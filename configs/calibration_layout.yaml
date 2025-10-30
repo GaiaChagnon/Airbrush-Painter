@@ -1,0 +1,62 @@
+# Calibration pattern layout
+# Used by: src/data_pipeline/calibrate.py (generate_calibration_gcode)
+# Purpose: Defines grid layouts, step values, and labels for calibration patterns
+
+schema: calibration_layout.v1
+units: "mm"
+
+# Color grid (CMY samples)
+color_grid:
+  origin_mm: [10, 10]
+  patch_size_mm: 15
+  spacing_mm: 2
+  samples:
+    c: [0.0, 0.25, 0.5, 0.75, 1.0]
+    m: [0.0, 0.25, 0.5, 0.75, 1.0]
+    y: [0.0, 0.25, 0.5, 0.75, 1.0]
+  label_prefix: "C"              # Labels: C000, C001, ..., C444
+
+# PSF and alpha grid (Z, speed samples)
+psf_alpha_grid:
+  origin_mm: [120, 10]
+  dot_spacing_mm: 10
+  samples:
+    z_mm: [5, 10, 15, 20, 25]
+    speed_mm_s: [50, 100, 150, 200, 250]
+  label_prefix: "P"              # Labels: P00, P01, ..., P44
+
+# Layering test (overlap validation)
+layering_patches:
+  origin_mm: [10, 200]
+  patch_size_mm: 20
+  spacing_mm: 5
+  base_colors:                   # Base layer CMY
+    - [1.0, 0.0, 0.0]            # Cyan
+    - [0.0, 1.0, 0.0]            # Magenta
+    - [0.0, 0.0, 1.0]            # Yellow
+  top_colors:                    # Top layer CMY
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+    - [1.0, 0.0, 0.0]
+  label_prefix: "L"              # Labels: L00, L01, ...
+
+# Fiducials (for scan alignment)
+fiducials:
+  - position_mm: [5, 5]
+    size_mm: 3
+    label: "F1"
+  - position_mm: [205, 5]
+    size_mm: 3
+    label: "F2"
+  - position_mm: [5, 292]
+    size_mm: 3
+    label: "F3"
+  - position_mm: [205, 292]
+    size_mm: 3
+    label: "F4"
+
+# Pen settings (for labels)
+pen:
+  font_size_mm: 2
+  offset_from_patch_mm: 3
+

@@ -1,0 +1,26 @@
+# Physics simulator configuration v1
+# Used by: src/airbrush_simulator/differentiable_renderer.py
+# Purpose: LUT paths and renderer settings
+
+schema: sim.v1
+
+# Lookup table paths (FP32 tensors)
+luts:
+  color: "configs/sim/luts/color_lut.pt"   # CMY → linear RGB [Nc x Nm x Ny x 3]
+  alpha: "configs/sim/luts/alpha_lut.pt"   # (Z, speed) → coverage [Nz x Nv]
+  psf: "configs/sim/luts/psf_lut.pt"       # (Z, speed) → kernel [Nz x Nv x K x K]
+
+# Rasterizer backend
+rasterizer:
+  backend: "cuda"                # Primary: "cuda" (nvdiffrast)
+  fallback: "splat"              # Fallback: "splat" (Gaussian stamps)
+
+# Color space (internal)
+color_space: "linear_rgb"        # Images are linear RGB [0,1] internally
+
+# Metadata
+metadata:
+  calibration_date: "2025-10-27"
+  machine_profile: "grbl_airbrush.v1"
+  semver: "1.0.0"
+

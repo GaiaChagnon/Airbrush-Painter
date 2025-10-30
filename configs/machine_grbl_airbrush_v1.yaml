@@ -1,0 +1,37 @@
+# Machine profile: GRBL airbrush v1
+# Used by: src/utils/gcode_generator.py, src/utils/gcode_vm.py
+# Purpose: Machine-level constraints and G-code flavor
+
+schema: machine.v1
+
+# Work area (mm)
+work_area_mm:
+  x: 210.0
+  y: 297.0
+  z: 30.0
+
+# G-code flavor
+gcode_flavor: "grbl_1.1f"
+units: "mm"
+feed_units: "mm/min"
+
+# Feed limits (mm/s)
+feeds:
+  max_xy_mm_s: 300.0
+  max_z_mm_s: 20.0
+
+# Macros (G-code snippets)
+macros:
+  include_dir: "gcode/macros/"
+  purge: "PURGE.gcode"           # Purge before each stroke
+  pen_up: "PEN_UP.gcode"
+  pen_down: "PEN_DOWN.gcode"
+
+# Safety
+safety:
+  soft_limits: true
+  purge_zone_mm:                 # Safe purge area (off canvas)
+    x: [200, 209]
+    y: [290, 296]
+    z: [10, 15]
+

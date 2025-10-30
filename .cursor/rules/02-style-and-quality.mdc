@@ -1,0 +1,14 @@
+---
+description: Coding standards, tests, and documentation
+alwaysApply: true
+---
+# SWE best practices
+
+- Python ≥3.10, **full type hints**. Prefer `TypedDict`/`pydantic` models for structured data.
+- Formatting/linting (document your toolchain): `ruff` + `black` + `isort` recommended.
+- Tests: use `pytest`. Place under `tests/` and name `test_*.py`. Keep unit tests fast and deterministic.
+- **No hidden side effects** in utils; pure functions where possible.
+- **No star imports**. Use explicit imports and `__all__` in utils packages when helpful.
+- **Public APIs** stable; breaking changes require versioned schemas (e.g., `stroke.v2.yaml`), not hidden param tweaks.
+- **Error messages** should mention offending key/path and expected range/shape.
+- **Performance hints**: prefer vectorized ops; keep LPIPS in FP32; networks in BF16 with autocast.

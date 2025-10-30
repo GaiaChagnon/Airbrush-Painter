@@ -1,0 +1,51 @@
+# Machine schema v1
+# Purpose: Machine profile structure and validation
+# Used by: src/utils/validators, src/utils/gcode_generator.py
+
+schema: machine.v1
+semver: "1.0.0"
+
+# Required fields
+required:
+  - work_area_mm
+  - gcode_flavor
+  - units
+  - feed_units
+  - feeds
+  - macros
+  - safety
+
+# Field definitions
+fields:
+  work_area_mm:
+    type: "dict"
+    required: [x, y, z]
+    units: "mm"
+  gcode_flavor:
+    type: "str"
+    allowed: ["grbl_1.1f", "marlin_2.0", "reprap"]
+  units:
+    type: "str"
+    allowed: ["mm", "inch"]
+  feed_units:
+    type: "str"
+    allowed: ["mm/min", "mm/s"]
+  feeds:
+    type: "dict"
+    required: [max_xy_mm_s, max_z_mm_s]
+  macros:
+    type: "dict"
+    required: [include_dir, purge, pen_up, pen_down]
+  safety:
+    type: "dict"
+    required: [soft_limits, purge_zone_mm]
+
+# Validators
+validators:
+  - "work_area_mm.x > 0"
+  - "work_area_mm.y > 0"
+  - "work_area_mm.z > 0"
+  - "feeds.max_xy_mm_s > 0"
+  - "feeds.max_z_mm_s > 0"
+  - "macros.include_dir exists"
+

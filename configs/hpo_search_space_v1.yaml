@@ -1,0 +1,62 @@
+# HPO search space v1
+# Used by: scripts/train.py (with --hpo flag)
+# Purpose: Optuna study configuration for hyperparameter optimization
+
+schema: hpo_search_space.v1
+
+# Objective function
+objective:
+  name: "avg_final_lpips_validation"
+  direction: "minimize"          # Lower LPIPS is better (minimize directly)
+
+# Trial budget
+budget:
+  n_trials: 80
+  timeout_minutes: 3600          # 60 hours max
+
+# Sampler and pruner
+sampler:
+  type: "tpe"                    # Tree-structured Parzen Estimator
+  seed: 123
+
+pruner:
+  type: "median"
+  warmup_steps: 8                # Don't prune before 8 epochs
+
+# Search space (hyperparameters)
+search_space:
+  agent.learning_rate:
+    dist: "loguniform"
+    low: 3.0e-5
+    high: 3.0e-3
+  agent.entropy_coef:
+    dist: "loguniform"
+    low: 1.0e-4
+    high: 1.0e-2
+  agent.gamma:
+    dist: "uniform"
+    low: 0.94
+    high: 0.999
+  agent.clip_param:
+    dist: "uniform"
+    low: 0.1
+    high: 0.3
+  agent.softargmax_temp:
+    dist: "loguniform"
+    low: 0.5
+    high: 3.0
+
+# Validation set (fixed 10 images)
+validation:
+  image_dir: "data/validation_images/cmy_only/"
+  stroke_cap: 1500               # Full cap for production-representative eval
+
+# Constraints
+constraints:
+  max_strokes: 1500
+
+# MLflow tracking
+mlflow:
+  experiment: "airbrush_hpo_v2"
+  run_name_prefix: "trial"
+
