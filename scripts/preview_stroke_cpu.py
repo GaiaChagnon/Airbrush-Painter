@@ -260,8 +260,11 @@ def save_rgb_image(canvas: np.ndarray, path: Path):
     path : Path
         Output path
     """
-    # Convert to sRGB
-    canvas_srgb = color_utils.linear_to_srgb(canvas)
+    # Convert to sRGB (convert to torch first)
+    import torch
+    canvas_torch = torch.from_numpy(canvas)
+    canvas_srgb_torch = color_utils.linear_to_srgb(canvas_torch)
+    canvas_srgb = canvas_srgb_torch.numpy()
     
     # Convert to uint8
     canvas_uint8 = np.clip(canvas_srgb * 255, 0, 255).astype(np.uint8)
@@ -365,11 +368,8 @@ def main():
     args = parse_args()
     
     # Setup logging
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging_config.setup_logging(
-        log_file=None,  # Console only for CLI
-        level=log_level
-    )
+    log_level = "DEBUG" if args.verbose else "INFO"
+    logging_config.setup_logging(log_level=log_level, log_file=None)
     logger = logging.getLogger(__name__)
     
     # Parse canvas settings
@@ -444,15 +444,29 @@ def main():
         plot_psf_profiles(renderer, strokes, args.psf_samples, psf_path)
         logger.info(f"Saved PSF profiles: {psf_path}")
     
-    # Metadata
+    # Metadata (convert numpy types to Python native types for YAML)
+    def convert_to_native(obj):
+        """Convert numpy types to Python native types."""
+        if isinstance(obj, (np.integer, np.floating)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert_to_native(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_native(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(convert_to_native(item) for item in obj)
+        return obj
+    
     metadata = {
         'num_strokes': len(strokes),
         'canvas_size_px': (canvas_h, canvas_w),
         'work_area_mm': (work_w, work_h),
-        'render_time_s': render_time,
+        'render_time_s': float(render_time),
         'background': args.background,
         'lut_source': 'toy' if not args.lut_dir else str(args.lut_dir),
-        'strokes': strokes
+        'strokes': convert_to_native(strokes)
     }
     metadata_path = output_dir / f'{prefix}_metadata.yaml'
     fs.atomic_yaml_dump(metadata, metadata_path)
