@@ -24,7 +24,7 @@ Usage:
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
-from pydantic import BaseModel, Field, validator, root_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ============================================================================
@@ -69,21 +69,20 @@ class StrokeV1(BaseModel):
     speed_profile: SpeedProfile
     color_cmy: ColorCMY
     
-    @validator('id', allow_reuse=True)
+    @field_validator('id')
     @classmethod
     def validate_id(cls, v: str) -> str:
         if not v or len(v) < 5:
             raise ValueError(f"Stroke ID must be non-empty and at least 5 chars, got: {v}")
         return v
     
-    @root_validator
-    @classmethod
-    def validate_geometry_bounds(cls, values: Dict) -> Dict:
+    @model_validator(mode='after')
+    def validate_geometry_bounds(self) -> 'StrokeV1':
         """Validate control points are within A4 bounds."""
         bounds_x = (0.0, 210.0)
         bounds_y = (0.0, 297.0)
         
-        bezier = values.get('bezier')
+        bezier = self.bezier
         if bezier:
             for i, pt_name in enumerate(['p1', 'p2', 'p3', 'p4'], 1):
                 pt = getattr(bezier, pt_name)
@@ -96,7 +95,7 @@ class StrokeV1(BaseModel):
                     raise ValueError(
                         f"Control point {pt_name} y={y:.2f} out of bounds [{bounds_y[0]}, {bounds_y[1]}]"
                     )
-        return values
+        return self
 
 
 class StrokesFileV1(BaseModel):
@@ -107,7 +106,7 @@ class StrokesFileV1(BaseModel):
     class Config:
         allow_population_by_field_name = True
     
-    @validator('schema_version', allow_reuse=True)
+    @field_validator('schema_version')
     @classmethod
     def validate_schema(cls, v: str) -> str:
         if v != "stroke.v1":
@@ -135,17 +134,16 @@ class ColorLUT(BaseModel):
     values_path: str = Field(..., description="Path to .pt file")
     description: str = Field("Trilinear interpolation on CMY cube → linear RGB [0,1]")
     
-    @root_validator
-    @classmethod
-    def validate_shape_consistency(cls, values: Dict) -> Dict:
+    @model_validator(mode='after')
+    def validate_shape_consistency(self) -> 'ColorLUT':
         """Ensure shape matches grid."""
-        grid = values.get('grid')
-        shape = values.get('shape')
+        grid = self.grid
+        shape = self.shape
         if grid and shape:
             expected = (grid.c, grid.m, grid.y, 3)
             if shape != expected:
                 raise ValueError(f"Shape {shape} doesn't match grid {expected}")
-        return values
+        return self
 
 
 class AlphaLUTAxes(BaseModel):
@@ -162,17 +160,16 @@ class AlphaLUT(BaseModel):
     values_path: str = Field(..., description="Path to .pt file")
     description: str = Field("Bilinear interpolation on Z×V grid → coverage [0,1]")
     
-    @root_validator
-    @classmethod
-    def validate_shape_consistency(cls, values: Dict) -> Dict:
+    @model_validator(mode='after')
+    def validate_shape_consistency(self) -> 'AlphaLUT':
         """Ensure shape matches axes."""
-        axes = values.get('axes')
-        shape = values.get('shape')
+        axes = self.axes
+        shape = self.shape
         if axes and shape:
             expected = (len(axes.z), len(axes.v))
             if shape != expected:
                 raise ValueError(f"Shape {shape} doesn't match axes {expected}")
-        return values
+        return self
 
 
 class PSFLUTAxes(BaseModel):
@@ -190,25 +187,24 @@ class PSFLUT(BaseModel):
     values_path: str = Field(..., description="Path to .pt file")
     description: str = Field("Bilinear interpolation on Z×V grid → normalized Gaussian kernel")
     
-    @validator('kernel_size')
+    @field_validator('kernel_size')
     @classmethod
     def validate_odd_kernel(cls, v: int) -> int:
         if v % 2 == 0:
             raise ValueError(f"Kernel size must be odd, got {v}")
         return v
     
-    @root_validator
-    @classmethod
-    def validate_shape_consistency(cls, values: Dict) -> Dict:
+    @model_validator(mode='after')
+    def validate_shape_consistency(self) -> 'PSFLUT':
         """Ensure shape matches axes and kernel."""
-        axes = values.get('axes')
-        shape = values.get('shape')
-        kernel_size = values.get('kernel_size')
+        axes = self.axes
+        shape = self.shape
+        kernel_size = self.kernel_size
         if axes and shape and kernel_size:
             expected = (len(axes.z), len(axes.v), kernel_size, kernel_size)
             if shape != expected:
                 raise ValueError(f"Shape {shape} doesn't match expected {expected}")
-        return values
+        return self
 
 
 class LUTMetadata(BaseModel):
@@ -230,7 +226,7 @@ class LUTsV1(BaseModel):
     class Config:
         allow_population_by_field_name = True
     
-    @validator('schema_version', allow_reuse=True)
+    @field_validator('schema_version')
     @classmethod
     def validate_schema(cls, v: str) -> str:
         if v != "luts.v1":
@@ -256,17 +252,17 @@ class CanvasBounds(BaseModel):
     y_min: float = Field(..., ge=0, description="Canvas Y minimum (mm)")
     y_max: float = Field(..., gt=0, description="Canvas Y maximum (mm)")
     
-    @validator('x_max', allow_reuse=True)
+    @field_validator('x_max')
     @classmethod
-    def validate_x_range(cls, v, values):
-        if 'x_min' in values and v <= values['x_min']:
+    def validate_x_range(cls, v, info):
+        if info.data.get('x_min') and v <= info.data['x_min']:
             raise ValueError(f"x_max ({v}) must be > x_min ({values['x_min']})")
         return v
     
-    @validator('y_max', allow_reuse=True)
+    @field_validator('y_max')
     @classmethod
-    def validate_y_range(cls, v, values):
-        if 'y_min' in values and v <= values['y_min']:
+    def validate_y_range(cls, v, info):
+        if info.data.get('y_min') and v <= info.data['y_min']:
             raise ValueError(f"y_max ({v}) must be > y_min ({values['y_min']})")
         return v
 
@@ -321,17 +317,17 @@ class MachineV1(BaseModel):
     class Config:
         allow_population_by_field_name = True
     
-    @validator('schema_version', allow_reuse=True)
+    @field_validator('schema_version')
     @classmethod
     def validate_schema(cls, v: str) -> str:
         if v != "machine.v1":
             raise ValueError(f"Expected schema 'machine.v1', got '{v}'")
         return v
     
-    @validator('canvas_mm', allow_reuse=True)
+    @field_validator('canvas_mm')
     @classmethod
-    def validate_canvas_within_work_area(cls, v, values):
-        if 'work_area_mm' in values:
+    def validate_canvas_within_work_area(cls, v, info):
+        if 'work_area_mm' in info.data:
             work = values['work_area_mm']
             if v.x_max > work.x:
                 raise ValueError(f"Canvas x_max ({v.x_max}) exceeds machine work area ({work.x})")
@@ -339,7 +335,7 @@ class MachineV1(BaseModel):
                 raise ValueError(f"Canvas y_max ({v.y_max}) exceeds machine work area ({work.y})")
         return v
     
-    @validator('gcode_flavor', allow_reuse=True)
+    @field_validator('gcode_flavor')
     @classmethod
     def validate_flavor(cls, v: str) -> str:
         allowed = ["grbl_1.1f", "marlin_2.0", "reprap"]
@@ -347,14 +343,14 @@ class MachineV1(BaseModel):
             raise ValueError(f"G-code flavor must be one of {allowed}, got '{v}'")
         return v
     
-    @validator('units', allow_reuse=True)
+    @field_validator('units')
     @classmethod
     def validate_units(cls, v: str) -> str:
         if v not in ["mm", "inch"]:
             raise ValueError(f"Units must be 'mm' or 'inch', got '{v}'")
         return v
     
-    @validator('feed_units', allow_reuse=True)
+    @field_validator('feed_units')
     @classmethod
     def validate_feed_units(cls, v: str) -> str:
         if v not in ["mm/min", "mm/s"]:
@@ -391,7 +387,7 @@ class JobPass(BaseModel):
     strokes_path: Optional[str] = Field(None, description="Path to strokes YAML")
     vectors_path: Optional[str] = Field(None, description="Path to pen vectors YAML")
     
-    @validator('name', allow_reuse=True)
+    @field_validator('name')
     @classmethod
     def validate_name(cls, v: str) -> str:
         if v not in ["cmy", "pen"]:
@@ -418,7 +414,7 @@ class JobV1(BaseModel):
     class Config:
         allow_population_by_field_name = True
     
-    @validator('schema_version', allow_reuse=True)
+    @field_validator('schema_version')
     @classmethod
     def validate_schema(cls, v: str) -> str:
         if v != "job.v1":
