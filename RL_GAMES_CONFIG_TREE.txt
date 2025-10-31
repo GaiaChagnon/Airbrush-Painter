@@ -1,0 +1,247 @@
+RL-Games Configuration Tree Structure
+======================================
+
+configs/train.yaml
+├── task: "AirbrushPainter-v0"
+├── device: "cuda:0"
+│
+├── compute:                                    # DGX Spark compute settings
+│   ├── precision: "bf16"
+│   ├── channels_last: true
+│   ├── grad_checkpointing: false
+│   └── torch_compile:
+│       ├── enabled: false
+│       └── mode: "max-autotune"
+│
+├── env_config: "configs/env_airbrush_v1.yaml"
+├── sim_config: "configs/sim/physics_v1.yaml"
+│
+├── lpips:                                      # LPIPS reward config
+│   ├── net: "vgg"
+│   └── tile:
+│       ├── size: 0
+│       └── overlap: 0
+│
+├── params:                                     # ★ RL-GAMES STRUCTURE ★
+│   ├── seed: 42
+│   │
+│   ├── env:                                    # Environment wrappers
+│   │   ├── clip_observations: 10.0
+│   │   └── clip_actions: 1.0
+│   │
+│   ├── algo:                                   # Algorithm selection
+│   │   └── name: "a2c_continuous"
+│   │
+│   ├── model:                                  # Model type
+│   │   └── name: "continuous_a2c_logstd"
+│   │
+│   ├── network:                                # Network architecture
+│   │   ├── name: "actor_critic"
+│   │   ├── separate: False
+│   │   ├── space:
+│   │   │   └── continuous:
+│   │   │       ├── mu_activation: None
+│   │   │       ├── sigma_activation: None
+│   │   │       ├── mu_init:
+│   │   │       │   └── name: "default"
+│   │   │       ├── sigma_init:
+│   │   │       │   ├── name: "const_initializer"
+│   │   │       │   └── val: 0
+│   │   │       └── fixed_sigma: True
+│   │   └── mlp:
+│   │       ├── units: [512, 512, 512]
+│   │       ├── activation: "elu"
+│   │       ├── d2rl: False
+│   │       ├── initializer:
+│   │       │   └── name: "default"
+│   │       └── regularizer:
+│   │           └── name: None
+│   │
+│   ├── load_checkpoint: False
+│   ├── load_path: ""
+│   │
+│   └── config:                                 # ★ MAIN TRAINING CONFIG ★
+│       ├── name: "airbrush_painter_ppo"
+│       ├── env_name: "rlgpu"
+│       ├── device: "cuda:0"
+│       ├── device_name: "cuda:0"
+│       ├── multi_gpu: False
+│       │
+│       ├── ppo: True                           # ★ PPO/A2C TOGGLE ★
+│       ├── mixed_precision: False
+│       ├── normalize_input: True
+│       ├── normalize_value: True
+│       ├── value_bootstrap: True
+│       ├── num_actors: -1
+│       │
+│       ├── reward_shaper:
+│       │   └── scale_value: 1.0
+│       │
+│       ├── normalize_advantage: True
+│       │
+│       ├── ─────────────────────────────
+│       ├── Core RL Hyperparameters:
+│       ├── ─────────────────────────────
+│       ├── gamma: 0.995                        # Discount factor
+│       ├── tau: 0.95                           # GAE lambda
+│       ├── learning_rate: 3.0e-4               # Adam LR
+│       ├── lr_schedule: "adaptive"
+│       ├── schedule_type: "standard"
+│       ├── kl_threshold: 0.008
+│       │
+│       ├── ─────────────────────────────
+│       ├── Training Loop:
+│       ├── ─────────────────────────────
+│       ├── score_to_win: 100000
+│       ├── max_epochs: 10000
+│       ├── save_best_after: 50
+│       ├── save_frequency: 10
+│       ├── print_stats: True
+│       │
+│       ├── ─────────────────────────────
+│       ├── PPO-Specific:
+│       ├── ─────────────────────────────
+│       ├── grad_norm: 1.0
+│       ├── entropy_coef: 0.001
+│       ├── truncate_grads: True
+│       ├── e_clip: 0.2
+│       │
+│       ├── ─────────────────────────────
+│       ├── Rollout & Batch:
+│       ├── ─────────────────────────────
+│       ├── horizon_length: 256
+│       ├── minibatch_size: 8192
+│       ├── mini_epochs: 4
+│       │
+│       ├── ─────────────────────────────
+│       ├── Value Function:
+│       ├── ─────────────────────────────
+│       ├── critic_coef: 2.0
+│       ├── clip_value: True
+│       │
+│       ├── seq_length: 4
+│       └── bounds_loss_coef: 0.0001
+│
+├── agent:                                      # ★ CUSTOM ARCHITECTURE ★
+│   ├── backbone: "resnet34"
+│   ├── spatial_head: "heatmap_soft_argmax"
+│   └── softargmax_temp: 1.0
+│
+├── curriculum:
+│   └── stage: "hard"
+│
+├── dataloader:
+│   └── pin_memory: false
+│
+└── logging:
+    ├── level: "INFO"
+    ├── json: false
+    ├── color: true
+    ├── file: "outputs/logs/train.log"
+    ├── rotate:
+    │   ├── mode: "size"
+    │   ├── max_bytes: 50000000
+    │   └── backup_count: 5
+    ├── capture_warnings: true
+    ├── quiet_libs: ["matplotlib", "PIL", "numba", "urllib3"]
+    ├── context:
+    │   └── app: "train"
+    ├── mlflow_experiment: "airbrush_train_v2"
+    ├── run_name_prefix: "train"
+    ├── log_seeds: true
+    └── save_interval: 10
+
+
+Key Sections Legend:
+====================
+params.*         → RL-Games standard structure (PPO/A2C)
+agent.*          → Custom architecture (project-specific)
+compute.*        → Hardware settings (DGX Spark)
+lpips.*          → Reward computation (LPIPS)
+logging.*        → MLflow & file logging
+
+
+Parameter Path Examples:
+========================
+params.config.learning_rate      → 0.0003
+params.config.ppo                → True
+params.config.gamma              → 0.995
+params.config.horizon_length     → 256
+agent.backbone                   → "resnet34"
+agent.spatial_head               → "heatmap_soft_argmax"
+compute.precision                → "bf16"
+logging.mlflow_experiment        → "airbrush_train_v2"
+
+
+Most Important Parameters (Top 5):
+===================================
+1. params.config.learning_rate   → Training speed & stability
+2. params.config.gamma           → Long-term planning ability
+3. params.config.entropy_coef    → Exploration vs exploitation
+4. params.config.horizon_length  → Update frequency
+5. agent.backbone                → Feature extraction capacity
+
+
+PPO vs A2C Toggle:
+==================
+PPO (Recommended):
+  params.config.ppo: True
+  params.config.mini_epochs: 4
+  params.config.horizon_length: 256
+
+A2C (Advanced):
+  params.config.ppo: False
+  params.config.mini_epochs: 1
+  params.config.horizon_length: 16
+  params.config.learning_rate: 7.0e-4 (higher)
+
+
+HPO Search Space (configs/hpo_search_space_v1.yaml):
+=====================================================
+Tunable Parameters (8 total):
+  ✓ params.config.learning_rate   (1e-5 to 1e-3)
+  ✓ params.config.entropy_coef    (1e-4 to 1e-2)
+  ✓ params.config.gamma           (0.94 to 0.999)
+  ✓ params.config.e_clip          (0.1 to 0.3)
+  ✓ params.config.tau             (0.9 to 0.99)
+  ✓ params.config.horizon_length  (128 to 512)
+  ✓ params.config.mini_epochs     (2 to 8)
+  ✓ agent.softargmax_temp         (0.5 to 3.0)
+
+
+Documentation Files:
+====================
+TRAINING_CONFIG_UPDATE.md         → Complete changelog & guide
+MIGRATION_GUIDE_RL_GAMES.md       → Developer migration guide
+CARTPOLE_VS_AIRBRUSH_PARAMS.md    → Parameter comparison & rationale
+RL_GAMES_INTEGRATION_SUMMARY.md   → Executive summary
+RL_GAMES_QUICK_REFERENCE.md       → One-page cheat sheet
+RL_GAMES_CONFIG_TREE.txt          → This file (visual tree)
+
+
+Status:
+=======
+✅ Configuration complete
+✅ YAML validation passed
+✅ HPO search space updated
+✅ Documentation comprehensive
+⏳ Integration testing pending
+
+
+Commands:
+=========
+# Standard training
+python scripts/train.py --config configs/train.yaml
+
+# HPO training
+python scripts/train.py --config configs/train.yaml --hpo --trials 80
+
+# Validate config
+python -c "import yaml; yaml.safe_load(open('configs/train.yaml'))"
+
+# Check parameter
+python -c "from omegaconf import OmegaConf; cfg=OmegaConf.load('configs/train.yaml'); print(cfg.params.config.learning_rate)"
+
+
+Generated: 2025-10-31
+Version: rl_games v1.0

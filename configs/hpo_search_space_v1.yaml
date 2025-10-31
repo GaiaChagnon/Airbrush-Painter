@@ -24,23 +24,41 @@ pruner:
   warmup_steps: 8                # Don't prune before 8 epochs
 
 # Search space (hyperparameters)
+# NOTE: Paths updated to match rl_games structure in train.yaml
 search_space:
-  agent.learning_rate:
+  # RL-Games PPO hyperparameters (params.config.*)
+  params.config.learning_rate:
     dist: "loguniform"
     low: 3.0e-5
     high: 3.0e-3
-  agent.entropy_coef:
+  params.config.entropy_coef:
     dist: "loguniform"
     low: 1.0e-4
     high: 1.0e-2
-  agent.gamma:
+  params.config.gamma:
     dist: "uniform"
     low: 0.94
     high: 0.999
-  agent.clip_param:
+  params.config.e_clip:              # Renamed from agent.clip_param
     dist: "uniform"
     low: 0.1
     high: 0.3
+  params.config.tau:                 # GAE lambda (new parameter)
+    dist: "uniform"
+    low: 0.90
+    high: 0.99
+  params.config.horizon_length:      # Rollout length (new parameter)
+    dist: "int_uniform"
+    low: 128
+    high: 512
+    step: 64
+  params.config.mini_epochs:         # SGD passes (new parameter)
+    dist: "int_uniform"
+    low: 2
+    high: 8
+    step: 1
+  
+  # Custom agent architecture (agent.*)
   agent.softargmax_temp:
     dist: "loguniform"
     low: 0.5

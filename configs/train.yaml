@@ -1,6 +1,34 @@
 # Training configuration
 # Used by: scripts/train.py
-# Purpose: Global training & compute settings for PPO agent
+# Purpose: Global training & compute settings for PPO/A2C agent
+#
+# RL-Games Configuration Structure:
+# ----------------------------------
+# This config follows rl_games library structure with four main sections:
+#   1. params.env: Environment wrappers (obs/action clipping)
+#   2. params.algo: Algorithm selection (a2c_continuous for both PPO and A2C)
+#   3. params.model: Model type (continuous_a2c_logstd for continuous actions)
+#   4. params.network: Network architecture (actor_critic with custom backbone)
+#   5. params.config: Main training hyperparameters
+#
+# To switch between PPO and A2C:
+#   - PPO: Set params.config.ppo = True (default, recommended)
+#   - A2C: Set params.config.ppo = False (faster but less stable)
+#
+# Key hyperparameters to tune (see HPO search space in hpo_search_space_v1.yaml):
+#   - learning_rate: Adam LR (typical range: 1e-5 to 1e-3)
+#   - entropy_coef: Exploration bonus (0.0001 to 0.01)
+#   - gamma: Discount factor (0.94 to 0.999 for long-horizon tasks)
+#   - tau: GAE lambda (0.9 to 0.99)
+#   - e_clip: PPO clipping epsilon (0.1 to 0.3)
+#   - horizon_length: Rollout length per update (16 to 512)
+#   - minibatch_size: SGD batch size (depends on num_envs × horizon_length)
+#   - mini_epochs: SGD passes over collected data (2 to 8)
+#
+# Network architecture is customized in agent.* section (not standard rl_games):
+#   - backbone: ResNet variant for visual feature extraction
+#   - spatial_head: Coordinate prediction method (heatmap or coordconv)
+#   - softargmax_temp: Temperature for heatmap→coordinate conversion
 
 task: "AirbrushPainter-v0"
 device: "cuda:0"
@@ -25,15 +53,103 @@ lpips:
     size: 0                      # 0 = full-frame on DGX; reduce if OOM (e.g., 2048)
     overlap: 0
 
-# PPO hyperparameters
+# RL-Games configuration structure
+params:
+  seed: 42
+
+  env:
+    clip_observations: 10.0    # Clip obs to [-clip, +clip] (images in [0,1], so high value)
+    clip_actions: 1.0          # Actions already in [-1,1], so clip at boundary
+
+  algo:
+    name: a2c_continuous       # rl_games internal algo name (PPO is "a2c_continuous" with ppo=True)
+
+  model:
+    name: continuous_a2c_logstd  # rl_games model type for continuous actions
+
+  # Network architecture (custom for AirbrushPainter)
+  network:
+    name: actor_critic
+    separate: False            # Shared backbone between actor and critic
+    space:
+      continuous:
+        mu_activation: None    # No activation on mean (tanh applied by action normalization)
+        sigma_activation: None # No activation on log_std
+        mu_init:
+          name: default        # Orthogonal init (rl_games default)
+        sigma_init:
+          name: const_initializer
+          val: 0               # Log-std init to 0 (std=1.0)
+        fixed_sigma: True      # Use learnable log_std (False for learned, True for fixed)
+    mlp:
+      units: [512, 512, 512]   # MLP head sizes (after backbone spatial pooling)
+      activation: elu
+      d2rl: False              # Dueling networks (not needed for continuous control)
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  load_checkpoint: False       # Set to True and specify load_path to resume training
+  load_path: ''
+
+  # Main RL-Games training config
+  config:
+    name: airbrush_painter_ppo
+    env_name: rlgpu            # Generic rl_games env name (actual env created by our code)
+    device: 'cuda:0'
+    device_name: 'cuda:0'
+    multi_gpu: False
+    ppo: True                  # Use PPO (if False, uses plain A2C)
+    mixed_precision: False     # We handle BF16 ourselves via torch_utils
+    normalize_input: True      # Normalize observations (images already [0,1], helps stabilize)
+    normalize_value: True      # Normalize value function targets
+    value_bootstrap: True      # Bootstrap value for non-terminal states
+    num_actors: -1             # Set dynamically based on num_envs (vectorized envs)
+    
+    reward_shaper:
+      scale_value: 1.0         # LPIPS improvement is already well-scaled [-2, 2]
+    
+    normalize_advantage: True  # Normalize advantages (standard PPO practice)
+    
+    # Core RL hyperparameters
+    gamma: 0.995               # Discount factor (long horizon for painting)
+    tau: 0.95                  # GAE lambda for advantage estimation
+    learning_rate: 3.0e-4      # Adam learning rate
+    lr_schedule: adaptive      # Reduce LR if KL divergence too high
+    schedule_type: standard    # 'standard' or 'legacy'
+    kl_threshold: 0.008        # KL threshold for adaptive LR (target KL per update)
+    
+    # Training loop parameters
+    score_to_win: 100000       # Stop if mean reward reaches this (effectively disabled)
+    max_epochs: 10000          # Maximum training epochs
+    save_best_after: 50        # Start tracking best model after this many epochs
+    save_frequency: 10         # Save checkpoint every N epochs
+    print_stats: True          # Print training stats
+    
+    # PPO-specific parameters
+    grad_norm: 1.0             # Gradient clipping (max L2 norm)
+    entropy_coef: 0.001        # Entropy bonus (encourages exploration)
+    truncate_grads: True       # Enable gradient clipping
+    e_clip: 0.2                # PPO clipping parameter (epsilon)
+    
+    # Rollout and batch parameters
+    horizon_length: 256        # Steps per rollout per env before update
+    minibatch_size: 8192       # Minibatch size for SGD updates
+    mini_epochs: 4             # Number of SGD passes over collected data
+    
+    # Value function training
+    critic_coef: 2.0           # Value loss coefficient (relative to policy loss)
+    clip_value: True           # Clip value function updates (stabilizes training)
+    
+    seq_length: 4              # For RNN policies (not used, but required by rl_games)
+    bounds_loss_coef: 0.0001   # Penalty for actions near boundaries (optional)
+
+# Custom agent network parameters (for our build_actor_critic function)
 agent:
-  backbone: "resnet34"                      # Network architecture
+  backbone: "resnet34"                      # Network architecture: resnet18, resnet34, resnet50
   spatial_head: "heatmap_soft_argmax"       # "coordconv" or "heatmap_soft_argmax"
   softargmax_temp: 1.0                      # Temperature (lower=sharper, higher=smoother)
-  learning_rate: 0.0003
-  entropy_coef: 0.001
-  gamma: 0.995                              # Discount factor
-  clip_param: 0.2                           # PPO clipping
 
 # Content curriculum (no resolution curriculum, multi-resolution is architectural)
 curriculum:
@@ -61,4 +177,66 @@ logging:
   run_name_prefix: "train"
   log_seeds: true                # Log PYTHONHASHSEED, torch seeds, cudnn flags
   save_interval: 10              # Save training monitor artifacts every N epochs
+
+
+# ------------------------------------------------------------------------------
+# Environment-Specific Reward Shaping (Optional Extension)
+# ------------------------------------------------------------------------------
+# For complex reward engineering beyond LPIPS improvement, add an env_cfg section:
+#
+# env_cfg:
+#   # Example: Multi-component reward with shaping terms
+#   rew_scale_lpips_improvement: 1.0     # Primary signal (LPIPS delta)
+#   rew_scale_stroke_efficiency: -0.01   # Penalize excessive strokes
+#   rew_scale_color_accuracy: 0.5        # Bonus for color matching
+#   rew_scale_coverage: 0.1              # Encourage canvas coverage
+#   rew_scale_edge_preservation: 0.3     # Reward preserving target edges
+#   
+#   # Bonus milestones (like your cartpole example)
+#   rew_bonus_lpips_below_0_5: 100       # Bonus when LPIPS < 0.5
+#   rew_bonus_lpips_below_0_2: 500       # Larger bonus for LPIPS < 0.2
+#   rew_bonus_lpips_below_0_1: 1000      # Huge bonus for near-perfect
+#
+# Current implementation: Single reward = LPIPS improvement only (no shaping).
+# If you add reward shaping, update src/airbrush_robot_env/env_v1.py accordingly.
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# A2C Configuration Example (Commented Out)
+# ------------------------------------------------------------------------------
+# To use plain A2C instead of PPO, uncomment and modify params.config as follows:
+#
+# params:
+#   config:
+#     ppo: False                 # CRITICAL: Disable PPO (use plain A2C)
+#     
+#     # A2C typically needs different hyperparameters:
+#     horizon_length: 16         # Shorter rollouts (A2C updates more frequently)
+#     mini_epochs: 1             # A2C does single-pass updates (no replay)
+#     minibatch_size: 4096       # Smaller batches (less data per update)
+#     learning_rate: 7.0e-4      # Often higher LR for A2C
+#     entropy_coef: 0.01         # Higher entropy for exploration (no PPO clipping)
+#     grad_norm: 0.5             # Tighter gradient clipping (A2C is less stable)
+#     
+#     # Other params remain similar to PPO
+#     gamma: 0.995
+#     tau: 0.95
+#     normalize_advantage: True
+#     critic_coef: 2.0
+#
+# A2C Trade-offs:
+#   Advantages:
+#     - Faster updates (no mini_epochs, shorter rollouts)
+#     - Simpler algorithm (no clipping, no replay buffer)
+#     - Lower memory footprint
+#   Disadvantages:
+#     - Less sample efficient (no experience replay)
+#     - Less stable (no policy clipping, higher variance)
+#     - Requires more tuning (sensitive to LR and entropy)
+#
+# Recommendation: Start with PPO (ppo=True). Switch to A2C only if:
+#   1. PPO is too slow for your iteration speed
+#   2. You have abundant compute for exploration
+#   3. You're willing to invest in hyperparameter tuning
+# ------------------------------------------------------------------------------
 
