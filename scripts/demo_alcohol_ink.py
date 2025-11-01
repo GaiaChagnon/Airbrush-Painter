@@ -41,7 +41,7 @@ def main():
     
     print("Rendering comprehensive demo...")
     
-    # Define color palette (7 distinct colors in CMY space)
+    # Define color palette (7 distinct colors in CMY space - SATURATED)
     colors = [
         {'c': 0.9, 'm': 0.0, 'y': 0.0, 'name': 'cyan'},
         {'c': 0.0, 'm': 0.9, 'y': 0.0, 'name': 'magenta'},

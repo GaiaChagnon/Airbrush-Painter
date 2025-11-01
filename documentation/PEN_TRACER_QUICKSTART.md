@@ -15,7 +15,7 @@ pip install pyclipper shapely scikit-image
 All configuration files are already set up in the repository:
 - `configs/env_airbrush_v1.yaml` - Environment/canvas settings
 - `configs/tools/pen_finetip_v1.yaml` - Pen tool parameters
-- `configs/sim/pen_tracer_v1.yaml` - Extraction & path generation settings
+- `configs/sim/pen_tracer_v2.yaml` - Edge detection & gamut-aware hatching settings
 
 ---
 
@@ -32,7 +32,7 @@ result = pen_tracer.make_pen_layer(
     target_rgb_path="data/raw_images/my_image.jpg",
     env_cfg_path="configs/env_airbrush_v1.yaml",
     pen_tool_cfg_path="configs/tools/pen_finetip_v1.yaml",
-    pen_tracer_cfg_path="configs/sim/pen_tracer_v1.yaml",
+    pen_tracer_cfg_path="configs/sim/pen_tracer_v2.yaml",
     out_dir="outputs/pen/my_job",
     cmy_canvas_path=None  # Optional: path to color layer for composite
 )
@@ -89,7 +89,7 @@ metadata:
   tool_name: "finetip_pigment_0.3mm"
   offset_mm: [12.50, -6.20, 0.00]
   generated_at: "2025-10-31T12:00:00Z"
-  tracer_version: "pen_tracer.v1"
+  tracer_version: "pen_tracer.v2"
 ```
 
 ---
@@ -98,7 +98,7 @@ metadata:
 
 ### Adjust Black Threshold
 
-Edit `configs/sim/pen_tracer_v1.yaml`:
+Edit `configs/sim/pen_tracer_v2.yaml`:
 ```yaml
 thresholds:
   lab_l_max: 18.0    # Increase to capture more dark content (0-100)
@@ -306,5 +306,5 @@ gcode_generator.generate_pen_gcode(
 ---
 
 **Last Updated**: 2025-10-31  
-**Version**: pen_tracer.v1
+**Version**: pen_tracer.v2
 

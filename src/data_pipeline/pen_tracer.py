@@ -35,7 +35,8 @@ from skimage import morphology, measure
 from shapely.geometry import LineString
 import pyclipper
 
-from ..utils import validators, fs, color, compute, geometry, metrics
+from ..utils import validators, color, compute, geometry, metrics
+from ..utils import io as fs  # Use io module for consistency
 
 logger = logging.getLogger(__name__)
 
@@ -328,7 +329,7 @@ def generate_hatch_pattern(
     return hatch_lines_mm
 
 
-def make_pen_layer_v3(
+def make_pen_layer(
     target_rgb_path: str,
     env_cfg_path: str,
     pen_tool_cfg_path: str,

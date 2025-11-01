@@ -11,7 +11,7 @@ Architecture:
     - Mass-per-mm scaling (not normalized Gaussians)
     - Speed-aware width & deposition
     - CMY → linear RGB via color_lut (trilinear interpolation)
-    - Alpha-over compositing (linear RGB, clamped accumulation)
+    - Transparent filter compositing (multiplicative light transmission model)
     - Visibility gates: skip imperceptible strokes
 
 Invariants:
@@ -51,6 +51,8 @@ Notes:
     - Width & mass controlled by renderer_cpu.v1.yaml config
 """
 
+import copy
+import hashlib
 import logging
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -62,6 +64,29 @@ import torch
 from src.utils import compute, geometry, color as color_utils, metrics, fs
 
 logger = logging.getLogger(__name__)
+
+
+def _seed_from_str(seed_base: int, s: str) -> int:
+    """Generate process-stable seed from string.
+    
+    Uses hashlib (not built-in hash()) to ensure determinism across processes.
+    Python's hash() is process-salted by default (PYTHONHASHSEED).
+    
+    Parameters
+    ----------
+    seed_base : int
+        Base seed value
+    s : str
+        String to hash (e.g., stroke ID)
+    
+    Returns
+    -------
+    int
+        Deterministic seed value
+    """
+    h = hashlib.blake2b(s.encode('utf-8'), digest_size=8).digest()
+    n = int.from_bytes(h, 'little') & 0x7fffffff
+    return (seed_base ^ n) & 0x7fffffff
 
 
 class CPUReferenceRenderer:
@@ -183,9 +208,9 @@ class CPUReferenceRenderer:
         Returns
         -------
         dict
-            Clamped stroke dictionary
+            Clamped stroke dictionary (deep copy, does not mutate input)
         """
-        clamped = stroke_dict.copy()
+        clamped = copy.deepcopy(stroke_dict)
         
         # Clamp control points
         x_min, x_max = self.stroke_bounds['x']
@@ -279,22 +304,23 @@ class CPUReferenceRenderer:
         mass_per_sec = np.interp(z, z_knots, deposition['mass_per_sec'])
         
         # Convert to per-mm via speed scaling
-        speed_exp = deposition.get('speed_exponent', 1.0)
-        mass_per_mm = mass_per_sec / max(v, 1e-6) ** abs(speed_exp)
+        # Don't take abs(): honor sign for <1 or >1 scaling
+        speed_exp = float(deposition.get('speed_exponent', 1.0))
+        mass_per_mm = mass_per_sec / (max(v, 1e-6) ** speed_exp)
         
         return float(mass_per_mm)
     
     def _build_radial_profile(
         self,
-        dist_px: np.ndarray,
+        dist_mm: np.ndarray,
         width_mm: float
     ) -> np.ndarray:
         """Build radial opacity profile from distance map.
         
         Parameters
         ----------
-        dist_px : np.ndarray
-            Distance transform (pixels from centerline), shape (H, W)
+        dist_mm : np.ndarray
+            Distance transform in mm from centerline, shape (H, W)
         width_mm : float
             Spray width in mm
         
@@ -304,9 +330,6 @@ class CPUReferenceRenderer:
             Radial profile phi(r), shape (H, W), range [0, 1]
         """
         profile_cfg = self.cpu_cfg['profile']
-        
-        # Convert distance to mm
-        dist_mm = dist_px / self.dpi_avg
         
         # Compute radii
         r_core = profile_cfg['core_frac'] * 0.5 * width_mm
@@ -443,7 +466,8 @@ class CPUReferenceRenderer:
         stroke_id = stroke_dict.get('id', 'unknown')
         seed = self.cpu_cfg.get('randomness', {}).get('seed', 42)
         # Hash stroke ID to get a unique but deterministic seed per stroke
-        stroke_seed = seed + hash(stroke_id) % 10000
+        # Use hashlib (not built-in hash()) for process-stable determinism
+        stroke_seed = _seed_from_str(seed, stroke_id)
         self.rng = np.random.RandomState(stroke_seed)
         
         # Validate inputs
@@ -530,11 +554,14 @@ class CPUReferenceRenderer:
         mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
         cv2.polylines(mask, [polyline_roi], isClosed=False, color=255, thickness=1)
         
-        # Distance transform
-        dist_px = cv2.distanceTransform(255 - mask, cv2.DIST_L2, 3).astype(np.float32)
+        # Distance transform (use DIST_MASK_PRECISE for better diagonal accuracy)
+        dist_px = cv2.distanceTransform(255 - mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE).astype(np.float32)
+        
+        # Convert to mm
+        dist_mm = dist_px / self.dpi_avg
         
         # Build radial profile
-        phi = self._build_radial_profile(dist_px, width_mm)
+        phi = self._build_radial_profile(dist_mm, width_mm)
         
         # Apply mass scaling
         k_mass = self.cpu_cfg['deposition'].get('k_mass', 2.5)
@@ -580,8 +607,8 @@ class CPUReferenceRenderer:
         alpha_roi_new = np.clip(alpha_roi_new, 0.0, 1.0)
         
         # Visibility check
-        core_radius_px = self.cpu_cfg['profile']['core_frac'] * 0.5 * width_mm * self.dpi_avg
-        core_mask = dist_px <= core_radius_px
+        core_radius_mm = self.cpu_cfg['profile']['core_frac'] * 0.5 * width_mm
+        core_mask = dist_mm <= core_radius_mm
         
         alpha_delta = alpha_roi_new - alpha_roi
         

@@ -69,7 +69,7 @@ def paint_main(
     env_cfg_path: str = "configs/env_airbrush_v1.yaml",
     machine_cfg_path: str = "configs/machine_grbl_airbrush_v1.yaml",
     pen_tool_cfg_path: str = "configs/tools/pen_finetip_v1.yaml",
-    pen_tracer_cfg_path: str = "configs/sim/pen_tracer_v1.yaml",
+    pen_tracer_cfg_path: str = "configs/sim/pen_tracer_v2.yaml",
     enable_pen_layer: bool = True,
     print_res_px: Optional[tuple] = None,
 ) -> Dict[str, any]:
@@ -278,7 +278,7 @@ def main():
     parser.add_argument(
         "--pen-tracer-config",
         type=str,
-        default="configs/sim/pen_tracer_v1.yaml",
+        default="configs/sim/pen_tracer_v2.yaml",
         help="Path to pen tracer config",
     )
     parser.add_argument(

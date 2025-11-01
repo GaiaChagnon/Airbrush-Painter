@@ -35,7 +35,7 @@ print("  • Single-direction hatching: 45° diagonal")
 print("="*80)
 
 try:
-    result = pen_tracer.make_pen_layer_v3(
+    result = pen_tracer.make_pen_layer(
         target_rgb_path=image_path,
         env_cfg_path=env_cfg_path,
         pen_tool_cfg_path=pen_tool_cfg_path,

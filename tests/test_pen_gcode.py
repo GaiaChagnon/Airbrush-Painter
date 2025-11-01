@@ -96,7 +96,7 @@ def simple_pen_vectors():
             offset_mm=[12.5, -6.2, 0.0],
             hatch_angles_deg=[0.0],
             generated_at="2025-10-31T12:00:00Z",
-            tracer_version="pen_tracer.v1",
+            tracer_version="pen_tracer.v2",
         ),
     )
 
@@ -233,7 +233,7 @@ def test_pen_gcode_respects_soft_limits(
             offset_mm=[12.5, -6.2, 0.0],
             hatch_angles_deg=[0.0],
             generated_at="2025-10-31T12:00:00Z",
-            tracer_version="pen_tracer.v1",
+            tracer_version="pen_tracer.v2",
         ),
     )
     

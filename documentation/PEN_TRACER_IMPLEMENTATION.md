@@ -63,12 +63,12 @@ Target Image (PNG/JPEG)
 
 ### Schema Definitions
 - `configs/schema/pen_tool.v1.yaml` - Pen tool physical parameters
-- `configs/schema/pen_tracer.v1.yaml` - Extraction and path generation config
+- `configs/schema/pen_tracer.v2.yaml` - Edge detection and gamut-aware hatching config
 - `configs/schema/pen_vectors.v1.yaml` - Serialization format for pen paths
 
 ### Configuration Files
 - `configs/tools/pen_finetip_v1.yaml` - Concrete 0.3mm finetip pen config
-- `configs/sim/pen_tracer_v1.yaml` - Concrete tracer parameters
+- `configs/sim/pen_tracer_v2.yaml` - Concrete tracer parameters
 
 ### Source Code
 - `src/data_pipeline/pen_tracer.py` - Core pen tracing implementation (1200+ lines)
@@ -125,7 +125,7 @@ result = pen_tracer.make_pen_layer(
     target_rgb_path="target.png",
     env_cfg_path="configs/env_airbrush_v1.yaml",
     pen_tool_cfg_path="configs/tools/pen_finetip_v1.yaml",
-    pen_tracer_cfg_path="configs/sim/pen_tracer_v1.yaml",
+    pen_tracer_cfg_path="configs/sim/pen_tracer_v2.yaml",
     out_dir="outputs/pen/job_001/",
     cmy_canvas_path="outputs/canvas.png"  # Optional
 )
@@ -183,7 +183,7 @@ offset_mm: [12.50, -6.20, 0.00] # Tool offset from airbrush
 
 ### Pen Tracer Parameters
 
-Key parameters in `pen_tracer.v1.yaml`:
+Key parameters in `pen_tracer.v2.yaml`:
 
 ```yaml
 thresholds:
@@ -326,7 +326,7 @@ tolerances:
   max_gap_frac: 0.02
   path_count_min: 5
   path_count_max: 20
-pen_config: "configs/sim/pen_tracer_v1.yaml"
+pen_config: "configs/sim/pen_tracer_v2.yaml"
 ```
 
 ## Algorithm Details

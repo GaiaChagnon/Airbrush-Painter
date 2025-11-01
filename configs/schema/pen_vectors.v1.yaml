@@ -28,7 +28,7 @@ metadata:
   offset_mm: [12.50, -6.20, 0.00]    # Tool offset from airbrush origin
   hatch_angles_deg: [0, 90, 45, 135] # Angles used in hatching
   generated_at: "2025-10-31T12:00:00Z"
-  tracer_version: "pen_tracer.v1"
+  tracer_version: "pen_tracer.v2"
 
 # Bounds (enforced by validator)
 bounds:

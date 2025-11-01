@@ -859,94 +859,6 @@ class PenToolV1(BaseModel):
 
 
 # ============================================================================
-# PEN TRACER SCHEMA V1
-# ============================================================================
-
-class PenThresholds(BaseModel):
-    """LAB thresholds for black ink extraction."""
-    lab_l_max: float = Field(..., ge=0.0, le=50.0, description="Max L* for black")
-    a_abs_min: float = Field(..., ge=0.0, description="Min |a*| chroma gate")
-    b_abs_min: float = Field(..., ge=0.0, description="Min |b*| chroma gate")
-
-
-class PenMorphology(BaseModel):
-    """Morphological operations on binary mask."""
-    close_px: int = Field(..., ge=0, description="Morphological close kernel size (px)")
-    open_px: int = Field(..., ge=0, description="Morphological open kernel size (px)")
-    min_area_px: int = Field(..., ge=0, description="Min component area to keep (px)")
-
-
-class PenVectorization(BaseModel):
-    """Vectorization parameters."""
-    simplify_tol_px: float = Field(..., ge=0.1, le=5.0, description="Douglas-Peucker tolerance (px)")
-    potrace_turdsize: int = Field(..., ge=0, description="Potrace speckle filter (px)")
-
-
-class PenClassification(BaseModel):
-    """Component classification parameters."""
-    line_like_width_px: int = Field(..., ge=1, le=50, description="Width threshold for line vs region")
-    donut_hole_min_area_px: int = Field(..., ge=0, description="Min inner hole area to keep (px)")
-
-
-class DarknessToPassesRule(BaseModel):
-    """Overshading rule: map L* to extra passes."""
-    l_max: float = Field(..., ge=0.0, le=100.0, description="Max L* for this rule")
-    passes: int = Field(..., ge=0, le=10, description="Extra passes for this darkness")
-
-
-class PenFilling(BaseModel):
-    """Region filling strategy."""
-    hatch_angles_deg: List[float] = Field(..., description="Hatch angles for passes (degrees)")
-    hatch_spacing_scale: float = Field(..., ge=0.5, le=2.0, description="Scale for hatch spacing")
-    darkness_to_passes: List[DarknessToPassesRule] = Field(..., description="Overshading rules")
-    
-    @field_validator('hatch_angles_deg')
-    @classmethod
-    def validate_angles(cls, v: List[float]) -> List[float]:
-        for angle in v:
-            if not (-180.0 <= angle <= 180.0):
-                raise ValueError(f"Hatch angle {angle} out of bounds [-180, 180]")
-        return v
-
-
-class PenContours(BaseModel):
-    """Contour packing parameters."""
-    endcap_extra_len_mm: float = Field(..., ge=0.0, le=5.0, description="Extend line ends (mm)")
-    max_shells_per_side: int = Field(..., ge=1, le=50, description="Max offset contours per side")
-
-
-class PenVisibility(BaseModel):
-    """Visibility and quality gates."""
-    min_coverage: float = Field(..., ge=0.0, le=1.0, description="Min black coverage fraction")
-    max_gap_frac: float = Field(..., ge=0.0, le=0.5, description="Max allowed white gap fraction")
-
-
-class PenDebug(BaseModel):
-    """Debug output configuration."""
-    save_intermediates: bool = Field(..., description="Save intermediate masks/paths")
-
-
-class PenTracerV1(BaseModel):
-    """Pen tracer schema v1 (black layer extraction and path generation config)."""
-    schema: str = Field(..., description="Schema version")
-    thresholds: PenThresholds
-    morphology: PenMorphology
-    vectorization: PenVectorization
-    classification: PenClassification
-    filling: PenFilling
-    contours: PenContours
-    visibility: PenVisibility
-    debug: PenDebug
-    
-    @field_validator('schema')
-    @classmethod
-    def validate_schema(cls, v: str) -> str:
-        if v != "pen_tracer.v1":
-            raise ValueError(f"Expected schema 'pen_tracer.v1', got '{v}'")
-        return v
-
-
-# ============================================================================
 # PEN TRACER SCHEMA V2 (Edge + Gamut-Aware Hatching)
 # ============================================================================
 
@@ -1161,39 +1073,6 @@ def load_pen_tool_config(path: Union[str, Path]) -> PenToolV1:
         return PenToolV1(**data)
     except Exception as e:
         raise ValueError(f"Pen tool config validation failed at {path}: {e}") from e
-
-
-def load_pen_tracer_config(path: Union[str, Path]) -> PenTracerV1:
-    """Load and validate pen tracer config from YAML.
-    
-    Parameters
-    ----------
-    path : Union[str, Path]
-        Path to pen_tracer.v1.yaml file
-    
-    Returns
-    -------
-    PenTracerV1
-        Validated pen tracer configuration
-    
-    Raises
-    ------
-    FileNotFoundError
-        If path doesn't exist
-    ValueError
-        If validation fails (with actionable error message)
-    """
-    from . import fs
-    
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Pen tracer config not found: {path}")
-    
-    data = fs.load_yaml(path)
-    try:
-        return PenTracerV1(**data)
-    except Exception as e:
-        raise ValueError(f"Pen tracer config validation failed at {path}: {e}") from e
 
 
 def load_pen_tracer_v2_config(path: Union[str, Path]) -> PenTracerV2:
