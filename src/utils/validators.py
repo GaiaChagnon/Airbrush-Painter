@@ -328,7 +328,7 @@ class MachineV1(BaseModel):
     @classmethod
     def validate_canvas_within_work_area(cls, v, info):
         if 'work_area_mm' in info.data:
-            work = values['work_area_mm']
+            work = info.data['work_area_mm']
             if v.x_max > work.x:
                 raise ValueError(f"Canvas x_max ({v.x_max}) exceeds machine work area ({work.x})")
             if v.y_max > work.y:
@@ -626,3 +626,637 @@ def flatten_config_for_mlflow(cfg: Union[Dict, BaseModel]) -> Dict[str, Any]:
         return dict(items)
     
     return _flatten(cfg)
+
+
+# ============================================================================
+# CPU RENDERER CONFIG (renderer_cpu.v1.yaml)
+# ============================================================================
+
+class VisibilityConfig(BaseModel):
+    """Visibility thresholds for skipping imperceptible strokes."""
+    min_alpha_visible: float = Field(default=0.0125, ge=0.0, le=1.0)
+    min_delta_e_visible: float = Field(default=0.8, ge=0.0)
+    min_stroke_coverage: float = Field(default=0.0001, ge=0.0, le=1.0)
+    min_center_luminance_drop: float = Field(default=0.05, ge=0.0, le=1.0)
+
+
+class WidthModel(BaseModel):
+    """Width model: maps (z, v) → spray width in mm."""
+    z_knots_mm: List[float] = Field(..., min_length=2)
+    width_min_mm: List[float] = Field(..., min_length=2)
+    width_max_mm: List[float] = Field(..., min_length=2)
+    v_knots_mm_s: List[float] = Field(..., min_length=2)
+    width_scale: List[float] = Field(..., min_length=2)
+    
+    @model_validator(mode='after')
+    def validate_lengths(self) -> 'WidthModel':
+        """Validate that all arrays have consistent lengths."""
+        z_len = len(self.z_knots_mm)
+        if len(self.width_min_mm) != z_len or len(self.width_max_mm) != z_len:
+            raise ValueError("width_min_mm and width_max_mm must match z_knots_mm length")
+        
+        v_len = len(self.v_knots_mm_s)
+        if len(self.width_scale) != v_len:
+            raise ValueError("width_scale must match v_knots_mm_s length")
+        
+        return self
+
+
+class ProfileConfig(BaseModel):
+    """Radial opacity profile shape parameters."""
+    type: str = Field(default="flat_core_gaussian_skirt")
+    core_frac: float = Field(default=0.40, ge=0.0, le=1.0)
+    skirt_sigma_frac: float = Field(default=0.28, ge=0.0, le=1.0)
+    skirt_power: float = Field(default=1.8, ge=0.5, le=5.0)
+    margin_factor: float = Field(default=1.5, ge=1.0, le=5.0)
+
+
+class DepositionModel(BaseModel):
+    """Deposition model: mass of opacity per unit length."""
+    z_knots_mm: List[float] = Field(..., min_length=2)
+    mass_per_sec: List[float] = Field(..., min_length=2)
+    speed_exponent: float = Field(default=1.0, ge=0.0, le=2.0)
+    k_mass: float = Field(default=2.5, ge=0.1, le=100.0)
+    
+    @model_validator(mode='after')
+    def validate_lengths(self) -> 'DepositionModel':
+        """Validate that arrays have consistent lengths."""
+        if len(self.mass_per_sec) != len(self.z_knots_mm):
+            raise ValueError("mass_per_sec must match z_knots_mm length")
+        return self
+
+
+class StampTrainConfig(BaseModel):
+    """Stamp train mode configuration (alternative to distance transform)."""
+    patterns: List[str] = Field(default_factory=list)
+    unit_diam_mm: float = Field(default=1.0, ge=0.1, le=10.0)
+    spacing_mm: float = Field(default=0.5, ge=0.05, le=5.0)
+    jitter_mm: float = Field(default=0.08, ge=0.0, le=1.0)
+    noise_gain: float = Field(default=0.12, ge=0.0, le=1.0)
+
+
+class MixingConfig(BaseModel):
+    """Color mixing/layering configuration."""
+    mode: str = Field(default="layer_over")
+    km_params_path: Optional[str] = None
+    
+    @field_validator('mode')
+    @classmethod
+    def validate_mode(cls, v: str) -> str:
+        allowed = {'layer_over', 'kubelka_munk'}
+        if v not in allowed:
+            raise ValueError(f"mode must be one of {allowed}, got {v}")
+        return v
+
+
+class RandomnessConfig(BaseModel):
+    """Randomness control for speckle/texture."""
+    seed: int = Field(default=42, ge=0)
+    speckle: bool = Field(default=True)
+    speckle_gain: float = Field(default=0.08, ge=0.0, le=1.0)
+    speckle_scale: float = Field(default=2.0, ge=0.5, le=10.0)
+
+
+class SamplingConfig(BaseModel):
+    """Sampling along polyline configuration."""
+    max_step_mm: float = Field(default=0.25, ge=0.01, le=5.0)
+    min_samples: int = Field(default=8, ge=2, le=1000)
+
+
+class RendererCPUV1(BaseModel):
+    """CPU renderer configuration (renderer_cpu.v1.yaml schema).
+    
+    Defines physical behavior for deterministic OpenCV-based airbrush simulation.
+    Controls width, mass deposition, visibility gates, and profile shape.
+    """
+    schema: str = Field(default="renderer_cpu.v1")
+    mode: str = Field(default="opencv_distance")
+    visibility: VisibilityConfig = Field(default_factory=VisibilityConfig)
+    width_model: WidthModel
+    profile: ProfileConfig = Field(default_factory=ProfileConfig)
+    deposition: DepositionModel
+    stamp_train: StampTrainConfig = Field(default_factory=StampTrainConfig)
+    mixing: MixingConfig = Field(default_factory=MixingConfig)
+    randomness: RandomnessConfig = Field(default_factory=RandomnessConfig)
+    sampling: SamplingConfig = Field(default_factory=SamplingConfig)
+    
+    @field_validator('mode')
+    @classmethod
+    def validate_mode(cls, v: str) -> str:
+        allowed = {'opencv_distance', 'stamp_train'}
+        if v not in allowed:
+            raise ValueError(f"mode must be one of {allowed}, got {v}")
+        return v
+    
+    @field_validator('schema')
+    @classmethod
+    def validate_schema(cls, v: str) -> str:
+        if v != "renderer_cpu.v1":
+            raise ValueError(f"schema must be 'renderer_cpu.v1', got {v}")
+        return v
+
+
+def load_renderer_cpu_config(path: Union[str, Path]) -> RendererCPUV1:
+    """Load and validate CPU renderer config from YAML.
+    
+    Parameters
+    ----------
+    path : str or Path
+        Path to renderer_cpu.v1.yaml file
+    
+    Returns
+    -------
+    RendererCPUV1
+        Validated config model
+    
+    Raises
+    ------
+    ValueError
+        If config is invalid
+    FileNotFoundError
+        If file does not exist
+    """
+    from . import fs
+    
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"CPU renderer config not found: {path}")
+    
+    cfg = fs.load_yaml(path)
+    return RendererCPUV1(**cfg)
+
+
+# ============================================================================
+# PEN TOOL SCHEMA V1
+# ============================================================================
+
+class PenMacros(BaseModel):
+    """Pen tool G-code macros."""
+    pen_up: str = Field(..., description="Pen up macro filename")
+    pen_down: str = Field(..., description="Pen down macro filename")
+
+
+class PenAcceleration(BaseModel):
+    """Pen tool acceleration limits."""
+    xy_mm_s2: float = Field(..., gt=0, description="XY acceleration (mm/s²)")
+
+
+class PenJoins(BaseModel):
+    """Pen path rendering/offsetting style."""
+    cap_style: str = Field(..., description="Cap style for path ends")
+    join_style: str = Field(..., description="Join style for path corners")
+    
+    @field_validator('cap_style')
+    @classmethod
+    def validate_cap_style(cls, v: str) -> str:
+        allowed = {"round", "square", "flat"}
+        if v not in allowed:
+            raise ValueError(f"cap_style must be one of {allowed}, got '{v}'")
+        return v
+    
+    @field_validator('join_style')
+    @classmethod
+    def validate_join_style(cls, v: str) -> str:
+        allowed = {"round", "miter", "bevel"}
+        if v not in allowed:
+            raise ValueError(f"join_style must be one of {allowed}, got '{v}'")
+        return v
+
+
+class PenToolV1(BaseModel):
+    """Pen tool schema v1 (physical pen tool configuration)."""
+    schema: str = Field(..., description="Schema version")
+    name: str = Field(..., description="Tool name")
+    tip_diameter_mm: float = Field(..., ge=0.1, le=2.0, description="Pen tip diameter (mm)")
+    overlap_frac: float = Field(..., ge=0.0, le=0.5, description="Overlap fraction between passes")
+    max_passes: int = Field(..., ge=1, le=10, description="Maximum overshading stacks")
+    feed_mm_s: float = Field(..., ge=10.0, le=300.0, description="Drawing feed rate (mm/s)")
+    travel_mm_s: float = Field(..., ge=50.0, le=400.0, description="Travel feed rate (mm/s)")
+    safe_z_mm: float = Field(..., ge=0.0, le=30.0, description="Safe Z for travel (mm)")
+    draw_z_mm: float = Field(..., ge=-2.0, le=10.0, description="Pen-down Z (mm)")
+    plunge_mm_s: float = Field(..., ge=1.0, le=50.0, description="Z feed rate (mm/s)")
+    offset_mm: List[float] = Field(..., description="Tool offset from airbrush [dx, dy, dz]")
+    macros: PenMacros
+    accel: PenAcceleration
+    joins: PenJoins
+    
+    @field_validator('schema')
+    @classmethod
+    def validate_schema(cls, v: str) -> str:
+        if v != "pen_tool.v1":
+            raise ValueError(f"Expected schema 'pen_tool.v1', got '{v}'")
+        return v
+    
+    @field_validator('offset_mm')
+    @classmethod
+    def validate_offset(cls, v: List[float]) -> List[float]:
+        if len(v) != 3:
+            raise ValueError(f"offset_mm must have 3 elements [dx, dy, dz], got {len(v)}")
+        for i, val in enumerate(v):
+            if not (-50.0 <= val <= 50.0):
+                raise ValueError(f"offset_mm[{i}] = {val} out of bounds [-50.0, 50.0]")
+        return v
+
+
+# ============================================================================
+# PEN TRACER SCHEMA V1
+# ============================================================================
+
+class PenThresholds(BaseModel):
+    """LAB thresholds for black ink extraction."""
+    lab_l_max: float = Field(..., ge=0.0, le=50.0, description="Max L* for black")
+    a_abs_min: float = Field(..., ge=0.0, description="Min |a*| chroma gate")
+    b_abs_min: float = Field(..., ge=0.0, description="Min |b*| chroma gate")
+
+
+class PenMorphology(BaseModel):
+    """Morphological operations on binary mask."""
+    close_px: int = Field(..., ge=0, description="Morphological close kernel size (px)")
+    open_px: int = Field(..., ge=0, description="Morphological open kernel size (px)")
+    min_area_px: int = Field(..., ge=0, description="Min component area to keep (px)")
+
+
+class PenVectorization(BaseModel):
+    """Vectorization parameters."""
+    simplify_tol_px: float = Field(..., ge=0.1, le=5.0, description="Douglas-Peucker tolerance (px)")
+    potrace_turdsize: int = Field(..., ge=0, description="Potrace speckle filter (px)")
+
+
+class PenClassification(BaseModel):
+    """Component classification parameters."""
+    line_like_width_px: int = Field(..., ge=1, le=50, description="Width threshold for line vs region")
+    donut_hole_min_area_px: int = Field(..., ge=0, description="Min inner hole area to keep (px)")
+
+
+class DarknessToPassesRule(BaseModel):
+    """Overshading rule: map L* to extra passes."""
+    l_max: float = Field(..., ge=0.0, le=100.0, description="Max L* for this rule")
+    passes: int = Field(..., ge=0, le=10, description="Extra passes for this darkness")
+
+
+class PenFilling(BaseModel):
+    """Region filling strategy."""
+    hatch_angles_deg: List[float] = Field(..., description="Hatch angles for passes (degrees)")
+    hatch_spacing_scale: float = Field(..., ge=0.5, le=2.0, description="Scale for hatch spacing")
+    darkness_to_passes: List[DarknessToPassesRule] = Field(..., description="Overshading rules")
+    
+    @field_validator('hatch_angles_deg')
+    @classmethod
+    def validate_angles(cls, v: List[float]) -> List[float]:
+        for angle in v:
+            if not (-180.0 <= angle <= 180.0):
+                raise ValueError(f"Hatch angle {angle} out of bounds [-180, 180]")
+        return v
+
+
+class PenContours(BaseModel):
+    """Contour packing parameters."""
+    endcap_extra_len_mm: float = Field(..., ge=0.0, le=5.0, description="Extend line ends (mm)")
+    max_shells_per_side: int = Field(..., ge=1, le=50, description="Max offset contours per side")
+
+
+class PenVisibility(BaseModel):
+    """Visibility and quality gates."""
+    min_coverage: float = Field(..., ge=0.0, le=1.0, description="Min black coverage fraction")
+    max_gap_frac: float = Field(..., ge=0.0, le=0.5, description="Max allowed white gap fraction")
+
+
+class PenDebug(BaseModel):
+    """Debug output configuration."""
+    save_intermediates: bool = Field(..., description="Save intermediate masks/paths")
+
+
+class PenTracerV1(BaseModel):
+    """Pen tracer schema v1 (black layer extraction and path generation config)."""
+    schema: str = Field(..., description="Schema version")
+    thresholds: PenThresholds
+    morphology: PenMorphology
+    vectorization: PenVectorization
+    classification: PenClassification
+    filling: PenFilling
+    contours: PenContours
+    visibility: PenVisibility
+    debug: PenDebug
+    
+    @field_validator('schema')
+    @classmethod
+    def validate_schema(cls, v: str) -> str:
+        if v != "pen_tracer.v1":
+            raise ValueError(f"Expected schema 'pen_tracer.v1', got '{v}'")
+        return v
+
+
+# ============================================================================
+# PEN TRACER SCHEMA V2 (Edge + Gamut-Aware Hatching)
+# ============================================================================
+
+class PenTracerV2Output(BaseModel):
+    """Output resolution settings."""
+    target_height_px: Optional[int] = Field(None, description="Target height (width from aspect ratio), null for original")
+    min_px: int = Field(512, ge=256, le=2048, description="Minimum resolution")
+    max_px: int = Field(4096, ge=1024, le=8192, description="Maximum resolution")
+    
+    @field_validator('target_height_px')
+    @classmethod
+    def validate_target_height(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError(f"target_height_px must be positive, got {v}")
+        return v
+
+
+class PenTracerV2EdgeDetection(BaseModel):
+    """Edge detection configuration."""
+    enabled: bool = Field(True, description="Enable edge extraction")
+    canny_low: float = Field(50.0, ge=10.0, le=200.0, description="Canny lower threshold")
+    canny_high: float = Field(150.0, ge=50.0, le=400.0, description="Canny upper threshold")
+    min_length_px: int = Field(20, ge=5, le=200, description="Minimum edge length")
+    link_distance_px: int = Field(2, ge=0, le=10, description="Gap linking distance")
+    simplify_tol_px: float = Field(1.5, ge=0.1, le=5.0, description="Simplification tolerance")
+
+
+class PenTracerV2CMYGamut(BaseModel):
+    """CMY airbrush gamut definition."""
+    min_luminance: float = Field(15.0, ge=0.0, le=50.0, description="Minimum L* achievable")
+    max_chroma: float = Field(80.0, ge=0.0, le=150.0, description="Maximum chroma")
+    hue_ranges: List[List[float]] = Field([[0, 360]], description="Hue ranges [start, end] degrees")
+
+
+class PenTracerV2DarknessLevel(BaseModel):
+    """Single darkness level for hatching (exclusive range)."""
+    l_min: float = Field(..., ge=0.0, le=100.0, description="Minimum L* for this level (inclusive)")
+    l_max: float = Field(..., ge=0.0, le=100.0, description="Maximum L* for this level (exclusive)")
+    passes: int = Field(..., ge=1, le=5, description="Number of hatching passes")
+    hatch_angles: List[float] = Field(..., description="Hatch angles in degrees")
+    
+    @field_validator('l_max')
+    @classmethod
+    def validate_range(cls, v: float, info) -> float:
+        if 'l_min' in info.data and v <= info.data['l_min']:
+            raise ValueError(f"l_max ({v}) must be greater than l_min ({info.data['l_min']})")
+        return v
+
+
+class PenTracerV2ShadowHatching(BaseModel):
+    """Shadow hatching configuration."""
+    enabled: bool = Field(True, description="Enable shadow hatching")
+    gamut_aware: bool = Field(True, description="Only hatch out-of-gamut regions")
+    cmy_gamut: PenTracerV2CMYGamut
+    darkness_levels: List[PenTracerV2DarknessLevel]
+    min_area_px: int = Field(500, ge=50, le=5000, description="Minimum shadow area")
+    spacing_scale: float = Field(1.0, ge=0.1, le=5.0, description="Hatch spacing multiplier")
+    min_line_spacing_mm: float = Field(0.5, ge=0.1, le=5.0, description="Minimum line spacing")
+    max_hatch_coverage: float = Field(0.75, ge=0.0, le=1.0, description="Maximum hatch coverage fraction")
+
+
+class PenTracerV2Calibration(BaseModel):
+    """Calibration integration settings."""
+    calibration_file: Optional[str] = Field(None, description="Path to calibration YAML")
+    margin: float = Field(0.05, ge=0.0, le=0.3, description="Gamut expansion margin")
+
+
+class PenTracerV2Debug(BaseModel):
+    """Debug output settings."""
+    save_intermediates: bool = Field(True, description="Save intermediate images")
+    save_gamut_mask: bool = Field(True, description="Save out-of-gamut mask")
+    save_edge_mask: bool = Field(True, description="Save edge mask")
+    save_shadow_masks: bool = Field(True, description="Save shadow masks")
+
+
+class PenTracerV2(BaseModel):
+    """Pen tracer schema v2 (edge + gamut-aware hatching)."""
+    schema: str = Field(..., description="Schema version")
+    output: PenTracerV2Output
+    edge_detection: PenTracerV2EdgeDetection
+    shadow_hatching: PenTracerV2ShadowHatching
+    calibration: PenTracerV2Calibration
+    debug: PenTracerV2Debug
+    
+    @field_validator('schema')
+    @classmethod
+    def validate_schema(cls, v: str) -> str:
+        if v != "pen_tracer.v2":
+            raise ValueError(f"Expected schema 'pen_tracer.v2', got '{v}'")
+        return v
+
+
+# ============================================================================
+# PEN VECTORS SCHEMA V1
+# ============================================================================
+
+class PenPath(BaseModel):
+    """Single pen path (polyline in image frame mm)."""
+    id: str = Field(..., description="Unique path identifier")
+    kind: str = Field(..., description="Path topology")
+    role: str = Field(..., description="Path semantic role")
+    tip_diameter_mm: float = Field(..., ge=0.1, le=2.0, description="Pen tip diameter (mm)")
+    z_mm: float = Field(..., ge=-2.0, le=10.0, description="Pen Z position (mm)")
+    feed_mm_s: float = Field(..., ge=10.0, le=300.0, description="XY feed rate (mm/s)")
+    points_mm: List[List[float]] = Field(..., description="Polyline points [x, y] in mm")
+    
+    @field_validator('kind')
+    @classmethod
+    def validate_kind(cls, v: str) -> str:
+        allowed = {"polyline", "polygon"}
+        if v not in allowed:
+            raise ValueError(f"kind must be one of {allowed}, got '{v}'")
+        return v
+    
+    @field_validator('role')
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        allowed = {"outline", "hatch", "fill"}
+        if v not in allowed:
+            raise ValueError(f"role must be one of {allowed}, got '{v}'")
+        return v
+    
+    @field_validator('points_mm')
+    @classmethod
+    def validate_points(cls, v: List[List[float]]) -> List[List[float]]:
+        for i, pt in enumerate(v):
+            if len(pt) != 2:
+                raise ValueError(f"Point {i} must have 2 coordinates, got {len(pt)}")
+            x, y = pt
+            if not (0.0 <= x <= 210.0):  # A4 width
+                raise ValueError(f"Point {i} x={x} out of bounds [0, 210]")
+            if not (0.0 <= y <= 297.0):  # A4 height
+                raise ValueError(f"Point {i} y={y} out of bounds [0, 297]")
+        return v
+
+
+class PenVectorsMetadata(BaseModel):
+    """Pen vectors metadata (provenance)."""
+    tool_name: str = Field(..., description="Tool name")
+    offset_mm: List[float] = Field(..., description="Tool offset [dx, dy, dz]")
+    hatch_angles_deg: List[float] = Field(..., description="Hatch angles used")
+    generated_at: str = Field(..., description="ISO 8601 timestamp")
+    tracer_version: str = Field(..., description="Tracer schema version")
+
+
+class PenVectorsV1(BaseModel):
+    """Pen vectors schema v1 (serialization format for pen layer)."""
+    schema: str = Field(..., description="Schema version")
+    render_px: List[int] = Field(..., description="Rendering resolution [W, H]")
+    work_area_mm: List[float] = Field(..., description="Canvas dimensions [W, H] mm")
+    paths: List[PenPath] = Field(..., description="List of pen paths")
+    metadata: PenVectorsMetadata
+    
+    @field_validator('schema')
+    @classmethod
+    def validate_schema(cls, v: str) -> str:
+        if v != "pen_vectors.v1":
+            raise ValueError(f"Expected schema 'pen_vectors.v1', got '{v}'")
+        return v
+    
+    @field_validator('render_px')
+    @classmethod
+    def validate_render_px(cls, v: List[int]) -> List[int]:
+        if len(v) != 2:
+            raise ValueError(f"render_px must have 2 elements [W, H], got {len(v)}")
+        if v[0] <= 0 or v[1] <= 0:
+            raise ValueError(f"render_px dimensions must be positive, got {v}")
+        return v
+    
+    @field_validator('work_area_mm')
+    @classmethod
+    def validate_work_area(cls, v: List[float]) -> List[float]:
+        if len(v) != 2:
+            raise ValueError(f"work_area_mm must have 2 elements [W, H], got {len(v)}")
+        if v[0] <= 0 or v[1] <= 0:
+            raise ValueError(f"work_area_mm dimensions must be positive, got {v}")
+        return v
+
+
+# ============================================================================
+# PUBLIC API (PEN LAYER)
+# ============================================================================
+
+def load_pen_tool_config(path: Union[str, Path]) -> PenToolV1:
+    """Load and validate pen tool config from YAML.
+    
+    Parameters
+    ----------
+    path : Union[str, Path]
+        Path to pen_tool.v1.yaml file
+    
+    Returns
+    -------
+    PenToolV1
+        Validated pen tool configuration
+    
+    Raises
+    ------
+    FileNotFoundError
+        If path doesn't exist
+    ValueError
+        If validation fails (with actionable error message)
+    """
+    from . import fs
+    
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Pen tool config not found: {path}")
+    
+    data = fs.load_yaml(path)
+    try:
+        return PenToolV1(**data)
+    except Exception as e:
+        raise ValueError(f"Pen tool config validation failed at {path}: {e}") from e
+
+
+def load_pen_tracer_config(path: Union[str, Path]) -> PenTracerV1:
+    """Load and validate pen tracer config from YAML.
+    
+    Parameters
+    ----------
+    path : Union[str, Path]
+        Path to pen_tracer.v1.yaml file
+    
+    Returns
+    -------
+    PenTracerV1
+        Validated pen tracer configuration
+    
+    Raises
+    ------
+    FileNotFoundError
+        If path doesn't exist
+    ValueError
+        If validation fails (with actionable error message)
+    """
+    from . import fs
+    
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Pen tracer config not found: {path}")
+    
+    data = fs.load_yaml(path)
+    try:
+        return PenTracerV1(**data)
+    except Exception as e:
+        raise ValueError(f"Pen tracer config validation failed at {path}: {e}") from e
+
+
+def load_pen_tracer_v2_config(path: Union[str, Path]) -> PenTracerV2:
+    """Load and validate pen tracer V2 config from YAML.
+    
+    Parameters
+    ----------
+    path : Union[str, Path]
+        Path to pen_tracer.v2.yaml file
+    
+    Returns
+    -------
+    PenTracerV2
+        Validated pen tracer V2 configuration
+    
+    Raises
+    ------
+    FileNotFoundError
+        If path doesn't exist
+    ValueError
+        If validation fails (with actionable error message)
+    """
+    from . import fs
+    
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Pen tracer V2 config not found: {path}")
+    
+    data = fs.load_yaml(path)
+    try:
+        return PenTracerV2(**data)
+    except Exception as e:
+        raise ValueError(f"Pen tracer V2 config validation failed at {path}: {e}") from e
+
+
+def load_pen_vectors(path: Union[str, Path]) -> PenVectorsV1:
+    """Load and validate pen vectors from YAML.
+    
+    Parameters
+    ----------
+    path : Union[str, Path]
+        Path to pen_vectors.v1.yaml file
+    
+    Returns
+    -------
+    PenVectorsV1
+        Validated pen vectors
+    
+    Raises
+    ------
+    FileNotFoundError
+        If path doesn't exist
+    ValueError
+        If validation fails (with actionable error message)
+    """
+    from . import fs
+    
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Pen vectors file not found: {path}")
+    
+    data = fs.load_yaml(path)
+    try:
+        return PenVectorsV1(**data)
+    except Exception as e:
+        raise ValueError(f"Pen vectors validation failed at {path}: {e}") from e

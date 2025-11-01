@@ -1,0 +1,111 @@
+# Pen Tracer V2 Configuration
+# Edge detection + gamut-aware shadow hatching
+
+schema: pen_tracer.v2
+
+# Output resolution settings
+output:
+  # A4 paper dimensions at high DPI for quality output
+  # A4 = 210mm × 297mm
+  # At 300 DPI: 2480 × 3508 pixels (standard print quality)
+  # Set to null to use render_px from environment config
+  target_height_px: 3508  # A4 height at 300 DPI
+  
+  min_px: 512    # Safety minimum
+  max_px: 4096   # Memory limit
+
+# Edge detection (outline extraction)
+edge_detection:
+  enabled: true
+  
+  # Canny edge detection
+  # Higher thresholds = only detect HARD color changes (dark blue vs white)
+  # Lower thresholds = detect soft changes too (blue vs light blue)
+  canny_low: 100.0      # Lower threshold (increased for hard edges only)
+  canny_high: 200.0     # Upper threshold (increased for hard edges only)
+  
+  # Edge filtering
+  min_length_px: 20     # Minimum edge length (increase to remove small details)
+  link_distance_px: 2   # Gap linking (increase to connect broken edges)
+  
+  # Vectorization
+  simplify_tol_px: 1.5  # Simplification (increase for smoother, fewer points)
+
+# Shadow hatching (darkness filling)
+shadow_hatching:
+  enabled: true
+  
+  # Gamut-aware mode: only hatch colors CMY cannot reproduce
+  gamut_aware: true
+  
+  # CMY airbrush gamut (fallback values)
+  # These will be overridden by calibration data when available
+  cmy_gamut:
+    # Darkest black achievable with CMY
+    # Anything darker (lower L*) needs pen hatching
+    min_luminance: 15.0   # L* = 15 is ~95% black
+    
+    # Maximum chroma (color saturation) CMY can achieve
+    # Highly saturated colors outside this may need pen boost
+    max_chroma: 80.0
+    
+    # Hue ranges CMY can reproduce well
+    # Full range for now (will be refined by calibration)
+    hue_ranges:
+      - [0, 360]  # All hues (no filtering yet)
+  
+  # Darkness levels for hatching
+  # Only applied to regions outside CMY gamut
+  # IMPORTANT: Each level is EXCLUSIVE (only hatches that specific darkness range)
+  # This prevents overlapping/double-tracing
+  darkness_levels:
+    # Very dark only (L* 0-30) - densest hatching
+    - l_min: 0.0
+      l_max: 30.0
+      passes: 1
+      hatch_angles: [45]
+    
+    # Dark only (L* 30-50) - medium hatching
+    - l_min: 30.0
+      l_max: 50.0
+      passes: 1
+      hatch_angles: [45]
+    
+    # Medium dark only (L* 50-70) - sparse hatching
+    - l_min: 50.0
+      l_max: 70.0
+      passes: 1
+      hatch_angles: [45]
+  
+  # Morphology
+  min_area_px: 500      # Minimum shadow region size (reduce for finer details)
+  
+  # Hatching pattern
+  # Increase spacing to leave room for CMY colors to show through
+  spacing_scale: 2.5    # Hatch spacing multiplier (2.5x = sparse hatching)
+  
+  # Line proximity limits
+  min_line_spacing_mm: 0.5  # Minimum distance between parallel lines
+  
+  # Coverage limits
+  # Maximum fraction of canvas that hatching can cover (0.0-1.0)
+  # Prevents over-inking and ensures CMY colors have space
+  max_hatch_coverage: 0.20  # Maximum 20% coverage (sparse, letting colors show)
+
+# Calibration integration
+calibration:
+  # Path to calibration data (will override cmy_gamut above)
+  # Set to null to use fallback values
+  calibration_file: null  # e.g., "outputs/calibration/cmy_gamut.yaml"
+  
+  # Gamut expansion margin (safety factor)
+  # Expand CMY gamut slightly to avoid gaps at boundaries
+  margin: 0.05  # 5% expansion
+
+# Debug output
+debug:
+  save_intermediates: true
+  save_gamut_mask: true      # Mask of regions outside CMY gamut
+  save_edge_mask: true       # Edge detection result
+  save_shadow_masks: true    # Shadow masks at each darkness level
+

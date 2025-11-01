@@ -1,13 +1,12 @@
-"""Golden image tests for CPU reference renderer.
+"""Golden image tests for CPU reference renderer (OpenCV distance-transform model).
 
 This test suite validates rendering against known-good reference images
-(golden baselines). Golden images are stored in ci/golden_tests_cpu/ and
-are versioned with the codebase.
+with the new OpenCV distance-transform spray model (flat core + Gaussian skirt).
 
 Test workflow:
 1. Render predefined strokes with fixed seeds and configs
 2. Compare rendered images against saved golden PNGs
-3. Validate metrics: PSNR, SSIM, ΔE2000, coverage fraction
+3. Validate metrics: PSNR, SSIM, ΔE2000, coverage, center luminance
 4. Fail if any metric exceeds threshold
 
 Golden test cases:
@@ -16,17 +15,20 @@ Golden test cases:
 3. multi_stroke: Three overlapping strokes
 4. boundary_graze: Stroke near canvas edge
 5. tiny_stroke: Micro-stroke for anti-aliasing test
+6. speed_scaling: Same stroke at different speeds
+7. width_control: Strokes at different Z heights
 
 Acceptance thresholds:
 - PSNR ≥ 28 dB (strict pixel-level match)
 - SSIM ≥ 0.92 (structural similarity)
 - ΔE2000 mean ≤ 2.0 (perceptual color difference)
-- Coverage fraction within ±5% (painted area)
+- Coverage fraction within expected range
+- Center luminance drop ≥ 0.05 (visibility gate)
 
 Usage:
     pytest tests/test_cpu_golden.py  # Run all golden tests
-    pytest tests/test_cpu_golden.py::test_golden_straight_line  # Run specific test
-    pytest tests/test_cpu_golden.py --regen-golden  # Regenerate golden images (manual mode)
+    pytest tests/test_cpu_golden.py::test_golden_straight_line
+    pytest tests/test_cpu_golden.py --regen-golden  # Regenerate (manual mode)
 """
 
 import logging
@@ -40,7 +42,6 @@ import torch
 from src.airbrush_simulator.cpu_reference import CPUReferenceRenderer, load_toy_luts
 from src.utils import color as color_utils, metrics, fs
 
-
 logger = logging.getLogger(__name__)
 
 # Golden test data directory
@@ -48,10 +49,11 @@ GOLDEN_DIR = Path(__file__).parent.parent / 'ci' / 'golden_tests_cpu'
 
 # Acceptance thresholds
 THRESHOLDS = {
-    'psnr_min': 28.0,       # dB
-    'ssim_min': 0.92,       # [0,1]
-    'delta_e_max': 2.0,     # ΔE2000
-    'coverage_tol': 0.05    # ±5% relative
+    'psnr_min': 28.0,                  # dB
+    'ssim_min': 0.92,                  # [0,1]
+    'delta_e_max': 2.0,                # ΔE2000
+    'coverage_tol': 0.05,              # ±5% relative
+    'min_center_luminance_drop': 0.05  # center must darken by at least this much
 }
 
 
@@ -61,13 +63,16 @@ THRESHOLDS = {
 
 @pytest.fixture
 def renderer():
-    """Create renderer with fixed config."""
+    """Create renderer with fixed config and toy LUTs."""
     env_cfg = {
         'work_area_mm': (210.0, 297.0),
         'render_px': (908, 1280)
     }
-    sim_cfg = {}
-    luts = load_toy_luts()
+    sim_cfg = {
+        'renderer_cpu_config': 'configs/sim/renderer_cpu.v1.yaml'
+    }
+    # Use high_visibility=True for solid black strokes
+    luts = load_toy_luts(high_visibility=True)
     return CPUReferenceRenderer(sim_cfg, env_cfg, luts)
 
 
@@ -100,7 +105,7 @@ def get_golden_strokes() -> Dict[str, Dict]:
                 'p3': (130.0, 148.5),
                 'p4': (160.0, 148.5)
             },
-            'z_profile': {'z0': 10.0, 'z1': 10.0},
+            'z_profile': {'z0': 6.0, 'z1': 6.0},
             'speed_profile': {'v0': 50.0, 'v1': 50.0},
             'color_cmy': {'c': 0.8, 'm': 0.2, 'y': 0.1}
         },
@@ -113,8 +118,8 @@ def get_golden_strokes() -> Dict[str, Dict]:
                 'p3': (150.0, 80.0),
                 'p4': (200.0, 150.0)
             },
-            'z_profile': {'z0': 5.0, 'z1': 15.0},
-            'speed_profile': {'v0': 100.0, 'v1': 200.0},
+            'z_profile': {'z0': 5.0, 'z1': 10.0},
+            'speed_profile': {'v0': 40.0, 'v1': 100.0},
             'color_cmy': {'c': 0.2, 'm': 0.8, 'y': 0.3}
         },
         
@@ -126,8 +131,8 @@ def get_golden_strokes() -> Dict[str, Dict]:
                 'p3': (15.0, 15.0),
                 'p4': (20.0, 20.0)
             },
-            'z_profile': {'z0': 8.0, 'z1': 12.0},
-            'speed_profile': {'v0': 75.0, 'v1': 125.0},
+            'z_profile': {'z0': 6.0, 'z1': 8.0},
+            'speed_profile': {'v0': 60.0, 'v1': 80.0},
             'color_cmy': {'c': 0.5, 'm': 0.5, 'y': 0.5}
         },
         
@@ -139,9 +144,61 @@ def get_golden_strokes() -> Dict[str, Dict]:
                 'p3': (102.0, 101.0),
                 'p4': (103.0, 101.5)
             },
-            'z_profile': {'z0': 10.0, 'z1': 10.0},
+            'z_profile': {'z0': 6.0, 'z1': 6.0},
             'speed_profile': {'v0': 50.0, 'v1': 50.0},
             'color_cmy': {'c': 0.3, 'm': 0.3, 'y': 0.3}
+        },
+        
+        'wide_stroke_high_z': {
+            'id': 'golden-00004-wide',
+            'bezier': {
+                'p1': (60.0, 200.0),
+                'p2': (90.0, 200.0),
+                'p3': (120.0, 200.0),
+                'p4': (150.0, 200.0)
+            },
+            'z_profile': {'z0': 15.0, 'z1': 15.0},
+            'speed_profile': {'v0': 50.0, 'v1': 50.0},
+            'color_cmy': {'c': 0.6, 'm': 0.4, 'y': 0.2}
+        },
+        
+        'narrow_stroke_low_z': {
+            'id': 'golden-00005-narrow',
+            'bezier': {
+                'p1': (60.0, 220.0),
+                'p2': (90.0, 220.0),
+                'p3': (120.0, 220.0),
+                'p4': (150.0, 220.0)
+            },
+            'z_profile': {'z0': 3.0, 'z1': 3.0},
+            'speed_profile': {'v0': 50.0, 'v1': 50.0},
+            'color_cmy': {'c': 0.6, 'm': 0.4, 'y': 0.2}
+        },
+        
+        'fast_stroke': {
+            'id': 'golden-00006-fast',
+            'bezier': {
+                'p1': (60.0, 240.0),
+                'p2': (90.0, 240.0),
+                'p3': (120.0, 240.0),
+                'p4': (150.0, 240.0)
+            },
+            'z_profile': {'z0': 6.0, 'z1': 6.0},
+            'speed_profile': {'v0': 200.0, 'v1': 200.0},
+            'color_cmy': {'c': 0.6, 'm': 0.4, 'y': 0.2}
+        },
+        
+        'slow_stroke': {
+            'id': 'golden-00007-slow',
+            'bezier': {
+                'p1': (60.0, 260.0),
+                'p2': (90.0, 260.0),
+                'p3': (120.0, 260.0),
+                'p4': (150.0, 260.0)
+            },
+            'z_profile': {'z0': 6.0, 'z1': 6.0},
+            'speed_profile': {'v0': 20.0, 'v1': 20.0},
+            'color_cmy': {'c': 0.6, 'm': 0.4, 'y': 0.2}
         }
     }
     
@@ -165,7 +222,7 @@ def get_golden_multi_strokes() -> list:
                 'p3': (120.0, 100.0),
                 'p4': (140.0, 100.0)
             },
-            'z_profile': {'z0': 10.0, 'z1': 10.0},
+            'z_profile': {'z0': 6.0, 'z1': 6.0},
             'speed_profile': {'v0': 50.0, 'v1': 50.0},
             'color_cmy': {'c': 0.9, 'm': 0.1, 'y': 0.1}
         },
@@ -177,7 +234,7 @@ def get_golden_multi_strokes() -> list:
                 'p3': (130.0, 110.0),
                 'p4': (150.0, 110.0)
             },
-            'z_profile': {'z0': 12.0, 'z1': 12.0},
+            'z_profile': {'z0': 8.0, 'z1': 8.0},
             'speed_profile': {'v0': 60.0, 'v1': 60.0},
             'color_cmy': {'c': 0.1, 'm': 0.9, 'y': 0.1}
         },
@@ -189,7 +246,7 @@ def get_golden_multi_strokes() -> list:
                 'p3': (125.0, 120.0),
                 'p4': (145.0, 120.0)
             },
-            'z_profile': {'z0': 8.0, 'z1': 8.0},
+            'z_profile': {'z0': 5.0, 'z1': 5.0},
             'speed_profile': {'v0': 70.0, 'v1': 70.0},
             'color_cmy': {'c': 0.1, 'm': 0.1, 'y': 0.9}
         }
@@ -212,8 +269,8 @@ def render_golden_case(
     ----------
     renderer : CPUReferenceRenderer
         Renderer instance
-    strokes : list of dict
-        Stroke definitions
+    strokes : list of dict or dict
+        Stroke definition(s)
     canvas_init : np.ndarray
         Initial canvas
     alpha_init : np.ndarray
@@ -245,7 +302,10 @@ def save_golden_image(canvas: np.ndarray, path: Path):
     path : Path
         Output path
     """
-    canvas_srgb = color_utils.linear_to_srgb(canvas)
+    # Convert numpy to torch tensor for color conversion
+    canvas_torch = torch.from_numpy(canvas).permute(2, 0, 1)  # (H,W,3) -> (3,H,W)
+    canvas_srgb = color_utils.linear_to_srgb(canvas_torch)
+    canvas_srgb = canvas_srgb.permute(1, 2, 0).numpy()  # (3,H,W) -> (H,W,3)
     canvas_uint8 = np.clip(canvas_srgb * 255, 0, 255).astype(np.uint8)
     
     import PIL.Image
@@ -269,7 +329,10 @@ def load_golden_image(path: Path) -> np.ndarray:
     import PIL.Image
     img = PIL.Image.open(path).convert('RGB')
     arr = np.array(img, dtype=np.float32) / 255.0  # sRGB [0,1]
-    arr_linear = color_utils.srgb_to_linear(arr)
+    # Convert to torch tensor for color conversion
+    arr_torch = torch.from_numpy(arr).permute(2, 0, 1)  # (H,W,3) -> (3,H,W)
+    arr_linear = color_utils.srgb_to_linear(arr_torch)
+    arr_linear = arr_linear.permute(1, 2, 0).numpy()  # (3,H,W) -> (H,W,3)
     return arr_linear
 
 
@@ -292,29 +355,45 @@ def compute_metrics(
     Returns
     -------
     dict
-        Metrics: {psnr, ssim, delta_e_mean, coverage}
+        Metrics: {psnr, ssim, delta_e_mean, coverage, center_luminance_drop}
     """
+    # Convert numpy arrays to torch tensors with correct shape
+    canvas_test_torch = torch.from_numpy(canvas_test).permute(2, 0, 1)
+    canvas_golden_torch = torch.from_numpy(canvas_golden).permute(2, 0, 1)
+    alpha_test_torch = torch.from_numpy(alpha_test)
+    
     # PSNR (higher is better)
-    psnr = metrics.psnr(canvas_test, canvas_golden)
+    psnr = metrics.psnr(canvas_test_torch, canvas_golden_torch)
     
     # SSIM (higher is better)
-    ssim = metrics.ssim(canvas_test, canvas_golden)
+    ssim = metrics.ssim(canvas_test_torch, canvas_golden_torch)
     
     # ΔE2000 (lower is better)
-    # Convert to Lab
-    lab_test = color_utils.rgb_to_lab(canvas_test.reshape(-1, 3))
-    lab_golden = color_utils.rgb_to_lab(canvas_golden.reshape(-1, 3))
+    lab_test = color_utils.rgb_to_lab(canvas_test_torch)
+    lab_golden = color_utils.rgb_to_lab(canvas_golden_torch)
     delta_e = color_utils.delta_e2000(lab_test, lab_golden)
     delta_e_mean = float(delta_e.mean())
     
     # Coverage (painted area fraction)
-    coverage = metrics.paint_coverage_alpha(alpha_test)
+    coverage = metrics.paint_coverage(alpha_test_torch)
+    
+    # Center luminance drop (visibility check)
+    # Compute luminance of white canvas vs painted canvas where alpha > 0.1
+    painted_mask = alpha_test > 0.1
+    if painted_mask.any():
+        L_white = 1.0  # white canvas luminance
+        L_test = 0.2126 * canvas_test[..., 0] + 0.7152 * canvas_test[..., 1] + 0.0722 * canvas_test[..., 2]
+        L_painted = L_test[painted_mask].mean()
+        center_drop = float(L_white - L_painted)
+    else:
+        center_drop = 0.0
     
     return {
         'psnr': float(psnr),
         'ssim': float(ssim),
         'delta_e_mean': delta_e_mean,
-        'coverage': float(coverage)
+        'coverage': float(coverage),
+        'center_luminance_drop': center_drop
     }
 
 
@@ -336,8 +415,13 @@ def validate_metrics(metrics_dict: Dict[str, float], test_name: str):
     psnr = metrics_dict['psnr']
     ssim = metrics_dict['ssim']
     delta_e = metrics_dict['delta_e_mean']
+    coverage = metrics_dict['coverage']
+    center_drop = metrics_dict.get('center_luminance_drop', 0.0)
     
-    logger.info(f"{test_name}: PSNR={psnr:.2f} dB, SSIM={ssim:.4f}, ΔE={delta_e:.2f}")
+    logger.info(
+        f"{test_name}: PSNR={psnr:.2f} dB, SSIM={ssim:.4f}, ΔE={delta_e:.2f}, "
+        f"coverage={coverage:.4f}, center_drop={center_drop:.3f}"
+    )
     
     assert psnr >= THRESHOLDS['psnr_min'], \
         f"PSNR {psnr:.2f} < {THRESHOLDS['psnr_min']} dB"
@@ -347,6 +431,9 @@ def validate_metrics(metrics_dict: Dict[str, float], test_name: str):
     
     assert delta_e <= THRESHOLDS['delta_e_max'], \
         f"ΔE {delta_e:.2f} > {THRESHOLDS['delta_e_max']}"
+    
+    assert center_drop >= THRESHOLDS['min_center_luminance_drop'], \
+        f"Center luminance drop {center_drop:.3f} < {THRESHOLDS['min_center_luminance_drop']}"
 
 
 # ============================================================================
@@ -400,7 +487,7 @@ def test_golden_curved_stroke(renderer, blank_canvas):
 
 @pytest.mark.golden
 def test_golden_multi_stroke(renderer, blank_canvas):
-    """Golden test: three overlapping strokes (CMY primary colors)."""
+    """Golden test: three overlapping strokes (CMY layering)."""
     strokes = get_golden_multi_strokes()
     
     canvas, alpha = render_golden_case(renderer, strokes, *blank_canvas)
@@ -458,28 +545,169 @@ def test_golden_tiny_stroke(renderer, blank_canvas):
 
 
 # ============================================================================
-# COVERAGE REGRESSION TESTS
+# PHYSICS & VISIBILITY TESTS
 # ============================================================================
 
-@pytest.mark.golden
-def test_coverage_stability():
-    """Test that coverage metrics are stable across runs."""
-    renderer_cfg = {
-        'work_area_mm': (210.0, 297.0),
-        'render_px': (908, 1280)
+@pytest.mark.physics
+def test_visibility_sanity(renderer, blank_canvas):
+    """Test that strokes are actually visible (not near-white)."""
+    strokes = get_golden_strokes()
+    
+    # Test at moderate z, v
+    stroke = strokes['straight_line']
+    canvas, alpha = render_golden_case(renderer, stroke, *blank_canvas)
+    
+    # Check coverage
+    coverage = np.mean(alpha)
+    assert coverage >= 0.001, f"Coverage {coverage:.6f} too low (stroke nearly invisible)"
+    
+    # Check center luminance drop
+    painted_mask = alpha > 0.1
+    assert painted_mask.any(), "No pixels with alpha > 0.1"
+    
+    L = 0.2126 * canvas[..., 0] + 0.7152 * canvas[..., 1] + 0.0722 * canvas[..., 2]
+    L_painted = L[painted_mask].mean()
+    drop = 1.0 - L_painted
+    
+    assert drop >= 0.05, f"Center luminance drop {drop:.3f} < 0.05 (stroke barely visible)"
+
+
+@pytest.mark.physics
+def test_width_control(renderer, blank_canvas):
+    """Test that width increases with Z as configured."""
+    strokes = get_golden_strokes()
+    
+    # Low Z → narrow
+    stroke_low = strokes['narrow_stroke_low_z']
+    canvas_low, alpha_low = render_golden_case(renderer, stroke_low, *blank_canvas)
+    
+    # High Z → wide
+    canvas_high = np.ones_like(blank_canvas[0])
+    alpha_high = np.zeros_like(blank_canvas[1])
+    stroke_high = strokes['wide_stroke_high_z']
+    canvas_high, alpha_high = render_golden_case(renderer, stroke_high, canvas_high, alpha_high)
+    
+    # Measure "width" by counting pixels with alpha > 0.05 in cross-section
+    # Find a vertical slice near the middle
+    mid_x = 105 * (1280 // 210)  # x ≈ 105 mm
+    
+    width_low_px = np.sum(alpha_low[:, mid_x - 5:mid_x + 5] > 0.05)
+    width_high_px = np.sum(alpha_high[:, mid_x - 5:mid_x + 5] > 0.05)
+    
+    assert width_high_px > width_low_px, \
+        f"High Z width {width_high_px} px not > low Z width {width_low_px} px"
+
+
+@pytest.mark.physics
+def test_speed_scaling(renderer, blank_canvas):
+    """Test that doubling speed reduces coverage (mass per mm halves)."""
+    strokes = get_golden_strokes()
+    
+    # Slow stroke
+    canvas_slow = np.ones_like(blank_canvas[0])
+    alpha_slow = np.zeros_like(blank_canvas[1])
+    stroke_slow = strokes['slow_stroke']
+    canvas_slow, alpha_slow = render_golden_case(renderer, stroke_slow, canvas_slow, alpha_slow)
+    coverage_slow = np.mean(alpha_slow)
+    
+    # Fast stroke
+    canvas_fast = np.ones_like(blank_canvas[0])
+    alpha_fast = np.zeros_like(blank_canvas[1])
+    stroke_fast = strokes['fast_stroke']
+    canvas_fast, alpha_fast = render_golden_case(renderer, stroke_fast, canvas_fast, alpha_fast)
+    coverage_fast = np.mean(alpha_fast)
+    
+    # Fast should have less coverage (less ink per mm)
+    assert coverage_fast < coverage_slow, \
+        f"Fast coverage {coverage_fast:.4f} not < slow coverage {coverage_slow:.4f}"
+    
+    # Should be roughly 10x difference (200 vs 20 mm/s)
+    ratio = coverage_slow / max(coverage_fast, 1e-9)
+    assert 3.0 < ratio < 15.0, \
+        f"Coverage ratio {ratio:.2f} outside expected range [3, 15]"
+
+
+@pytest.mark.physics
+def test_determinism(renderer):
+    """Test that rendering is deterministic across runs."""
+    stroke = get_golden_strokes()['straight_line']
+    
+    canvases = []
+    for _ in range(3):
+        canvas = np.ones((908, 1280, 3), dtype=np.float32)
+        alpha = np.zeros((908, 1280), dtype=np.float32)
+        canvas, _ = renderer.render_stroke(canvas, alpha, stroke)
+        canvases.append(canvas.copy())
+    
+    # All runs should be identical
+    for i in range(1, 3):
+        assert np.allclose(canvases[0], canvases[i], atol=1e-7), \
+            f"Run {i} differs from run 0 (non-deterministic)"
+
+
+@pytest.mark.physics
+def test_layering_alpha_over(renderer):
+    """Test that yellow over green produces yellowish-green (alpha-over)."""
+    # Green stroke
+    canvas = np.ones((908, 1280, 3), dtype=np.float32)
+    alpha = np.zeros((908, 1280), dtype=np.float32)
+    
+    stroke_green = {
+        'id': 'layer-green',
+        'bezier': {
+            'p1': (80.0, 150.0),
+            'p2': (100.0, 150.0),
+            'p3': (120.0, 150.0),
+            'p4': (140.0, 150.0)
+        },
+        'z_profile': {'z0': 6.0, 'z1': 6.0},
+        'speed_profile': {'v0': 50.0, 'v1': 50.0},
+        'color_cmy': {'c': 1.0, 'm': 0.0, 'y': 1.0}  # green = C+Y
     }
     
+    canvas, alpha = renderer.render_stroke(canvas, alpha, stroke_green)
+    
+    # Find center pixel
+    center_x = 110 * (1280 // 210)
+    center_y = 150 * (908 // 297)
+    color_green = canvas[center_y, center_x]
+    
+    # Yellow stroke over green
+    stroke_yellow = {
+        'id': 'layer-yellow',
+        'bezier': {
+            'p1': (80.0, 150.0),
+            'p2': (100.0, 150.0),
+            'p3': (120.0, 150.0),
+            'p4': (140.0, 150.0)
+        },
+        'z_profile': {'z0': 6.0, 'z1': 6.0},
+        'speed_profile': {'v0': 50.0, 'v1': 50.0},
+        'color_cmy': {'c': 0.0, 'm': 0.0, 'y': 1.0}  # yellow
+    }
+    
+    canvas, alpha = renderer.render_stroke(canvas, alpha, stroke_yellow)
+    color_result = canvas[center_y, center_x]
+    
+    # Result should be more yellowish (higher R, G) than pure green
+    assert color_result[1] >= color_green[1], \
+        "Yellow over green should increase G (more yellowish)"
+
+
+@pytest.mark.physics
+def test_coverage_stability(renderer):
+    """Test that coverage metrics are stable across runs."""
     stroke = get_golden_strokes()['straight_line']
     
     coverages = []
     for _ in range(3):
-        renderer = CPUReferenceRenderer({}, renderer_cfg, load_toy_luts())
         canvas = np.ones((908, 1280, 3), dtype=np.float32)
         alpha = np.zeros((908, 1280), dtype=np.float32)
         
         canvas, alpha = renderer.render_stroke(canvas, alpha, stroke)
-        coverage = metrics.paint_coverage_alpha(alpha)
-        coverages.append(coverage)
+        alpha_torch = torch.from_numpy(alpha)
+        coverage = metrics.paint_coverage(alpha_torch)
+        coverages.append(coverage.item())
     
     # All runs should give identical coverage
     assert all(abs(c - coverages[0]) < 1e-7 for c in coverages), \
@@ -513,4 +741,4 @@ def test_golden_thresholds_yaml_exists():
 # ============================================================================
 
 if __name__ == '__main__':
-    pytest.main([__file__, '-v', '--tb=short', '-m', 'golden'])
+    pytest.main([__file__, '-v', '--tb=short', '-m', 'golden or physics'])

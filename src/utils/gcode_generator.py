@@ -473,18 +473,21 @@ def generate_cmy_gcode(
 
 
 def generate_pen_gcode(
-    vectors: List[List[Tuple[float, float]]],
+    pen_vectors: validators.PenVectorsV1,
     machine_cfg: validators.MachineV1,
+    pen_tool_cfg: validators.PenToolV1,
     output_path: Union[str, Path]
 ) -> None:
-    """Generate G-code for pen layer.
+    """Generate G-code for pen layer with tool offset.
     
     Parameters
     ----------
-    vectors : List[List[Tuple[float, float]]]
-        List of polylines (image frame, relative to canvas), each polyline is list of (x, y) in mm
+    pen_vectors : validators.PenVectorsV1
+        Validated pen vectors (image frame, relative to canvas)
     machine_cfg : validators.MachineV1
         Machine configuration (includes canvas bounds)
+    pen_tool_cfg : validators.PenToolV1
+        Pen tool configuration (feeds, Z, offset)
     output_path : Union[str, Path]
         Output G-code file path
     
@@ -492,61 +495,87 @@ def generate_pen_gcode(
     -----
     Writes file atomically via fs.atomic_write_bytes().
     Uses PEN_UP/PEN_DOWN macros for pen control.
+    Applies tool offset (dx, dy, dz) after machine frame transform.
     Canvas bounds implicit from machine_cfg.
     """
-    logger.info(f"Generating pen G-code with {len(vectors)} vectors...")
+    logger.info(f"Generating pen G-code with {len(pen_vectors.paths)} paths...")
     
     lines = []
     
     # Header
     lines.extend(generate_gcode_header(machine_cfg))
+    lines.append(f"; Tool: {pen_tool_cfg.name}\n")
+    lines.append(f"; Tool offset: {pen_tool_cfg.offset_mm} mm\n")
+    lines.append("\n")
     
     # Pen up initially
     pen_up_lines = load_macro(machine_cfg, "pen_up")
     lines.extend(pen_up_lines)
     
-    # Default Z for pen (mid-range)
-    pen_z = machine_cfg.work_area_mm.z / 2.0
-    
-    # Default feed for pen (conservative)
-    pen_feed = speed_mm_s_to_feed(
-        min(100.0, machine_cfg.feeds.max_xy_mm_s / 2.0),
-        machine_cfg.feed_units,
-        machine_cfg
-    )
+    # Tool offset
+    tool_offset = torch.tensor(pen_tool_cfg.offset_mm[:2], dtype=torch.float32)  # [dx, dy]
+    tool_offset_z = pen_tool_cfg.offset_mm[2]
     
     # Canvas bounds for coordinate transform
     canvas = machine_cfg.canvas_mm
     canvas_bounds = (canvas.x_min, canvas.x_max, canvas.y_min, canvas.y_max)
     
-    # Process vectors
-    for vec_idx, polyline in enumerate(vectors):
-        lines.append(f"; VECTOR: {vec_idx}\n")
+    # Process paths
+    for path_obj in pen_vectors.paths:
+        lines.append(f"; PATH_ID: {path_obj.id}\n")
+        lines.append(f"; Role: {path_obj.role}, Kind: {path_obj.kind}\n")
         
-        if len(polyline) == 0:
+        polyline_mm = path_obj.points_mm
+        if len(polyline_mm) == 0:
             continue
         
         # Convert to tensor and transform to machine frame (absolute coordinates)
-        pts_img = torch.tensor(polyline, dtype=torch.float32)
+        pts_img = torch.tensor(polyline_mm, dtype=torch.float32)
         pts_mach = image_mm_to_machine_mm(pts_img, canvas_bounds, flip_y=True)
         
-        # Move to start (pen up)
-        x0, y0 = pts_mach[0, 0].item(), pts_mach[0, 1].item()
-        validate_soft_limits(x0, y0, pen_z, machine_cfg)
-        lines.append(f"G0 X{x0:.3f} Y{y0:.3f} Z{pen_z:.3f}\n")
+        # Apply tool offset
+        pts_mach_offset = pts_mach + tool_offset.unsqueeze(0)
         
-        # Pen down
+        # Z with offset
+        pen_z = path_obj.z_mm + tool_offset_z
+        
+        # Feed rate
+        pen_feed = speed_mm_s_to_feed(
+            path_obj.feed_mm_s,
+            machine_cfg.feed_units,
+            machine_cfg
+        )
+        
+        # Move to start (pen up)
+        x0, y0 = pts_mach_offset[0, 0].item(), pts_mach_offset[0, 1].item()
+        
+        # Safe travel Z
+        travel_z = pen_tool_cfg.safe_z_mm + tool_offset_z
+        validate_soft_limits(x0, y0, travel_z, machine_cfg)
+        lines.append(f"G0 X{x0:.3f} Y{y0:.3f} Z{travel_z:.3f}\n")
+        
+        # Pen down (plunge to drawing Z)
         pen_down_lines = load_macro(machine_cfg, "pen_down")
         lines.extend(pen_down_lines)
         
+        # Plunge feed
+        plunge_feed = speed_mm_s_to_feed(
+            pen_tool_cfg.plunge_mm_s,
+            machine_cfg.feed_units,
+            machine_cfg
+        )
+        validate_soft_limits(x0, y0, pen_z, machine_cfg)
+        lines.append(f"G1 Z{pen_z:.3f} F{plunge_feed:.1f}\n")
+        
         # Draw polyline
-        for i in range(1, len(pts_mach)):
-            x = pts_mach[i, 0].item()
-            y = pts_mach[i, 1].item()
+        for i in range(1, len(pts_mach_offset)):
+            x = pts_mach_offset[i, 0].item()
+            y = pts_mach_offset[i, 1].item()
             validate_soft_limits(x, y, pen_z, machine_cfg)
             lines.append(f"G1 X{x:.3f} Y{y:.3f} F{pen_feed:.1f}\n")
         
         # Pen up
+        lines.append(f"G0 Z{travel_z:.3f}\n")
         lines.extend(pen_up_lines)
         lines.append("\n")
     
@@ -564,7 +593,8 @@ def generate_all_gcode(
     job_cfg: validators.JobV1,
     machine_cfg: validators.MachineV1,
     strokes: validators.StrokesFileV1,
-    pen_vectors: Optional[List[List[Tuple[float, float]]]] = None,
+    pen_vectors: Optional[validators.PenVectorsV1] = None,
+    pen_tool_cfg: Optional[validators.PenToolV1] = None,
     output_dir: Union[str, Path] = "gcode_output"
 ) -> Dict[str, Path]:
     """Generate all G-code files for a job.
@@ -577,8 +607,10 @@ def generate_all_gcode(
         Validated machine configuration
     strokes : validators.StrokesFileV1
         Validated strokes container
-    pen_vectors : Optional[List[List[Tuple[float, float]]]]
-        Optional pen layer polylines (image frame)
+    pen_vectors : Optional[validators.PenVectorsV1]
+        Optional validated pen vectors (image frame)
+    pen_tool_cfg : Optional[validators.PenToolV1]
+        Optional pen tool configuration (required if pen_vectors provided)
     output_dir : Union[str, Path]
         Output directory, default "gcode_output"
     
@@ -587,6 +619,11 @@ def generate_all_gcode(
     Dict[str, Path]
         Mapping of artifact names to output paths
         Keys: 'cmy_gcode', 'pen_gcode', 'manifest'
+    
+    Raises
+    ------
+    ValueError
+        If pen_vectors provided but pen_tool_cfg is None
     
     Notes
     -----
@@ -608,8 +645,11 @@ def generate_all_gcode(
     # Generate pen G-code (if provided)
     pen_gcode_path = None
     if pen_vectors is not None and job_cfg.artifacts.pen_gcode_out:
+        if pen_tool_cfg is None:
+            raise ValueError("pen_tool_cfg required when pen_vectors provided")
+        
         pen_gcode_path = output_dir / Path(job_cfg.artifacts.pen_gcode_out).name
-        generate_pen_gcode(pen_vectors, machine_cfg, pen_gcode_path)
+        generate_pen_gcode(pen_vectors, machine_cfg, pen_tool_cfg, pen_gcode_path)
     
     # Generate manifest (platform-safe basename)
     manifest_path = output_dir / Path(job_cfg.artifacts.manifest_out).name
