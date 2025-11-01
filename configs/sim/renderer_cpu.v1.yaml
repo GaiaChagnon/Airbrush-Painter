@@ -46,7 +46,11 @@ deposition:
   speed_exponent: 1.0           # default: inverse proportional to speed
   
   # Global amplitude scale (tuned via layering tests)
-  k_mass: 2.8                   # Balanced for visible but transparent alcohol ink
+  # NOTE: Increased from 2.8 to 5.5 to 8.5 for more visible colors
+  k_mass: 8.5                   # Darker, more visible alcohol ink strokes
+  
+  # Mass conservation: normalize cross-section integral
+  normalize_cross_section: true # Ensures consistent mass independent of width/ROI cropping
 
 # Stamp train mode (alternative to distance transform)
 stamp_train:

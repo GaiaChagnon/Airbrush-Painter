@@ -879,11 +879,20 @@ class PenTracerV2Output(BaseModel):
 class PenTracerV2EdgeDetection(BaseModel):
     """Edge detection configuration."""
     enabled: bool = Field(True, description="Enable edge extraction")
-    canny_low: float = Field(50.0, ge=10.0, le=200.0, description="Canny lower threshold")
-    canny_high: float = Field(150.0, ge=50.0, le=400.0, description="Canny upper threshold")
-    min_length_px: int = Field(20, ge=5, le=200, description="Minimum edge length")
-    link_distance_px: int = Field(2, ge=0, le=10, description="Gap linking distance")
-    simplify_tol_px: float = Field(1.5, ge=0.1, le=5.0, description="Simplification tolerance")
+    # Bilateral filter preprocessing
+    bilateral_d: int = Field(9, ge=5, le=15, description="Bilateral filter diameter")
+    bilateral_sigma_color: float = Field(75.0, ge=50.0, le=150.0, description="Color smoothing")
+    bilateral_sigma_space: float = Field(75.0, ge=50.0, le=150.0, description="Spatial smoothing")
+    # Canny edge detection
+    canny_low: float = Field(30.0, ge=10.0, le=100.0, description="Canny low threshold")
+    canny_high: float = Field(100.0, ge=50.0, le=200.0, description="Canny high threshold")
+    sigma_px: float = Field(1.2, ge=0.5, le=3.0, description="Gaussian blur sigma")
+    # Morphological operations
+    closing_kernel_size: int = Field(5, ge=3, le=9, description="Closing kernel size")
+    merge_kernel_size: int = Field(3, ge=1, le=5, description="Merge kernel size")
+    # Filtering & simplification
+    min_length_px: int = Field(50, ge=10, le=100, description="Minimum edge length px")
+    simplify_tol_px: float = Field(0.5, ge=0.1, le=5.0, description="Simplification tolerance")
 
 
 class PenTracerV2CMYGamut(BaseModel):
@@ -915,8 +924,10 @@ class PenTracerV2ShadowHatching(BaseModel):
     cmy_gamut: PenTracerV2CMYGamut
     darkness_levels: List[PenTracerV2DarknessLevel]
     min_area_px: int = Field(500, ge=50, le=5000, description="Minimum shadow area")
+    close_gaps_px: int = Field(0, ge=0, le=10, description="Morphological closing kernel size")
     spacing_scale: float = Field(1.0, ge=0.1, le=5.0, description="Hatch spacing multiplier")
     min_line_spacing_mm: float = Field(0.5, ge=0.1, le=5.0, description="Minimum line spacing")
+    min_segment_length_mm: float = Field(0.0, ge=0.0, le=10.0, description="Minimum segment length to keep")
     max_hatch_coverage: float = Field(0.75, ge=0.0, le=1.0, description="Maximum hatch coverage fraction")
 
 

@@ -53,20 +53,20 @@ def main():
     ]
     
     # =========================================================================
-    # Section 1: Speed Variation (horizontal strokes, top section)
-    # Fast → Slow: lighter → darker
+    # Section 1: Within-Stroke Speed Gradients (horizontal strokes, top section)
+    # Each stroke accelerates: slow start → fast end = dark → light
     # =========================================================================
-    print("  Section 1: Speed variation...")
-    speeds = [180.0, 120.0, 80.0, 50.0, 25.0]
+    print("  Section 1: Within-stroke speed gradients (accelerating)...")
+    speed_pairs = [(25.0, 180.0), (30.0, 150.0), (40.0, 120.0), (50.0, 100.0), (60.0, 80.0)]
     y_start = 30.0
     y_spacing = 25.0
     
-    for i, speed in enumerate(speeds):
+    for i, (v0, v1) in enumerate(speed_pairs):
         color = colors[i % len(colors)]
         y_pos = y_start + i * y_spacing
         
         stroke = {
-            'id': f'speed-{speed}',
+            'id': f'speed-gradient-{i}',
             'bezier': {
                 'p1': (20.0, y_pos),
                 'p2': (70.0, y_pos),
@@ -74,86 +74,127 @@ def main():
                 'p4': (190.0, y_pos)
             },
             'z_profile': {'z0': 8.0, 'z1': 8.0},
-            'speed_profile': {'v0': speed, 'v1': speed},
+            'speed_profile': {'v0': v0, 'v1': v1},
             'color_cmy': {k: v for k, v in color.items() if k in ['c', 'm', 'y']}
         }
         canvas, alpha = renderer.render_stroke(canvas, alpha, stroke)
-        print(f"    {color['name']:8s} @ {speed:5.1f} mm/s")
+        print(f"    {color['name']:8s} @ {v0:5.1f}→{v1:5.1f} mm/s")
     
     # =========================================================================
-    # Section 2: Z-Height Variation (horizontal strokes, middle section)
-    # Low Z → High Z: narrow → wide
+    # Section 2: Within-Stroke Z-Height Gradients (horizontal strokes, middle section)
+    # Each stroke lifts: low start → high end = narrow → wide
     # =========================================================================
-    print("  Section 2: Z-height variation...")
-    z_heights = [3.0, 5.0, 8.0, 12.0, 16.0]
+    print("  Section 2: Within-stroke Z-height gradients (lifting)...")
+    z_pairs = [(3.0, 18.0), (4.0, 15.0), (5.0, 12.0), (6.0, 10.0), (7.0, 9.0)]
     y_start = 160.0
     y_spacing = 25.0
     
-    for i, z_height in enumerate(z_heights):
+    for i, (z0, z1) in enumerate(z_pairs):
         color = colors[(i + 2) % len(colors)]
         y_pos = y_start + i * y_spacing
         
         stroke = {
-            'id': f'z-{z_height}',
+            'id': f'z-gradient-{i}',
             'bezier': {
                 'p1': (20.0, y_pos),
                 'p2': (70.0, y_pos),
                 'p3': (140.0, y_pos),
                 'p4': (190.0, y_pos)
             },
-            'z_profile': {'z0': z_height, 'z1': z_height},
+            'z_profile': {'z0': z0, 'z1': z1},
             'speed_profile': {'v0': 60.0, 'v1': 60.0},
             'color_cmy': {k: v for k, v in color.items() if k in ['c', 'm', 'y']}
         }
         canvas, alpha = renderer.render_stroke(canvas, alpha, stroke)
-        print(f"    {color['name']:8s} @ Z={z_height:4.1f} mm")
+        print(f"    {color['name']:8s} @ Z={z0:4.1f}→{z1:4.1f} mm")
     
     # =========================================================================
     # Section 3: Crossing Strokes - Transparent Layering Demo
-    # Vertical and diagonal strokes that intersect to show blending
+    # Shows CMY color mixing including same-color overlaps and order dependence
     # =========================================================================
     print("  Section 3: Transparent layering with crossings...")
     
-    # Vertical strokes (left to right)
-    x_positions = [35.0, 65.0, 95.0, 125.0, 155.0, 185.0]
-    for i, x_pos in enumerate(x_positions):
-        color = colors[i % len(colors)]
-        
+    # Grid of horizontal strokes (all 7 colors)
+    y_positions = [60.0, 90.0, 120.0, 150.0, 180.0, 210.0, 240.0]
+    for i, (y_pos, color) in enumerate(zip(y_positions, colors)):
         stroke = {
-            'id': f'vertical-{i}',
+            'id': f'horizontal-layer-{i}',
             'bezier': {
-                'p1': (x_pos, 25.0),
-                'p2': (x_pos, 80.0),
-                'p3': (x_pos, 200.0),
+                'p1': (15.0, y_pos),
+                'p2': (70.0, y_pos),
+                'p3': (140.0, y_pos),
+                'p4': (195.0, y_pos)
+            },
+            'z_profile': {'z0': 7.0, 'z1': 7.0},
+            'speed_profile': {'v0': 60.0, 'v1': 60.0},
+            'color_cmy': {k: v for k, v in color.items() if k in ['c', 'm', 'y']}
+        }
+        canvas, alpha = renderer.render_stroke(canvas, alpha, stroke)
+        print(f"    Horizontal {color['name']:8s} @ Y={y_pos:5.1f} mm")
+    
+    # Grid of vertical strokes (all 7 colors) - will create same-color overlaps
+    x_positions = [30.0, 55.0, 80.0, 105.0, 130.0, 155.0, 180.0]
+    for i, (x_pos, color) in enumerate(zip(x_positions, colors)):
+        stroke = {
+            'id': f'vertical-layer-{i}',
+            'bezier': {
+                'p1': (x_pos, 30.0),
+                'p2': (x_pos, 90.0),
+                'p3': (x_pos, 190.0),
                 'p4': (x_pos, 270.0)
             },
-            'z_profile': {'z0': 8.0, 'z1': 8.0},
-            'speed_profile': {'v0': 70.0, 'v1': 70.0},
+            'z_profile': {'z0': 7.0, 'z1': 7.0},
+            'speed_profile': {'v0': 60.0, 'v1': 60.0},
             'color_cmy': {k: v for k, v in color.items() if k in ['c', 'm', 'y']}
         }
         canvas, alpha = renderer.render_stroke(canvas, alpha, stroke)
         print(f"    Vertical {color['name']:8s} @ X={x_pos:5.1f} mm")
     
-    # Diagonal strokes (crossing pattern)
-    diagonals = [
-        # Top-left to bottom-right
-        {'p1': (15.0, 25.0), 'p2': (70.0, 100.0), 'p3': (140.0, 200.0), 'p4': (195.0, 270.0)},
-        # Bottom-left to top-right
-        {'p1': (15.0, 270.0), 'p2': (70.0, 200.0), 'p3': (140.0, 100.0), 'p4': (195.0, 25.0)},
-    ]
+    # =========================================================================
+    # Section 3b: Order Dependence Test
+    # Two pairs showing cyan-over-magenta vs magenta-over-cyan
+    # =========================================================================
+    print("  Section 3b: Order dependence test...")
     
-    for i, diag in enumerate(diagonals):
-        color = colors[(i + 4) % len(colors)]
-        
-        stroke = {
-            'id': f'diagonal-{i}',
-            'bezier': diag,
-            'z_profile': {'z0': 10.0, 'z1': 10.0},
-            'speed_profile': {'v0': 80.0, 'v1': 80.0},
-            'color_cmy': {k: v for k, v in color.items() if k in ['c', 'm', 'y']}
-        }
-        canvas, alpha = renderer.render_stroke(canvas, alpha, stroke)
-        print(f"    Diagonal {color['name']:8s}")
+    # Pair 1: Cyan first, then Magenta crosses it
+    stroke = {
+        'id': 'order-test-1a',
+        'bezier': {'p1': (15.0, 35.0), 'p2': (40.0, 35.0), 'p3': (70.0, 35.0), 'p4': (95.0, 35.0)},
+        'z_profile': {'z0': 9.0, 'z1': 9.0},
+        'speed_profile': {'v0': 50.0, 'v1': 50.0},
+        'color_cmy': {'c': 1.0, 'm': 0.0, 'y': 0.0}  # cyan
+    }
+    canvas, alpha = renderer.render_stroke(canvas, alpha, stroke)
+    
+    stroke = {
+        'id': 'order-test-1b',
+        'bezier': {'p1': (55.0, 20.0), 'p2': (55.0, 30.0), 'p3': (55.0, 40.0), 'p4': (55.0, 50.0)},
+        'z_profile': {'z0': 9.0, 'z1': 9.0},
+        'speed_profile': {'v0': 50.0, 'v1': 50.0},
+        'color_cmy': {'c': 0.0, 'm': 1.0, 'y': 0.0}  # magenta
+    }
+    canvas, alpha = renderer.render_stroke(canvas, alpha, stroke)
+    print("    Order test 1: cyan → magenta crosses")
+    
+    # Pair 2: Magenta first, then Cyan crosses it
+    stroke = {
+        'id': 'order-test-2a',
+        'bezier': {'p1': (115.0, 35.0), 'p2': (140.0, 35.0), 'p3': (170.0, 35.0), 'p4': (195.0, 35.0)},
+        'z_profile': {'z0': 9.0, 'z1': 9.0},
+        'speed_profile': {'v0': 50.0, 'v1': 50.0},
+        'color_cmy': {'c': 0.0, 'm': 1.0, 'y': 0.0}  # magenta
+    }
+    canvas, alpha = renderer.render_stroke(canvas, alpha, stroke)
+    
+    stroke = {
+        'id': 'order-test-2b',
+        'bezier': {'p1': (155.0, 20.0), 'p2': (155.0, 30.0), 'p3': (155.0, 40.0), 'p4': (155.0, 50.0)},
+        'z_profile': {'z0': 9.0, 'z1': 9.0},
+        'speed_profile': {'v0': 50.0, 'v1': 50.0},
+        'color_cmy': {'c': 1.0, 'm': 0.0, 'y': 0.0}  # cyan
+    }
+    canvas, alpha = renderer.render_stroke(canvas, alpha, stroke)
+    print("    Order test 2: magenta → cyan crosses")
     
     # =========================================================================
     # Section 4: Curved Strokes - Bézier Demonstration
@@ -204,13 +245,15 @@ def main():
     
     print(f"\n✓ Saved: {output_path}")
     print(f"  Canvas size: {W}x{H} pixels")
-    print(f"  Total strokes: {len(speeds) + len(z_heights) + len(x_positions) + len(diagonals) + len(curves)}")
+    # Total: 5 speed + 5 z-height + 7 horizontal + 7 vertical + 4 order-test + 3 curves = 31 strokes
+    print(f"  Total strokes: {len(speed_pairs) + len(z_pairs) + 14 + 4 + len(curves)}")
     print(f"  Coverage: {np.mean(alpha)*100:.1f}%")
     print("\nDemo features:")
-    print("  ✓ Speed variation (5 strokes: fast→slow = light→dark)")
-    print("  ✓ Z-height variation (5 strokes: low→high = narrow→wide)")
+    print("  ✓ Within-stroke speed gradients (5 strokes: accelerating = dark→light)")
+    print("  ✓ Within-stroke Z-height gradients (5 strokes: lifting = narrow→wide)")
     print("  ✓ Color variety (7 distinct CMY colors)")
-    print("  ✓ Transparent layering (vertical + diagonal crossings)")
+    print("  ✓ Transparent layering (7×7 grid with same-color overlaps)")
+    print("  ✓ Order dependence test (cyan→magenta vs magenta→cyan)")
     print("  ✓ Bézier curves (S-curve, C-curve, Wave)")
     print("  ✓ All strokes within A4 bounds (0-210mm x 0-297mm)")
 

@@ -310,6 +310,24 @@ class CPUReferenceRenderer:
         
         return float(mass_per_mm)
     
+    def _compute_arc_lengths(self, polyline_mm: np.ndarray) -> np.ndarray:
+        """Compute cumulative arc-length at each polyline vertex.
+        
+        Parameters
+        ----------
+        polyline_mm : np.ndarray
+            Polyline vertices in mm, shape (N, 2)
+        
+        Returns
+        -------
+        np.ndarray
+            Cumulative arc-length at each vertex, shape (N,)
+        """
+        segments = np.diff(polyline_mm, axis=0)
+        lengths = np.sqrt((segments**2).sum(axis=1))
+        arc_lengths = np.concatenate([[0.0], np.cumsum(lengths)])
+        return arc_lengths
+    
     def _build_radial_profile(
         self,
         dist_mm: np.ndarray,
@@ -382,6 +400,135 @@ class CPUReferenceRenderer:
         # Normalize to [-1, 1]
         noise = (noise - noise.mean()) / max(noise.std(), 1e-6)
         return np.clip(noise, -1.0, 1.0)
+    
+    def _splat_circular_stamp(
+        self,
+        canvas: np.ndarray,
+        alpha_map: np.ndarray,
+        center_mm: np.ndarray,
+        width_mm: float,
+        mass_per_mm: float,
+        paint_color_rgb: np.ndarray,
+        sample_spacing_mm: float
+    ) -> tuple:
+        """Splat single circular stamp with radial profile.
+        
+        Parameters
+        ----------
+        canvas : np.ndarray
+            Canvas in linear RGB [0,1], shape (H, W, 3)
+        alpha_map : np.ndarray
+            Accumulated alpha, shape (H, W)
+        center_mm : np.ndarray
+            Stamp center in mm, shape (2,)
+        width_mm : float
+            Spray width in mm
+        mass_per_mm : float
+            Mass (opacity) per mm of path length
+        paint_color_rgb : np.ndarray
+            Paint color in linear RGB [0,1], shape (3,)
+        sample_spacing_mm : float
+            Arc-length spacing between samples (mm)
+        
+        Returns
+        -------
+        tuple
+            (canvas, alpha_map) after splatting
+        """
+        # Convert center to pixels
+        center_px = np.array([
+            center_mm[0] * self.dpi[0],
+            center_mm[1] * self.dpi[1]
+        ], dtype=np.float32)
+        
+        # Compute ROI around stamp (anisotropic margins for non-square pixels)
+        margin_factor = self.cpu_cfg['profile'].get('margin_factor', 1.5)
+        rx_mm = 0.5 * width_mm * margin_factor
+        ry_mm = 0.5 * width_mm * margin_factor
+        margin_x_px = int(np.ceil(rx_mm * self.dpi[0]))
+        margin_y_px = int(np.ceil(ry_mm * self.dpi[1]))
+        
+        x_min = max(0, int(center_px[0]) - margin_x_px)
+        x_max = min(self.canvas_w_px, int(center_px[0]) + margin_x_px + 1)
+        y_min = max(0, int(center_px[1]) - margin_y_px)
+        y_max = min(self.canvas_h_px, int(center_px[1]) + margin_y_px + 1)
+        
+        if x_max <= x_min or y_max <= y_min:
+            return canvas, alpha_map
+        
+        # Create coordinate grids for ROI
+        y_coords, x_coords = np.meshgrid(
+            np.arange(y_min, y_max, dtype=np.float32),
+            np.arange(x_min, x_max, dtype=np.float32),
+            indexing='ij'
+        )
+        
+        # Compute elliptical distance in mm (accounts for anisotropic pixels)
+        dx_mm = (x_coords - center_px[0]) / self.dpi[0]
+        dy_mm = (y_coords - center_px[1]) / self.dpi[1]
+        dist_mm = np.hypot(dx_mm, dy_mm)
+        
+        # Build radial profile
+        alpha_profile = self._build_radial_profile(dist_mm, width_mm)
+        
+        # Mass conservation: normalize cross-section so total deposited mass = mass_per_sample
+        # This ensures consistent deposition independent of width, anisotropy, and ROI cropping
+        k_mass = self.cpu_cfg['deposition'].get('k_mass', 2.5)
+        mass_per_sample = mass_per_mm * sample_spacing_mm
+        
+        normalize_cross_section = self.cpu_cfg['deposition'].get('normalize_cross_section', True)
+        if normalize_cross_section:
+            # Compute pixel area in mm²
+            pix_area_mm2 = (1.0 / self.dpi[0]) * (1.0 / self.dpi[1])
+            # Total mass in the profile (mm²)
+            profile_mass_mm2 = float(alpha_profile.sum()) * pix_area_mm2
+            
+            if profile_mass_mm2 > 0:
+                # Normalize so integral equals mass_per_sample, then apply k_mass gain
+                alpha_stamp = k_mass * (mass_per_sample / profile_mass_mm2) * alpha_profile
+            else:
+                alpha_stamp = np.zeros_like(alpha_profile, dtype=np.float32)
+        else:
+            # Legacy behavior: direct scaling (not mass-conserving)
+            alpha_stamp = k_mass * mass_per_sample * alpha_profile
+        
+        alpha_stamp = np.clip(alpha_stamp, 0.0, 1.0)
+        
+        # Extract ROI from canvas and alpha
+        canvas_roi = canvas[y_min:y_max, x_min:x_max, :]
+        alpha_roi = alpha_map[y_min:y_max, x_min:x_max]
+        
+        # Transparent filter compositing (alcohol ink model)
+        # Light transmission model: new_canvas = old_canvas * filter_transmission
+        # where filter_transmission = (1 - alpha) * 1.0 + alpha * paint_color
+        alpha_stamp_3d = alpha_stamp[:, :, np.newaxis]
+        paint_transmission = paint_color_rgb
+        
+        # For alcohol ink, we want to avoid over-darkening at intersections
+        # The issue: Porter-Duff alpha accumulation causes alpha to approach 1.0 too quickly
+        # Solution: Use transmission-based compositing where we track how much light passes through
+        
+        # Compute this layer's transmission per channel
+        # transmission = (1 - alpha) + alpha * paint_color
+        # This represents how much light passes through this layer of paint
+        layer_transmission = (1.0 - alpha_stamp_3d) + paint_transmission[np.newaxis, np.newaxis, :] * alpha_stamp_3d
+        
+        # Multiply transmissions (Beer-Lambert law for layered filters)
+        canvas_roi_new = canvas_roi * layer_transmission
+        canvas_roi_new = np.clip(canvas_roi_new, 0.0, 1.0)
+        
+        # Update alpha map using transmission-based formula
+        # Alpha represents "how much light is blocked" = 1 - transmission
+        # For white background (1,1,1), transmission = canvas_rgb
+        # So alpha = 1 - mean(canvas_rgb)
+        alpha_roi_new = 1.0 - np.mean(canvas_roi_new, axis=2)
+        alpha_roi_new = np.clip(alpha_roi_new, 0.0, 1.0)
+        
+        # Write back to canvas
+        canvas[y_min:y_max, x_min:x_max, :] = canvas_roi_new
+        alpha_map[y_min:y_max, x_min:x_max] = alpha_roi_new
+        
+        return canvas, alpha_map
     
     def _check_visibility(
         self,
@@ -517,107 +664,92 @@ class CPUReferenceRenderer:
             logger.warning("Degenerate stroke (< 2 polyline points), skipping")
             return canvas, alpha_map
         
-        # Use average z, v for width/mass (could interpolate per-sample if needed)
-        z_avg = 0.5 * (z0 + z1)
-        v_avg = 0.5 * (v0 + v1)
+        # Compute arc-lengths along polyline
+        arc_lengths = self._compute_arc_lengths(polyline_mm)
+        total_length = arc_lengths[-1]
         
-        # Compute width and mass
-        width_mm = self._width_mm(z_avg, v_avg)
-        mass_per_mm = self._mass_per_mm(z_avg, v_avg)
-        
-        # Convert polyline to pixels
-        polyline_px = np.zeros_like(polyline_mm)
-        polyline_px[:, 0] = polyline_mm[:, 0] * self.dpi[0]
-        polyline_px[:, 1] = polyline_mm[:, 1] * self.dpi[1]
-        polyline_px = polyline_px.astype(np.int32)
-        
-        # Compute ROI with margin
-        margin_px = int(np.ceil(0.5 * width_mm * self.dpi_avg * self.cpu_cfg['profile'].get('margin_factor', 1.5)))
-        x_min = max(0, polyline_px[:, 0].min() - margin_px)
-        x_max = min(self.canvas_w_px, polyline_px[:, 0].max() + margin_px + 1)
-        y_min = max(0, polyline_px[:, 1].min() - margin_px)
-        y_max = min(self.canvas_h_px, polyline_px[:, 1].max() + margin_px + 1)
-        
-        if x_max <= x_min or y_max <= y_min:
-            logger.warning("Stroke ROI outside canvas, skipping")
+        if total_length < 1e-6:
+            logger.warning("Degenerate stroke (zero length), skipping")
             return canvas, alpha_map
         
-        roi_w = x_max - x_min
-        roi_h = y_max - y_min
+        # Compute z/v at each polyline vertex for determining sample spacing
+        n_verts = len(polyline_mm)
+        z_vals = np.linspace(z0, z1, n_verts)
+        v_vals = np.linspace(v0, v1, n_verts)
+        widths = np.array([self._width_mm(z, v) for z, v in zip(z_vals, v_vals)])
         
-        # Shift polyline to ROI coordinates
-        polyline_roi = polyline_px.copy()
-        polyline_roi[:, 0] -= x_min
-        polyline_roi[:, 1] -= y_min
+        # Determine adaptive target spacing (4 samples per min width, capped at 0.5mm)
+        min_width_mm = widths.min()
+        target_ds = max(1e-3, min(0.25 * min_width_mm, 0.5))
         
-        # Rasterize 1-px centerline
-        mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
-        cv2.polylines(mask, [polyline_roi], isClosed=False, color=255, thickness=1)
+        # Create segments with true arc-length intervals
+        n_segs = max(1, int(np.ceil(total_length / target_ds)))
+        s_edges = np.linspace(0.0, total_length, n_segs + 1)  # (n_segs+1,) segment boundaries
+        s_centers = 0.5 * (s_edges[:-1] + s_edges[1:])        # (n_segs,) segment centers
+        ds = np.diff(s_edges)                                  # (n_segs,) actual spacing per segment
         
-        # Distance transform (use DIST_MASK_PRECISE for better diagonal accuracy)
-        dist_px = cv2.distanceTransform(255 - mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE).astype(np.float32)
+        # Interpolate positions at segment centers
+        sample_positions = np.zeros((n_segs, 2), dtype=np.float32)
+        sample_positions[:, 0] = np.interp(s_centers, arc_lengths, polyline_mm[:, 0])
+        sample_positions[:, 1] = np.interp(s_centers, arc_lengths, polyline_mm[:, 1])
         
-        # Convert to mm
-        dist_mm = dist_px / self.dpi_avg
+        # Interpolate z and v linearly by arc-length fraction at segment centers
+        sample_fractions = s_centers / total_length
+        sample_z = z0 + (z1 - z0) * sample_fractions
+        sample_v = v0 + (v1 - v0) * sample_fractions
         
-        # Build radial profile
-        phi = self._build_radial_profile(dist_mm, width_mm)
+        n_samples = n_segs
         
-        # Apply mass scaling
-        k_mass = self.cpu_cfg['deposition'].get('k_mass', 2.5)
-        alpha_profile = np.clip(k_mass * mass_per_mm * phi, 0.0, 1.0)
+        # Splat circular stamps at each segment center
+        canvas_before = canvas.copy()
+        alpha_before = alpha_map.copy()
         
-        # Zero out values below visibility threshold
-        min_alpha = self.cpu_cfg['visibility']['min_alpha_visible']
-        alpha_profile[alpha_profile < min_alpha] = 0.0
+        for i in range(n_samples):
+            center_mm = sample_positions[i]
+            z_i = sample_z[i]
+            v_i = sample_v[i]
+            
+            # Compute local width and mass
+            width_mm_i = self._width_mm(z_i, v_i)
+            mass_per_mm_i = self._mass_per_mm(z_i, v_i)
+            
+            # Use the actual segment spacing for this stamp (not a constant)
+            segment_spacing_mm = ds[i]
+            
+            # Splat stamp
+            canvas, alpha_map = self._splat_circular_stamp(
+                canvas, alpha_map,
+                center_mm, width_mm_i, mass_per_mm_i,
+                paint_color_rgb, segment_spacing_mm
+            )
         
-        # Extract ROI from canvas
-        canvas_roi = canvas[y_min:y_max, x_min:x_max]  # (h, w, 3)
-        alpha_roi = alpha_map[y_min:y_max, x_min:x_max]  # (h, w)
+        # Compute alpha delta for visibility check
+        alpha_delta = alpha_map - alpha_before
         
-        # Alcohol ink layering model (instant dry)
-        # Alcohol inks dry instantly on paper - no wet mixing.
-        # Each layer is a semi-transparent filter placed on top of previous layers.
-        # 
-        # Physics: Light passes through multiple transparent colored filters.
-        # Each filter absorbs some wavelengths (subtractive).
-        # 
-        # Model: Work in absorption space (1 - RGB), multiply absorptions, convert back.
-        # This is how stacked colored glass or film works.
-        
-        alpha_stamp = alpha_profile  # (h, w)
-        alpha_stamp_3d = alpha_stamp[:, :, np.newaxis]  # (h, w, 1)
-        
-        # Convert RGB to transmission (how much light passes through)
-        # transmission = 1 means all light passes (white/transparent)
-        # transmission = 0 means no light passes (black/opaque)
-        canvas_transmission = canvas_roi  # (h, w, 3)
-        paint_transmission = paint_color_rgb  # (3,)
-        
-        # New layer acts as a filter: reduces transmission by its own transmission
-        # Where alpha=1, full filter effect; where alpha=0, no filter
-        # transmission_new = transmission_old * lerp(1.0, paint_transmission, alpha)
-        filter_effect = (1.0 - alpha_stamp_3d) + paint_transmission[np.newaxis, np.newaxis, :] * alpha_stamp_3d
-        
-        canvas_roi_new = canvas_transmission * filter_effect
-        canvas_roi_new = np.clip(canvas_roi_new, 0.0, 1.0)
-        
-        # Update total alpha (accumulated opacity)
-        alpha_roi_new = alpha_roi + alpha_stamp * (1.0 - alpha_roi)
-        alpha_roi_new = np.clip(alpha_roi_new, 0.0, 1.0)
-        
-        # Visibility check
-        core_radius_mm = self.cpu_cfg['profile']['core_frac'] * 0.5 * width_mm
-        core_mask = dist_mm <= core_radius_mm
-        
-        alpha_delta = alpha_roi_new - alpha_roi
-        
-        if not self._check_visibility(canvas_roi, canvas_roi_new, alpha_delta, core_mask):
-            return canvas, alpha_map  # Skip this stroke
-        
-        # Write back to canvas
-        canvas[y_min:y_max, x_min:x_max] = canvas_roi_new
-        alpha_map[y_min:y_max, x_min:x_max] = alpha_roi_new
+        # Check visibility (optional gate)
+        if self.cpu_cfg['visibility'].get('enabled', True):
+            # For stamp-based rendering, we check overall visibility after all stamps
+            # Create a core mask from sample positions
+            core_mask = np.zeros_like(alpha_map, dtype=bool)
+            for i in range(n_samples):
+                center_px = np.array([
+                    int(sample_positions[i, 0] * self.dpi[0]),
+                    int(sample_positions[i, 1] * self.dpi[1])
+                ])
+                if 0 <= center_px[1] < self.canvas_h_px and 0 <= center_px[0] < self.canvas_w_px:
+                    # Mark a small region around center
+                    y_min_core = max(0, center_px[1] - 2)
+                    y_max_core = min(self.canvas_h_px, center_px[1] + 3)
+                    x_min_core = max(0, center_px[0] - 2)
+                    x_max_core = min(self.canvas_w_px, center_px[0] + 3)
+                    core_mask[y_min_core:y_max_core, x_min_core:x_max_core] = True
+            
+            visible = self._check_visibility(canvas_before, canvas, alpha_delta, core_mask)
+            if not visible:
+                stroke_id = stroke_dict.get('id', 'unknown')
+                coverage = np.mean(alpha_delta)
+                logger.debug(f"Stroke {stroke_id} failed visibility check (coverage={coverage:.9f}), reverting")
+                return canvas_before, alpha_before
         
         return canvas, alpha_map
     

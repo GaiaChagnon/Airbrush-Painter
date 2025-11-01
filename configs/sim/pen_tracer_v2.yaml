@@ -38,39 +38,201 @@ edge_detection:
   # Canny edge detection thresholds (applied to luminance channel)
   # Controls which color transitions are detected as "edges"
   # 
-  # TUNING GUIDE:
-  #   Higher thresholds → Only HARD color changes (e.g., dark blue vs white)
-  #   Lower thresholds → Also detect SOFT changes (e.g., blue vs light blue)
+  # ──────────────────────────────────────────────────────────────────────────
+  # Bilateral Filter Preprocessing
+  # ──────────────────────────────────────────────────────────────────────────
+  # Smooths gradients while preserving sharp edges
+  # CRITICAL for eliminating double lines from gradient artifacts
   # 
-  # RECOMMENDED RANGES:
-  #   canny_low:  50-150  (lower = more edges, including soft gradients)
-  #   canny_high: 100-300 (higher = only sharp transitions)
+  # bilateral_d: Neighborhood diameter
+  #   RANGE: 5-15
+  #   - 5-7:   Fast, less smoothing
+  #   - 9:     Balanced (RECOMMENDED)
+  #   - 11-15: Aggressive smoothing, slower
+  bilateral_d: 9
+  
+  # bilateral_sigma_color: Color smoothing strength
+  #   RANGE: 50-150
+  #   - 50-60:  Preserve more color variation
+  #   - 75:     Balanced (RECOMMENDED)
+  #   - 100-150: Strong smoothing, may blur edges
+  bilateral_sigma_color: 75
+  
+  # bilateral_sigma_space: Spatial smoothing strength
+  #   RANGE: 50-150
+  #   - 50-60:  More localized smoothing
+  #   - 75:     Balanced (RECOMMENDED)
+  #   - 100-150: Broader smoothing
+  bilateral_sigma_space: 75
+  
+  # ──────────────────────────────────────────────────────────────────────────
+  # Canny Edge Detection
+  # ──────────────────────────────────────────────────────────────────────────
+  # Lower thresholds = more edges (subtle transitions)
+  # Higher thresholds = fewer edges (only strong contrasts)
+  # 
+  # TUNING GUIDE:
+  #   canny_low:  10-100  (lower = more edges)
+  #   canny_high: 50-200  (lower = more edges)
   #   Typical ratio: canny_high = 2-3× canny_low
   # 
   # EXAMPLES:
-  #   - (50, 150):   Captures soft gradients, good for watercolor-style images
-  #   - (100, 200):  Balanced - only moderately sharp edges (current setting)
-  #   - (150, 300):  Very selective - only dramatic color jumps
+  #   - (20, 80):   Very sensitive, captures soft gradients
+  #   - (30, 100):  Balanced - good coverage (CURRENT)
+  #   - (50, 150):  Moderate - only clear edges
+  #   - (100, 200): Selective - only sharp transitions
   # 
-  # EFFECT: Higher → fewer, cleaner outlines; Lower → more detail, busier look
-  canny_low: 100.0
-  canny_high: 200.0
+  # EFFECT: Lower → more comprehensive outlines; Higher → cleaner, fewer lines
+  canny_low: 30.0
+  canny_high: 100.0
   
-  # Edge filtering
+  # sigma_px: Gaussian blur before Canny
+  #   RANGE: 0.5-3.0
+  #   - 0.5-1.0: Sharp, may be noisy
+  #   - 1.2-1.5: Balanced (RECOMMENDED)
+  #   - 2.0-3.0: Smooth, may miss fine details
+  sigma_px: 1.2
+  
+  # ──────────────────────────────────────────────────────────────────────────
+  # Morphological Operations
+  # ──────────────────────────────────────────────────────────────────────────
+  
+  # closing_kernel_size: Connect nearby edge fragments
+  #   RANGE: 3-9
+  #   - 3:   Minimal connection
+  #   - 5:   Balanced (RECOMMENDED)
+  #   - 7-9: Aggressive connection, may merge unrelated edges
+  closing_kernel_size: 5
+  
+  # merge_kernel_size: Merge parallel skeleton lines
+  #   RANGE: 1-5
+  #   - 1:   No merging
+  #   - 3:   Balanced (RECOMMENDED)
+  #   - 5:   Aggressive merging
+  merge_kernel_size: 3
+  
+  # ──────────────────────────────────────────────────────────────────────────
+  # Filtering & Simplification
+  # ──────────────────────────────────────────────────────────────────────────
+  
+  # min_length_px: Discard edges shorter than this
+  #   RANGE: 10-100 pixels
+  #   - 10-20: Keep fine details, more strokes
+  #   - 50:    Clean, essential outlines (CURRENT)
+  #   - 70+:   Very coarse, major features only
+  min_length_px: 50
+  
+  # simplify_tol_px: Douglas-Peucker simplification tolerance
+  #   RANGE: 0.5-5.0 pixels
+  #   - 0.5:   High fidelity, more points (CURRENT)
+  #   - 1.5:   Balanced
+  #   - 3.0+:  Aggressive smoothing, angular look
+  simplify_tol_px: 0.5
+  
+  # ──────────────────────────────────────────────────────────────────────────
+  # Adaptive Thresholding (NEW: Skeleton-based vectorization)
+  # ──────────────────────────────────────────────────────────────────────────
   # 
-  # min_length_px: Discard edges shorter than this (removes noise/texture)
-  #   RANGE: 5-50 pixels
-  #   - 5-10:  Keep fine details, more strokes
-  #   - 20-30: Clean, essential outlines only (current)
-  #   - 40+:   Very coarse, major features only
-  min_length_px: 20
+  # sigma_px: Gaussian blur sigma for edge detection
+  #   RANGE: 0.5-3.0
+  #   - 0.5-1.0: Sharp, may be noisy
+  #   - 1.2-1.5: Balanced (RECOMMENDED)
+  #   - 2.0-3.0: Smooth, may miss fine details
+  sigma_px: 1.2
   
-  # link_distance_px: Connect edges if gap is ≤ this (bridges broken contours)
+  # multiscale_sigmas: Multi-scale edge detection (captures edges at different scales)
+  #   If set, overrides sigma_px and runs Canny at multiple blur levels
+  #   RANGE: List of 1-3 sigma values
+  #   - [1.0, 2.0]: Captures both fine and coarse edges (RECOMMENDED)
+  #   - [0.8, 1.5, 2.5]: Three scales for complex images
+  #   - null: Use single sigma_px value
+  multiscale_sigmas: [1.0, 2.0]
+  
+  # hysteresis_q: Quantile-based adaptive thresholds [low, high]
+  #   Automatically adjusts Canny thresholds based on image gradient distribution
+  #   RANGE: [0.5-0.9, 0.8-0.98]
+  #   - [0.70, 0.90]: More edges, good for low-contrast images
+  #   - [0.75, 0.92]: Balanced (RECOMMENDED)
+  #   - [0.80, 0.95]: Fewer edges, only strong features
+  # 
+  # EFFECT: Replaces fixed canny_low/canny_high with adaptive values
+  hysteresis_q: [0.75, 0.92]
+  
+  # ──────────────────────────────────────────────────────────────────────────
+  # Skeletonization (Eliminates double lines)
+  # ──────────────────────────────────────────────────────────────────────────
+  # 
+  # skeletonize: Reduce edges to 1-pixel centerlines
+  #   Prevents cv2.findContours from tracing both sides of edges
+  #   CRITICAL: Set to true to eliminate double lines
+  # 
+  # EFFECT: Single-line outlines instead of parallel doubles
+  skeletonize: true
+  
+  # ──────────────────────────────────────────────────────────────────────────
+  # Gap Linking (Angle-aware endpoint connection)
+  # ──────────────────────────────────────────────────────────────────────────
+  # 
+  # link_gap_px: Maximum gap distance to bridge between endpoints
   #   RANGE: 0-10 pixels
   #   - 0: No linking (fragmented)
-  #   - 2-5: Moderate linking (current)
-  #   - 8+: Aggressive linking (may join unrelated edges)
-  link_distance_px: 2
+  #   - 3-5: Moderate linking (RECOMMENDED)
+  #   - 6-10: Aggressive linking (may join unrelated edges)
+  link_gap_px: 3
+  
+  # link_angle_deg: Maximum angle difference to consider endpoints compatible
+  #   Only links if directions agree within this tolerance
+  #   RANGE: 0-45 degrees
+  #   - 10-15: Strict, only nearly-aligned segments
+  #   - 20-25: Balanced (RECOMMENDED)
+  #   - 30-45: Permissive, may create sharp corners
+  # 
+  # EFFECT: Prevents linking edges that would create unnatural sharp turns
+  link_angle_deg: 20
+  
+  # ──────────────────────────────────────────────────────────────────────────
+  # Filtering & Simplification
+  # ──────────────────────────────────────────────────────────────────────────
+  # 
+  # min_len_mm: Minimum segment length (mm-aware filtering)
+  #   Filters out tiny dots and short fragments
+  #   RANGE: 0.5-20.0 mm
+  #   - 1.0-2.0: Keep most features
+  #   - 3.0-5.0: Balanced - remove dots but keep details (RECOMMENDED)
+  #   - 5.0-10.0: Aggressive - only major outlines
+  # 
+  # NOTE: Closed contours (circles) are kept if perimeter > min_len_mm
+  min_len_mm: 3.0
+  
+  # rdp_tol_mm: RDP simplification tolerance in millimeters
+  #   Geometry-aware simplification (accounts for physical pen resolution)
+  #   RANGE: 0.05-2.0 mm
+  #   - 0.1-0.2: High fidelity, many points
+  #   - 0.25-0.4: Balanced (RECOMMENDED)
+  #   - 0.5-1.0: Aggressive smoothing
+  # 
+  # EFFECT: Higher → smoother curves, fewer points, smaller G-code
+  rdp_tol_mm: 0.3
+  
+  # ──────────────────────────────────────────────────────────────────────────
+  # Deduplication (Collapse parallel double lines)
+  # ──────────────────────────────────────────────────────────────────────────
+  # 
+  # dedupe_min_sep_px: Collapse lines closer than this distance
+  #   RANGE: 0.5-10.0 pixels
+  #   - 1-2: Strict, only very close parallels (RECOMMENDED)
+  #   - 3-5: Moderate, may merge slightly separated lines
+  #   - 6-10: Aggressive, may over-merge
+  dedupe_min_sep_px: 2
+  
+  # dedupe_max_angle_deg: Maximum angle difference for parallel detection
+  #   RANGE: 0-30 degrees
+  #   - 5-10: Strict, only nearly-parallel lines (RECOMMENDED)
+  #   - 15-20: Moderate
+  #   - 25-30: Permissive, may merge non-parallel lines
+  # 
+  # EFFECT: Eliminates double-traced edges that skeleton missed
+  dedupe_max_angle_deg: 10
   
   # simplify_tol_px: Douglas-Peucker simplification tolerance
   #   RANGE: 0.5-5.0 pixels
@@ -78,7 +240,7 @@ edge_detection:
   #   - 1.5-2.5: Balanced (current)
   #   - 3.0+: Aggressive smoothing, angular look
   #   EFFECT: Higher → smoother curves, fewer points, smaller G-code
-  simplify_tol_px: 1.5
+  simplify_tol_px: 0.5
 
 # ============================================================================
 # SHADOW HATCHING (Darkness Filling)
@@ -219,6 +381,31 @@ shadow_hatching:
   #   - 0.5: Balanced (current)
   #   - 0.8+: Sparse (for thick pens or fast execution)
   min_line_spacing_mm: 0.5
+  
+  # ──────────────────────────────────────────────────────────────────────────
+  # Gap Closing & Segment Filtering
+  # ──────────────────────────────────────────────────────────────────────────
+  # 
+  # close_gaps_px: Morphological closing to connect nearby regions
+  #   Reduces "dotting" where color is slightly outside gamut range
+  #   RANGE: 0-5 pixels
+  #   - 0-1: Very precise, many small segments
+  #   - 2-3: Balanced - connects nearby regions (RECOMMENDED)
+  #   - 4-5: Aggressive - very smooth but may over-connect
+  # 
+  # EFFECT: Higher → fewer pen lifts, smoother strokes, less faithful to original
+  close_gaps_px: 10
+  
+  # min_segment_length_mm: Minimum length for hatch segments
+  #   Filters out tiny dots and short strokes that look messy
+  #   RANGE: 0.5-5.0 mm
+  #   - 0.5-1.0: Keep most details
+  #   - 1.0-2.0: Balanced - remove dots but keep small features (RECOMMENDED)
+  #   - 2.0-5.0: Aggressive - only long strokes
+  # 
+  # NOTE: Closed contours (circles, etc.) are kept if perimeter > min_length
+  # EFFECT: Higher → cleaner output, fewer pen lifts, but may lose small details
+  min_segment_length_mm: 3
   
   # ──────────────────────────────────────────────────────────────────────────
   # Coverage Limits

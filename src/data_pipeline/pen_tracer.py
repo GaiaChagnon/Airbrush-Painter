@@ -35,8 +35,7 @@ from skimage import morphology, measure
 from shapely.geometry import LineString
 import pyclipper
 
-from ..utils import validators, color, compute, geometry, metrics
-from ..utils import io as fs  # Use io module for consistency
+from ..utils import validators, color, compute, geometry, metrics, fs
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +44,7 @@ def compute_gamut_mask(
     img_lab: torch.Tensor,
     min_luminance: float,
     max_chroma: float,
+    hue_ranges: list,
     margin: float = 0.05
 ) -> np.ndarray:
     """Compute mask of regions outside CMY gamut.
@@ -57,6 +57,8 @@ def compute_gamut_mask(
         Minimum L* achievable by CMY (e.g., 15.0 for deep black)
     max_chroma : float
         Maximum chroma achievable by CMY (e.g., 80.0)
+    hue_ranges : list
+        List of [h_min, h_max] hue ranges in degrees that CMY can reproduce
     margin : float
         Safety margin for gamut expansion (0.0-0.3)
     
@@ -65,22 +67,34 @@ def compute_gamut_mask(
     out_of_gamut_mask : np.ndarray
         Binary mask, shape (H, W), 255 where pen is needed
     """
-    L = img_lab[0].numpy()
-    a = img_lab[1].numpy()
-    b = img_lab[2].numpy()
+    # GPU-safe: move to CPU before numpy conversion
+    L = img_lab[0].detach().cpu().numpy()
+    a = img_lab[1].detach().cpu().numpy()
+    b = img_lab[2].detach().cpu().numpy()
     
     # Compute chroma
     C = np.sqrt(a**2 + b**2)
+    
+    # Compute hue in degrees
+    hue = (np.degrees(np.arctan2(b, a)) + 360.0) % 360.0
     
     # Expand gamut by margin
     min_l_expanded = min_luminance * (1 + margin)
     max_c_expanded = max_chroma * (1 + margin)
     
-    # Out of gamut if:
-    # 1. Too dark (L* < min_luminance)
-    # 2. Too saturated (C > max_chroma)
+    # Out of gamut if too dark
     too_dark = L < min_l_expanded
-    too_saturated = C > max_c_expanded
+    
+    # Out of gamut if too saturated AND within problematic hue ranges
+    hue_ok = np.zeros_like(hue, dtype=bool)
+    for h0, h1 in hue_ranges:
+        if h0 <= h1:
+            hue_ok |= (hue >= h0) & (hue <= h1)
+        else:
+            # Wrap-around (e.g., [330, 30] for reds across 0°)
+            hue_ok |= (hue >= h0) | (hue <= h1)
+    
+    too_saturated = (C > max_c_expanded) & hue_ok
     
     out_of_gamut = (too_dark | too_saturated).astype(np.uint8) * 255
     
@@ -91,7 +105,7 @@ def extract_edges(
     img_rgb: torch.Tensor,
     cfg: validators.PenTracerV2EdgeDetection
 ) -> np.ndarray:
-    """Extract edges using Canny edge detection.
+    """Extract edges using LAB color space and Canny edge detection.
     
     Parameters
     ----------
@@ -109,37 +123,360 @@ def extract_edges(
         H, W = img_rgb.shape[1], img_rgb.shape[2]
         return np.zeros((H, W), dtype=np.uint8)
     
-    # Convert to grayscale
-    img_np = img_rgb.permute(1, 2, 0).numpy()
-    gray = cv2.cvtColor((img_np * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    # Convert to LAB for perceptually uniform color-aware edge detection
+    img_lab = color.rgb_to_lab(img_rgb)  # (3, H, W)
+    L_channel = img_lab[0].detach().cpu().numpy()  # (H, W) in [0, 100]
     
-    # Canny edge detection
-    edges = cv2.Canny(gray, cfg.canny_low, cfg.canny_high)
+    # Normalize L* to uint8
+    L_u8 = np.clip(L_channel * 255.0 / 100.0, 0, 255).astype(np.uint8)
     
-    # Link nearby edges
-    if cfg.link_distance_px > 0:
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (cfg.link_distance_px*2+1, cfg.link_distance_px*2+1)
-        )
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+    # Bilateral filter: smooths gradients while preserving sharp edges
+    # This eliminates the dark-light-dark artifacts that cause double lines
+    L_u8 = cv2.bilateralFilter(
+        L_u8,
+        d=cfg.bilateral_d,
+        sigmaColor=cfg.bilateral_sigma_color,
+        sigmaSpace=cfg.bilateral_sigma_space
+    )
     
-    # Remove short edges
-    if cfg.min_length_px > 0:
-        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        filtered = np.zeros_like(edges)
-        for cnt in contours:
-            if cv2.arcLength(cnt, False) >= cfg.min_length_px:
-                cv2.drawContours(filtered, [cnt], -1, 255, 1)
-        edges = filtered
+    # Apply Gaussian blur
+    blurred = cv2.GaussianBlur(L_u8, (0, 0), cfg.sigma_px)
+    
+    # Canny edge detection with configurable thresholds
+    edges = cv2.Canny(blurred, cfg.canny_low, cfg.canny_high)
+    
+    # Apply morphological closing to connect nearby edge fragments
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (cfg.closing_kernel_size, cfg.closing_kernel_size)
+    )
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+    
+    # Skeletonize to eliminate double lines (both sides of edges)
+    from skimage.morphology import skeletonize
+    edges = skeletonize(edges > 0).astype(np.uint8) * 255
+    
+    # Dilate skeleton slightly to merge nearby parallel lines (from gradient artifacts)
+    # Then skeletonize again to get single centerline
+    merge_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (cfg.merge_kernel_size, cfg.merge_kernel_size)
+    )
+    edges = cv2.dilate(edges, merge_kernel, iterations=1)
+    edges = skeletonize(edges > 0).astype(np.uint8) * 255
     
     return edges
+
+
+def _trace_skeleton_to_polylines(skel_u8: np.ndarray) -> List[np.ndarray]:
+    """Convert 1-px skeleton to ordered polylines (pixel coords).
+    
+    Walks skeleton graph from endpoints through junctions, producing
+    long connected polylines instead of fragmented contours.
+    
+    Parameters
+    ----------
+    skel_u8 : np.ndarray
+        Binary skeleton mask, shape (H, W), dtype uint8
+    
+    Returns
+    -------
+    polylines : List[np.ndarray]
+        List of polylines in pixel coordinates, each shape (N, 2) as (x, y)
+    """
+    skel = (skel_u8 > 0).astype(np.uint8)
+    H, W = skel.shape
+    nbrs = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+    
+    # Degree map (8-connected)
+    deg = cv2.filter2D(skel, -1, np.ones((3,3), np.uint8)) - skel
+    endpoints = np.argwhere((skel==1) & (deg==1))
+    visited = np.zeros_like(skel, dtype=bool)
+    
+    def walk(p):
+        """Walk from point p until hitting junction or dead end."""
+        path = [tuple(p)]
+        visited[p[0], p[1]] = True
+        prev = None
+        cur = tuple(p)
+        
+        while True:
+            nexts = []
+            for dy, dx in nbrs:
+                ny, nx = cur[0]+dy, cur[1]+dx
+                if 0 <= ny < H and 0 <= nx < W and skel[ny,nx] and not visited[ny,nx]:
+                    if prev is None or (ny, nx) != prev:
+                        nexts.append((ny, nx))
+            
+            if len(nexts) == 0:
+                break
+            
+            nxt = nexts[0]  # Prefer straight continuation if multiple
+            prev, cur = cur, nxt
+            visited[cur[0], cur[1]] = True
+            path.append(cur)
+            
+            # Stop at junction
+            if deg[cur[0], cur[1]] >= 3:
+                break
+        
+        return np.array(path, dtype=np.float32)[:, ::-1]  # (y,x) -> (x,y)
+    
+    polylines = []
+    
+    # Trace from endpoints
+    for p in endpoints:
+        if not visited[p[0], p[1]]:
+            path = walk(p)
+            if len(path) >= 2:
+                polylines.append(path)
+    
+    # Trace remaining cycles (closed loops without endpoints)
+    rem = np.argwhere((skel==1) & (~visited))
+    for p in rem:
+        if not visited[p[0], p[1]]:
+            path = walk(p)
+            if len(path) >= 2:
+                polylines.append(path)
+    
+    return polylines
+
+
+def _link_and_simplify(
+    polys_px: List[np.ndarray],
+    sx_mm_per_px: float,
+    sy_mm_per_px: float,
+    link_gap_px: int,
+    link_angle_deg: float,
+    min_len_mm: float,
+    rdp_tol_mm: float
+) -> List[np.ndarray]:
+    """Link nearby endpoints and simplify with mm-aware RDP.
+    
+    Parameters
+    ----------
+    polys_px : List[np.ndarray]
+        List of polylines in pixel coordinates
+    sx_mm_per_px : float
+        Millimeters per pixel in X direction
+    sy_mm_per_px : float
+        Millimeters per pixel in Y direction
+    link_gap_px : int
+        Maximum gap distance to bridge
+    link_angle_deg : float
+        Maximum angle difference for linking
+    min_len_mm : float
+        Minimum segment length to keep
+    rdp_tol_mm : float
+        RDP simplification tolerance in mm
+    
+    Returns
+    -------
+    simplified : List[np.ndarray]
+        Linked and simplified polylines in pixel coordinates
+    """
+    
+    def len_mm(p):
+        """Calculate polyline length in mm with anisotropic scaling."""
+        d = np.diff(p, axis=0)
+        L = np.sqrt((d[:,0]*sx_mm_per_px)**2 + (d[:,1]*sy_mm_per_px)**2).sum()
+        return L
+    
+    def angle_of(p, head=True):
+        """Get direction angle at head or tail."""
+        v = (p[1]-p[0]) if head else (p[-1]-p[-2])
+        return np.degrees(np.arctan2(v[1], v[0]))
+    
+    # 1. Drop short fragments
+    keep = [p for p in polys_px if len_mm(p) >= min_len_mm]
+    
+    # 2. Endpoint linking (spatial index for O(N log N) instead of O(N²))
+    # Build KD-tree for fast nearest-neighbor queries
+    from scipy.spatial import cKDTree
+    
+    # Limit iterations to prevent infinite loops
+    max_iterations = 5
+    for iteration in range(max_iterations):
+        if len(keep) == 0:
+            break
+        
+        # Collect all endpoints with metadata
+        endpoints = []
+        for i, p in enumerate(keep):
+            if len(p) >= 2:
+                endpoints.append((i, 'tail', p[-1], angle_of(p, head=False)))
+                endpoints.append((i, 'head', p[0], angle_of(p, head=True)))
+        
+        if len(endpoints) == 0:
+            break
+        
+        # Build spatial index
+        coords = np.array([ep[2] for ep in endpoints])
+        tree = cKDTree(coords)
+        
+        # Find pairs within link_gap_px
+        pairs = tree.query_pairs(link_gap_px, output_type='ndarray')
+        
+        if len(pairs) == 0:
+            break
+        
+        # Process pairs (greedy linking)
+        used = set()
+        merged = []
+        
+        for idx1, idx2 in pairs:
+            ep1 = endpoints[idx1]
+            ep2 = endpoints[idx2]
+            
+            i1, end1, pt1, ang1 = ep1
+            i2, end2, pt2, ang2 = ep2
+            
+            # Skip if same polyline or already used
+            if i1 == i2 or i1 in used or i2 in used:
+                continue
+            
+            # Check angle compatibility
+            angle_diff = abs(((ang1 - ang2 + 180) % 360) - 180)
+            if angle_diff > link_angle_deg:
+                continue
+            
+            # Link tail->head or tail->tail
+            if end1 == 'tail' and end2 == 'head':
+                merged.append(np.vstack([keep[i1], keep[i2]]))
+                used.add(i1)
+                used.add(i2)
+            elif end1 == 'tail' and end2 == 'tail':
+                merged.append(np.vstack([keep[i1], keep[i2][::-1]]))
+                used.add(i1)
+                used.add(i2)
+        
+        # Keep unmerged + merged
+        keep = [p for i, p in enumerate(keep) if i not in used] + merged
+        
+        if len(merged) == 0:
+            break
+    
+    # 3. Simplify with mm-aware RDP
+    eps_px = rdp_tol_mm / max(sx_mm_per_px, sy_mm_per_px)
+    simplified = []
+    for p in keep:
+        approx = cv2.approxPolyDP(
+            p.reshape(-1,1,2).astype(np.float32),
+            epsilon=eps_px,
+            closed=False
+        ).reshape(-1,2)
+        if approx.shape[0] >= 2 and len_mm(approx) >= min_len_mm:
+            simplified.append(approx)
+    
+    return simplified
+
+
+def _dedupe_parallel(
+    polys_px: List[np.ndarray],
+    dedupe_min_sep_px: float,
+    dedupe_max_angle_deg: float
+) -> List[np.ndarray]:
+    """Collapse near-parallel double lines into single centerlines.
+    
+    Parameters
+    ----------
+    polys_px : List[np.ndarray]
+        List of polylines in pixel coordinates
+    dedupe_min_sep_px : float
+        Collapse lines closer than this distance
+    dedupe_max_angle_deg : float
+        Maximum angle difference for parallel detection
+    
+    Returns
+    -------
+    out : List[np.ndarray]
+        Deduplicated polylines
+    """
+    
+    if len(polys_px) == 0:
+        return []
+    
+    # Pre-compute metadata for spatial filtering
+    metadata = []
+    for i, p in enumerate(polys_px):
+        v = p[-1] - p[0]
+        angle = np.degrees(np.arctan2(v[1], v[0]))
+        length = np.linalg.norm(v)
+        bbox_min = p.min(axis=0)
+        bbox_max = p.max(axis=0)
+        center = (bbox_min + bbox_max) / 2
+        metadata.append({
+            'idx': i,
+            'angle': angle,
+            'length': length,
+            'bbox_min': bbox_min,
+            'bbox_max': bbox_max,
+            'center': center,
+            'poly': p
+        })
+    
+    # Sort by length (descending) to keep longer lines
+    metadata.sort(key=lambda m: m['length'], reverse=True)
+    
+    used = set()
+    out = []
+    
+    for i, mi in enumerate(metadata):
+        if mi['idx'] in used:
+            continue
+        
+        # Mark as used
+        used.add(mi['idx'])
+        keep = True
+        
+        # Check against already kept lines (not all lines)
+        for mj in metadata[:i]:
+            if mj['idx'] in used or mj['idx'] == mi['idx']:
+                continue
+            
+            # Quick bbox check (with padding)
+            if (mi['bbox_max'][0] < mj['bbox_min'][0] - dedupe_min_sep_px or
+                mi['bbox_min'][0] > mj['bbox_max'][0] + dedupe_min_sep_px or
+                mi['bbox_max'][1] < mj['bbox_min'][1] - dedupe_min_sep_px or
+                mi['bbox_min'][1] > mj['bbox_max'][1] + dedupe_min_sep_px):
+                continue
+            
+            # Quick angle check
+            angle_diff = abs(((mi['angle'] - mj['angle'] + 180) % 360) - 180)
+            if angle_diff > dedupe_max_angle_deg:
+                continue
+            
+            # Quick center distance check
+            center_dist = np.linalg.norm(mi['center'] - mj['center'])
+            if center_dist > dedupe_min_sep_px * 5:
+                continue
+            
+            # Detailed distance check (sample 10 points)
+            pi = mi['poly']
+            pj = mj['poly']
+            sample_idx = np.linspace(0, len(pi)-1, min(10, len(pi)), dtype=int)
+            dists = []
+            for idx in sample_idx:
+                dists.append(np.min(np.linalg.norm(pj - pi[idx], axis=1)))
+            
+            mean_sep = float(np.mean(dists))
+            if mean_sep <= dedupe_min_sep_px:
+                # This is a duplicate of a longer line - skip it
+                keep = False
+                break
+        
+        if keep:
+            out.append(mi['poly'])
+    
+    return out
 
 
 def vectorize_edges(
     edge_mask: np.ndarray,
     simplify_tol_px: float,
-    mm_per_px: float
+    min_length_px: int,
+    sx_mm_per_px: float,
+    sy_mm_per_px: float
 ) -> List[np.ndarray]:
     """Vectorize edge mask to polylines.
     
@@ -149,8 +486,10 @@ def vectorize_edges(
         Binary edge mask, shape (H, W)
     simplify_tol_px : float
         Douglas-Peucker simplification tolerance
-    mm_per_px : float
-        Millimeters per pixel
+    sx_mm_per_px : float
+        Millimeters per pixel in X direction
+    sy_mm_per_px : float
+        Millimeters per pixel in Y direction
     
     Returns
     -------
@@ -165,14 +504,26 @@ def vectorize_edges(
         if len(pts_px) < 2:
             continue
         
+        # Filter by minimum length (in pixels)
+        if min_length_px > 0:
+            perimeter_px = cv2.arcLength(cnt, closed=False)
+            if perimeter_px < min_length_px:
+                continue
+        
         # Simplify
         if simplify_tol_px > 0:
             line = LineString(pts_px)
             line_simplified = line.simplify(simplify_tol_px, preserve_topology=True)
             pts_px = np.array(line_simplified.coords)
         
-        # Convert to mm
-        pts_mm = pts_px * mm_per_px
+        # Clip to image bounds (H, W)
+        H, W = edge_mask.shape
+        pts_px[:,0] = np.clip(pts_px[:,0], 0, W-1)
+        pts_px[:,1] = np.clip(pts_px[:,1], 0, H-1)
+        
+        # Convert to mm with anisotropic scaling
+        pts_mm = np.stack([pts_px[:,0] * sx_mm_per_px,
+                          pts_px[:,1] * sy_mm_per_px], axis=1)
         polylines_mm.append(pts_mm)
     
     return polylines_mm
@@ -239,7 +590,8 @@ def generate_hatch_pattern(
     mask: np.ndarray,
     hatch_spacing_px: float,
     hatch_angle_deg: float,
-    mm_per_px: float
+    sx_mm_per_px: float,
+    sy_mm_per_px: float
 ) -> List[np.ndarray]:
     """Generate hatching lines for a region.
     
@@ -251,8 +603,10 @@ def generate_hatch_pattern(
         Spacing between hatch lines
     hatch_angle_deg : float
         Hatch angle in degrees
-    mm_per_px : float
-        Millimeters per pixel
+    sx_mm_per_px : float
+        Millimeters per pixel in X direction
+    sy_mm_per_px : float
+        Millimeters per pixel in Y direction
     
     Returns
     -------
@@ -318,10 +672,15 @@ def generate_hatch_pattern(
         if start_idx is not None:
             segments.append((start_idx, len(inside)-1))
         
-        # Convert to mm
+        # Convert to mm with anisotropic scaling and clip to bounds
         for start, end in segments:
             if end - start >= 2:
-                seg_mm = samples[start:end+1] * mm_per_px
+                seg_px = samples[start:end+1]
+                # Clip to image bounds
+                seg_px[:,0] = np.clip(seg_px[:,0], 0, W-1)
+                seg_px[:,1] = np.clip(seg_px[:,1], 0, H-1)
+                seg_mm = np.stack([seg_px[:,0] * sx_mm_per_px,
+                                  seg_px[:,1] * sy_mm_per_px], axis=1)
                 hatch_lines_mm.append(seg_mm)
         
         y_current += hatch_spacing_px
@@ -407,9 +766,12 @@ def make_pen_layer(
     
     H, W = target_h, target_w
     render_px = [W, H]
-    mm_per_px = work_area_mm[1] / H
     
-    logger.info(f"  Resolution: {W}x{H} px, {mm_per_px:.4f} mm/px")
+    # Anisotropic scaling: separate X and Y scales for correct aspect ratio
+    sx_mm_per_px = work_area_mm[0] / W
+    sy_mm_per_px = work_area_mm[1] / H
+    
+    logger.info(f"  Resolution: {W}x{H} px, sx={sx_mm_per_px:.4f} mm/px, sy={sy_mm_per_px:.4f} mm/px")
     
     # Initialize paths
     all_paths = []
@@ -433,6 +795,7 @@ def make_pen_layer(
             img_lab,
             gamut_cfg.min_luminance,
             gamut_cfg.max_chroma,
+            gamut_cfg.hue_ranges,
             pen_tracer_cfg.calibration.margin
         )
         
@@ -456,10 +819,13 @@ def make_pen_layer(
         if pen_tracer_cfg.debug.save_edge_mask:
             cv2.imwrite(str(debug_path / "edge_mask.png"), edge_mask)
         
+        # Vectorize edges using contour-based approach
         edge_polylines = vectorize_edges(
             edge_mask,
             pen_tracer_cfg.edge_detection.simplify_tol_px,
-            mm_per_px
+            pen_tracer_cfg.edge_detection.min_length_px,
+            sx_mm_per_px,
+            sy_mm_per_px
         )
         
         logger.info(f"  Found {len(edge_polylines)} edge contours")
@@ -470,10 +836,10 @@ def make_pen_layer(
                 'id': f"pen-{path_id_counter:06d}",
                 'kind': 'polyline',
                 'role': 'outline',
-                'tip_diameter_mm': pen_tool_cfg.tip_diameter_mm,
-                'z_mm': pen_tool_cfg.draw_z_mm,
-                'feed_mm_s': pen_tool_cfg.feed_mm_s,
-                'points_mm': polyline_mm.tolist()
+                'tip_diameter_mm': float(pen_tool_cfg.tip_diameter_mm),
+                'z_mm': float(pen_tool_cfg.draw_z_mm),
+                'feed_mm_s': float(pen_tool_cfg.feed_mm_s),
+                'points_mm': polyline_mm.tolist()  # Keep as is, numpy's tolist() is optimized
             }
             all_paths.append(path_dict)
             path_id_counter += 1
@@ -491,9 +857,34 @@ def make_pen_layer(
             pen_tracer_cfg.shadow_hatching.min_area_px
         )
         
-        # Generate hatching
-        base_spacing_px = pen_tool_cfg.tip_diameter_mm / mm_per_px
+        # Apply morphological closing to connect nearby regions (reduce pen lifts)
+        if pen_tracer_cfg.shadow_hatching.close_gaps_px > 0:
+            close_kernel_size = pen_tracer_cfg.shadow_hatching.close_gaps_px
+            close_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (2*close_kernel_size+1, 2*close_kernel_size+1)
+            )
+            for key in shadow_masks:
+                shadow_masks[key] = cv2.morphologyEx(
+                    shadow_masks[key],
+                    cv2.MORPH_CLOSE,
+                    close_kernel
+                )
+            logger.info(f"  Applied gap closing ({close_kernel_size}px kernel)")
+        
+        # Dilate edge mask to create exclusion zone (prevent edge-hatch overlap)
+        edge_exclusion_mask = None
+        if pen_tracer_cfg.edge_detection.enabled and 'edge_mask' in locals():
+            dilation_px = max(1, int(0.5 * pen_tool_cfg.tip_diameter_mm / sy_mm_per_px))  # Truncate, don't round
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*dilation_px+1, 2*dilation_px+1))
+            edge_exclusion_mask = cv2.dilate(edge_mask, kernel)
+            logger.info(f"  Created edge exclusion zone ({dilation_px}px dilation)")
+        
+        # Generate hatching with minimum spacing enforcement
+        base_spacing_px = pen_tool_cfg.tip_diameter_mm / sy_mm_per_px
         hatch_spacing_px = base_spacing_px * (1.0 - pen_tool_cfg.overlap_frac) * pen_tracer_cfg.shadow_hatching.spacing_scale
+        min_spacing_px = pen_tracer_cfg.shadow_hatching.min_line_spacing_mm / sy_mm_per_px
+        hatch_spacing_px = max(hatch_spacing_px, min_spacing_px)
         
         total_hatch_lines = 0
         max_hatch_pixels = int(H * W * pen_tracer_cfg.shadow_hatching.max_hatch_coverage)
@@ -505,6 +896,11 @@ def make_pen_layer(
                 continue
             
             mask = shadow_masks[key]
+            
+            # Apply edge exclusion
+            if edge_exclusion_mask is not None:
+                mask = cv2.bitwise_and(mask, cv2.bitwise_not(edge_exclusion_mask))
+            
             if mask.sum() == 0:
                 continue
             
@@ -520,18 +916,38 @@ def make_pen_layer(
             
             # Generate passes
             for pass_idx, angle in enumerate(level.hatch_angles):
-                hatch_lines = generate_hatch_pattern(mask, hatch_spacing_px, angle, mm_per_px)
+                hatch_lines = generate_hatch_pattern(mask, hatch_spacing_px, angle, sx_mm_per_px, sy_mm_per_px)
+                
+                # Filter out segments that are too short (dots/tiny strokes)
+                if pen_tracer_cfg.shadow_hatching.min_segment_length_mm > 0:
+                    min_len_mm = pen_tracer_cfg.shadow_hatching.min_segment_length_mm
+                    filtered_lines = []
+                    for line_mm in hatch_lines:
+                        # Calculate segment length
+                        segment_length_mm = np.linalg.norm(np.diff(line_mm, axis=0), axis=1).sum()
+                        
+                        # Keep if long enough OR if it's a closed contour (first == last point)
+                        is_closed = np.allclose(line_mm[0], line_mm[-1], atol=0.1)
+                        if segment_length_mm >= min_len_mm or (is_closed and segment_length_mm >= min_len_mm * 0.5):
+                            filtered_lines.append(line_mm)
+                    
+                    num_filtered = len(hatch_lines) - len(filtered_lines)
+                    hatch_lines = filtered_lines
+                    if num_filtered > 0:
+                        logger.info(f"    Filtered {num_filtered} short segments (< {min_len_mm:.1f}mm)")
                 
                 logger.info(f"    Pass {pass_idx+1}/{level.passes} ({angle}°): {len(hatch_lines)} lines")
                 
                 # Add to paths and track coverage
                 for line_mm in hatch_lines:
-                    # Estimate pixels covered by this line
+                    # Estimate pixels covered by this line (accounting for pen tip width)
                     line_length_mm = np.linalg.norm(np.diff(line_mm, axis=0), axis=1).sum()
-                    line_pixels = int(line_length_mm / mm_per_px)
+                    thick_px = max(1, int(pen_tool_cfg.tip_diameter_mm / sy_mm_per_px))
+                    line_length_px = line_length_mm / sy_mm_per_px
+                    line_area_px = int(np.ceil(line_length_px * thick_px))
                     
                     # Check if adding this line would exceed coverage limit
-                    if current_hatch_pixels + line_pixels > max_hatch_pixels:
+                    if current_hatch_pixels + line_area_px > max_hatch_pixels:
                         logger.warning(f"    Stopping - coverage limit reached")
                         break
                     
@@ -539,14 +955,14 @@ def make_pen_layer(
                         'id': f"pen-{path_id_counter:06d}",
                         'kind': 'polyline',
                         'role': 'hatch',
-                        'tip_diameter_mm': pen_tool_cfg.tip_diameter_mm,
-                        'z_mm': pen_tool_cfg.draw_z_mm,
-                        'feed_mm_s': pen_tool_cfg.feed_mm_s,
+                        'tip_diameter_mm': float(pen_tool_cfg.tip_diameter_mm),
+                        'z_mm': float(pen_tool_cfg.draw_z_mm),
+                        'feed_mm_s': float(pen_tool_cfg.feed_mm_s),
                         'points_mm': line_mm.tolist()
                     }
                     all_paths.append(path_dict)
                     path_id_counter += 1
-                    current_hatch_pixels += line_pixels
+                    current_hatch_pixels += line_area_px
                     total_hatch_lines += 1
                 
                 if current_hatch_pixels >= max_hatch_pixels:
@@ -563,6 +979,10 @@ def make_pen_layer(
     # ========================================================================
     # SAVE PEN VECTORS
     # ========================================================================
+    # Collect all hatch angles used
+    all_angles = sorted({a for lvl in pen_tracer_cfg.shadow_hatching.darkness_levels
+                           for a in lvl.hatch_angles}) if pen_tracer_cfg.shadow_hatching.enabled else []
+    
     pen_vectors_data = {
         'schema': 'pen_vectors.v1',
         'render_px': render_px,
@@ -571,15 +991,34 @@ def make_pen_layer(
         'metadata': {
             'tool_name': pen_tool_cfg.name,
             'offset_mm': pen_tool_cfg.offset_mm,
+            'hatch_angles_deg': all_angles,
             'generated_at': datetime.utcnow().isoformat() + 'Z',
-            'tracer_version': 'pen_tracer.v3',
-            'gamut_aware': pen_tracer_cfg.shadow_hatching.gamut_aware
+            'tracer_version': 'pen_tracer.v2'
         }
     }
     
     pen_vectors_path = out_path / "pen_vectors.yaml"
-    logger.info(f"Saving {len(all_paths)} paths to YAML (this may take a while)...")
-    fs.atomic_yaml_dump(pen_vectors_data, pen_vectors_path)
+    logger.info(f"Saving {len(all_paths)} paths to YAML...")
+    
+    # Optimize: Use faster C-based YAML dumper if available
+    import yaml
+    try:
+        from yaml import CDumper as Dumper
+    except ImportError:
+        from yaml import Dumper
+    
+    # Write atomically with optimized dumper
+    tmp_path = pen_vectors_path.with_suffix('.tmp')
+    with open(tmp_path, 'w') as f:
+        yaml.dump(
+            pen_vectors_data,
+            f,
+            Dumper=Dumper,
+            default_flow_style=False,
+            sort_keys=False,
+            width=120
+        )
+    tmp_path.replace(pen_vectors_path)
     
     # ========================================================================
     # RENDER PREVIEW
@@ -588,10 +1027,15 @@ def make_pen_layer(
     
     canvas = np.ones((H, W, 3), dtype=np.uint8) * 255
     
+    # Use actual pen tip width for preview (truncate, don't round up)
+    thick_px = max(1, int(pen_tool_cfg.tip_diameter_mm / sy_mm_per_px))
+    
     for path in all_paths:
         pts_mm = np.array(path['points_mm'])
-        pts_px = (pts_mm / mm_per_px).astype(np.int32)
-        cv2.polylines(canvas, [pts_px], False, (0, 0, 0), 1, cv2.LINE_AA)
+        # Convert mm to px with anisotropic scaling
+        pts_px = np.stack([pts_mm[:,0] / sx_mm_per_px,
+                          pts_mm[:,1] / sy_mm_per_px], axis=1).astype(np.int32)
+        cv2.polylines(canvas, [pts_px], False, (0, 0, 0), thick_px, cv2.LINE_AA)
     
     pen_preview_path = out_path / "pen_preview.png"
     cv2.imwrite(str(pen_preview_path), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
