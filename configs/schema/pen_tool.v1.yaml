@@ -1,0 +1,52 @@
+# Pen tool schema v1
+# Purpose: Physical pen tool configuration for black layer tracing
+# Used by: pen_tracer.py, gcode_generator.py, validators.py
+
+schema: pen_tool.v1
+semver: "1.0.0"
+
+# Tool identification
+name: "finetip_pigment_0.3mm"
+
+# Physical parameters
+tip_diameter_mm: 0.30                # Physical nib diameter (mm)
+overlap_frac: 0.25                    # Overlap fraction between adjacent passes (0.0-1.0)
+max_passes: 4                         # Maximum overshading stacks for dark regions
+
+# Motion parameters
+feed_mm_s: 120.0                      # XY feed rate when drawing (mm/s)
+travel_mm_s: 250.0                    # XY feed rate when pen up (mm/s)
+safe_z_mm: 5.0                        # Safe Z height for travel (mm)
+draw_z_mm: -0.2                       # Pen-down Z (light pressure, mm)
+plunge_mm_s: 10.0                     # Z feed rate for pen up/down (mm/s)
+
+# Tool offset from airbrush nozzle origin
+# Measured via calibration (print cross with pen, concentric dot with airbrush)
+offset_mm: [12.50, -6.20, 0.00]      # [dx, dy, dz] in mm
+
+# G-code macros
+macros:
+  pen_up: "PEN_UP.gcode"              # Emitted at layer start, travels, end
+  pen_down: "PEN_DOWN.gcode"          # Emitted for each continuous path
+
+# Motion control (optional, for simulator/VM)
+accel:
+  xy_mm_s2: 1500.0                    # XY acceleration (mm/s²)
+
+# Path rendering/offsetting style
+joins:
+  cap_style: "round"                  # "round" | "square" | "flat"
+  join_style: "round"                 # "round" | "miter" | "bevel"
+
+# Bounds (enforced by validator)
+bounds:
+  tip_diameter_mm: [0.1, 2.0]
+  overlap_frac: [0.0, 0.5]
+  max_passes: [1, 10]
+  feed_mm_s: [10.0, 300.0]
+  travel_mm_s: [50.0, 400.0]
+  safe_z_mm: [0.0, 30.0]
+  draw_z_mm: [-2.0, 10.0]
+  plunge_mm_s: [1.0, 50.0]
+  offset_mm: [-50.0, 50.0]            # Per-axis range
+

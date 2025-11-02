@@ -10,6 +10,9 @@ luts:
   alpha: "configs/sim/luts/alpha_lut.pt"   # (Z, speed) → coverage [Nz x Nv]
   psf: "configs/sim/luts/psf_lut.pt"       # (Z, speed) → kernel [Nz x Nv x K x K]
 
+# CPU renderer configuration
+renderer_cpu_config: "configs/sim/renderer_cpu.v1.yaml"
+
 # Rasterizer backend
 rasterizer:
   backend: "cuda"                # Primary: "cuda" (nvdiffrast)
