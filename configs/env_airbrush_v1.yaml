@@ -1,0 +1,41 @@
+# Environment configuration v1
+# Used by: src/airbrush_robot_env/env_v1.py
+# Purpose: Multi-resolution RL environment parameters
+
+schema: env.v1
+units: "mm"
+
+# Work area (A4 portrait)
+work_area_mm:
+  x: 210.0                       # mm
+  y: 297.0                       # mm
+
+# Multi-resolution architecture (independent)
+resolutions:
+  render_px:                     # Physics simulation grid
+    w: 908
+    h: 1280
+  obs_px:                        # Policy input (downsampled for speed)
+    w: 454
+    h: 640
+  reward_px:                     # LPIPS evaluation grid (typically == render_px)
+    w: 908
+    h: 1280
+
+# Coordinate frames
+coordinate_frames:
+  image_origin: "top_left"       # +Y down (standard image convention)
+  machine_origin: "bottom_left"  # +Y up (standard G-code convention)
+  flip_y_for_gcode: true         # Transform image→machine at G-code gen
+
+# Fixed stroke cap (non-negotiable termination)
+stroke_cap: 1500
+
+# Renderer configuration
+renderer:
+  tile_size: 0                   # 0 = full-frame on DGX Spark
+  tile_overlap: 0
+  technician_steps: 12           # Gradient descent iterations for refinement
+  early_stop_delta: 1.0e-4       # Early stop if ΔLPIPS < threshold
+  project_params_each_step: true # Clamp to valid ranges each step
+

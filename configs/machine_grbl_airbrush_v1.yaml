@@ -1,0 +1,51 @@
+# Machine profile: GRBL airbrush v1
+# Used by: src/utils/gcode_generator.py, src/utils/gcode_vm.py
+# Purpose: Machine-level constraints and G-code flavor
+
+schema: machine.v1
+
+# Machine physical work area (mm) - origin at (0, 0)
+work_area_mm:
+  x: 250.0                       # Machine can travel 250mm in X
+  y: 350.0                       # Machine can travel 350mm in Y
+  z: 40.0                        # Z axis travel
+
+# Canvas bounds (mm) - painting surface within machine work area
+# Can be offset from machine origin (e.g., centered A4 paper)
+canvas_mm:
+  x_min: 20.0                    # Canvas starts 20mm from machine origin
+  x_max: 230.0                   # Canvas ends at 230mm (210mm wide A4)
+  y_min: 26.5                    # Canvas starts 26.5mm from origin (centered)
+  y_max: 323.5                   # Canvas ends at 323.5mm (297mm tall A4)
+
+# G-code flavor
+gcode_flavor: "grbl_1.1f"
+units: "mm"
+feed_units: "mm/min"
+
+# Feed limits (mm/s)
+feeds:
+  max_xy_mm_s: 300.0             # Maximum XY feed rate
+  max_z_mm_s: 20.0               # Maximum Z feed rate
+  rapid_mm_s: 200.0              # Rapid (G0) speed
+
+# Acceleration limits (mm/s²)
+acceleration:
+  max_xy_mm_s2: 1000.0           # XY acceleration
+  max_z_mm_s2: 500.0             # Z acceleration
+
+# Macros (G-code snippets)
+macros:
+  include_dir: "gcode/macros/"
+  purge: "PURGE.gcode"           # Purge before each stroke
+  pen_up: "PEN_UP.gcode"
+  pen_down: "PEN_DOWN.gcode"
+
+# Safety
+safety:
+  soft_limits: true
+  purge_zone_mm:                 # Safe purge area (off canvas)
+    x: [200, 209]
+    y: [290, 296]
+    z: [10, 15]
+

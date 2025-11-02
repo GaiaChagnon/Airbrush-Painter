@@ -1,0 +1,26 @@
+---
+description: Use utils for conversions, I/O, logging, tiling, color, metrics; do not re-implement
+alwaysApply: true
+---
+# Always use `src/utils` (do not re-implement)
+To keep behavior consistent and debuggable, the following **must** come from `src/utils`:
+
+- **Geometry & resolution**
+  - `compute.mm_to_px`, `compute.px_to_mm`, and frame transforms
+  - `compute.normalize_img_for_lpips` (and LPIPS must run FP32)
+- **Tiling & numerics**
+  - `compute.hann2d`, `compute.apply_tiled`, OOM guards, bounds projection
+- **Color science**
+  - `color.srgb_to_linear`, `color.linear_to_srgb`, `color.rgb_to_lab`, `color.delta_e2000`
+- **I/O**
+  - `io.atomic_*` for images/YAML, `io.symlink_atomic`, `io.ensure_dir`
+- **Logging**
+  - `logging_config.setup_logging` and context helpers; **no `print`** for runtime telemetry
+- **Torch ergonomics**
+  - `torch_utils` for device moves, channels-last, AMP contexts, GPU mem HWM
+- **Metrics**
+  - `metrics.psnr`, `metrics.ssim`, coverage/edge metrics (used in CI/adversarial tests)
+- **Strokes**
+  - `strokes.stroke_vec_to_yaml_dict`, `strokes.stroke_yaml_dict_to_vec`, IDs, bbox
+
+If a needed primitive is missing in `utils`, **add it there first** (with tests) and then call it.
