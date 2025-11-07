@@ -5,7 +5,7 @@ schema: pen_tool.v1
 name: "finetip_pigment_0.3mm"
 
 # Physical parameters
-tip_diameter_mm: 0.30
+tip_diameter_mm: 0.10
 overlap_frac: 0.25
 max_passes: 4
 

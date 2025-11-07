@@ -1,12 +1,14 @@
 # Airbrush Painter - Project Status
 
-**Last Updated:** 2025-11-01
+**Last Updated:** 2025-11-02
 
 ## Executive Summary
 
-**Status:** ✅ **Utils Layer, Pen Tracer & CPU Renderer Complete & Production-Ready**
+**Status:** ✅ **Foundation Layer Complete** | ⏳ **RL Pipeline in Stub Phase**
 
-All infrastructure utilities are fully implemented, tested, and validated with comprehensive test coverage. The Black Pen Path Tracer module is production-ready with gamut-aware hatching, A4 print quality output, and comprehensive parameter documentation. The CPU Reference Renderer is complete with realistic alcohol ink physics, transparent layering, and 96% test coverage. The project has a solid foundation for building the GPU renderer, environment, and RL agent layers.
+All infrastructure utilities (14 modules) are fully implemented, tested, and production-ready. The CPU Reference Renderer with realistic alcohol ink physics is complete with 96% test coverage. The Black Pen Path Tracer is production-ready with gamut-aware hatching and A4 print quality output. The paint.py inference script is functional for manual stroke execution.
+
+**RL training pipeline components (GPU renderer, environment, networks, training) are currently stub implementations (docstrings only) awaiting implementation.**
 
 ## Directory Structure ✓
 
@@ -28,15 +30,34 @@ All infrastructure utilities are fully implemented, tested, and validated with c
 ## Files Created
 
 ### Python Source (58 files)
-- Core modules with comprehensive docstrings
-- Utils modules (validators, compute, color, geometry, fs, torch_utils, metrics, profiler, strokes, hashing, logging_config, mlflow_helpers, gcode_generator, gcode_vm)
-- Data pipeline (preprocess, pen_tracer, calibrate)
-- Simulator (differentiable_renderer)
-- Environment (env_v1)
-- RL agent (networks)
-- GUI (main_window, tabs, widgets)
-- Scripts (train, paint, launch_gui, run_pen_tracer_test)
-- Tests (24 test modules: 22 existing + test_pen_tracer + test_pen_gcode)
+- **Utils modules (14 files, ~7,800 lines):**
+  - validators.py, compute.py, color.py, geometry.py, fs.py
+  - torch_utils.py, metrics.py, profiler.py, strokes.py, hashing.py
+  - logging_config.py, mlflow_helpers.py, gcode_generator.py, gcode_vm.py
+- **CPU Renderer (890 lines):** cpu_reference.py
+- **Pen Tracer (1,096 lines):** pen_tracer.py
+- **Paint Script (328 lines):** paint.py with paint_main() function
+- **Demo Scripts (262 lines):** demo_alcohol_ink.py
+- **Test Integration (47 lines):** run_pen_tracer_test.py
+
+**⏳ STUB IMPLEMENTATIONS (Docstrings Only, Awaiting Implementation):**
+- **GPU Renderer (39 lines):** differentiable_renderer.py
+- **Environment (39 lines):** env_v1.py
+- **Networks (39 lines):** networks.py
+- **Training (47 lines):** train.py
+- **GUI (33 lines):** main_window.py
+- **Data Pipeline (26-36 lines each):** preprocess.py, calibrate.py
+- **GUI Components:** tabs/__init__.py, widgets/__init__.py (stubs)
+- **Launch Script (34 lines):** launch_gui.py (stub)
+
+**✅ TEST FILES (17 files, various status):**
+- **Passing:** test_utils_comprehensive.py (18 suites, 170 tests)
+- **Passing:** test_cpu_golden.py, test_cpu_visual_regression.py, test_cpu_correctness.py
+- **Passing:** test_pen_gcode.py (pen G-code tests)
+- **Awaiting Implementation:** test_env_v1.py, test_env_resolutions.py, test_networks.py
+- **Awaiting Implementation:** test_renderer.py, test_parity_cpu_vs_gpu.py
+- **Other:** test_action_scaling.py, test_gui_monitoring.py, test_paint_main.py
+- **Other:** test_reward_hacks.py, reference_simulator.py
 
 ### Configuration Files (18 files)
 - train.yaml
@@ -370,45 +391,62 @@ All infrastructure utilities are fully implemented, tested, and validated with c
 - ✅ 57% fewer test files, 100% coverage maintained
 - ✅ All tests use proven working pattern (lazy imports, function-based)
 
-### Next Steps
+### Next Steps (Priority Order)
 
-### Phase 2.5: GPU Differentiable Renderer (In Progress)
+### Phase 2.5: GPU Differentiable Renderer (STUB → Implementation)
+**Current Status:** Stub (39 lines, docstring only)
 1. Implement `src/airbrush_simulator/differentiable_renderer.py` with nvdiffrast
-2. Match CPU renderer physics (distance transform on GPU)
+2. Port CPU renderer physics to GPU (distance transform approach)
 3. Test GPU/CPU parity (PSNR ≥ 26 dB, SSIM ≥ 0.90)
+4. Add gradient computation for technician refinement
 
-### Phase 3: Environment
+### Phase 3: RL Environment (STUB → Implementation)
+**Current Status:** Stub (39 lines, docstring only)
 1. Implement `src/airbrush_robot_env/env_v1.py`
-2. Test multi-resolution architecture
-3. Test action scaling and coordinate frames
+2. Integrate with GPU renderer for fast forward passes
+3. Test multi-resolution architecture (render_px, obs_px, reward_px)
+4. Test action scaling and coordinate frames
+5. Validate reward computation (LPIPS in FP32)
 
-### Phase 4: Policy Network
+### Phase 4: Policy Networks (STUB → Implementation)
+**Current Status:** Stub (39 lines, docstring only)
 1. Implement `src/rl_agent/networks.py`
-2. Test spatial heads (CoordConv, heatmap+soft-argmax)
+2. Implement CoordConv baseline
+3. Implement heatmap + soft-argmax head
+4. Test spatial coordinate prediction accuracy
+5. Validate channels-last + BF16 autocast
 
-### Phase 5: Data Pipeline
-1. Implement `src/data_pipeline/preprocess.py`
-2. Implement `src/data_pipeline/pen_vectorizer.py`
-3. Implement `src/data_pipeline/calibrate.py`
+### Phase 5: Training Script (STUB → Implementation)
+**Current Status:** Stub (47 lines, docstring only)
+1. Implement `scripts/train.py` with rl-games integration
+2. Implement HPO with Optuna
+3. Test training loop with synthetic data
+4. Add MLflow tracking integration
+5. Add training monitor artifact export
 
-### Phase 6: Training & Inference
-1. Implement `scripts/train.py`
-2. Implement `scripts/paint.py` (with paint_main callable API)
-3. Implement HPO integration
+### Phase 6: Data Pipeline (PARTIAL)
+**Current Status:** Pen tracer complete, others stub
+1. ✅ `pen_tracer.py` - Complete (1096 lines)
+2. ⏳ Implement `src/data_pipeline/preprocess.py` - Stub (26 lines)
+3. ⏳ Implement `src/data_pipeline/calibrate.py` - Stub (36 lines)
+4. ⏳ Verify `src/data_pipeline/pen_vectorizer.py` status
 
-### Phase 7: GUI
-1. Implement GUI tabs and widgets
-2. Implement watchdog monitoring
-3. Implement stroke playback
+### Phase 7: GUI (STUB → Implementation)
+**Current Status:** Stub (33 lines, docstring only)
+1. Implement `src/gui/main_window.py`
+2. Implement GUI tabs (training, inference, calibration)
+3. Implement widgets (image viewer, stroke playback)
+4. Implement watchdog file monitoring
+5. Test atomic artifact reading
 
-### Phase 8: G-code Generation
-1. Implement `src/utils/gcode_generator.py`
-2. Implement `src/utils/gcode_vm.py`
-
-### Phase 9: Testing & CI
-1. Implement all unit tests
-2. Setup golden tests
-3. Setup CI/CD pipeline
+### Phase 8: Testing & CI
+**Current Status:** Utils and CPU renderer tests complete
+1. ✅ Utils tests complete (18 suites, 170 tests)
+2. ✅ CPU renderer tests complete (12 tests, 5 golden, 7 physics)
+3. ⏳ Add tests for GPU renderer (once implemented)
+4. ⏳ Add tests for environment (once implemented)
+5. ⏳ Add tests for networks (once implemented)
+6. ⏳ Setup CI/CD pipeline
 
 ## Architecture Compliance
 
@@ -438,24 +476,33 @@ Current: v2.3.0 (per GlobalPlan.md)
 ## Summary & Statistics
 
 ### Completion Status by Layer
-- ✅ **Utils Layer:** 14/14 modules complete (100%)
-- ✅ **Utils Tests:** 1 comprehensive suite with 18 test suites (100%)
-- ✅ **Pen Tracer:** Complete with gamut-aware hatching, A4 output, full docs (100%)
-- ✅ **CPU Renderer:** Complete with alcohol ink physics, 96% test coverage (100%)
-- ⏳ **GPU Renderer:** Planned (nvdiffrast integration)
-- ⏳ **Environment:** Planned
-- ⏳ **RL Agent:** Planned
-- ⏳ **Data Pipeline:** Pen tracer complete, preprocess/calibrate planned
-- ⏳ **GUI:** Planned
+- ✅ **Utils Layer:** 14/14 modules complete (100%) - ~7,800 lines
+- ✅ **Utils Tests:** 1 comprehensive suite with 18 test suites, 170 tests (100%)
+- ✅ **Pen Tracer:** Complete with gamut-aware hatching, A4 output, full docs (100%) - 1,096 lines
+- ✅ **CPU Renderer:** Complete with alcohol ink physics, 96% test coverage (100%) - 890 lines
+- ✅ **Paint Script:** Functional for manual painting (100%) - 328 lines
+- ✅ **Demo Scripts:** Working demos for CPU renderer and pen tracer (100%) - 262 lines
+- ⏳ **GPU Renderer:** **STUB** (39 lines, docstring only) - 0% implemented
+- ⏳ **Environment:** **STUB** (39 lines, docstring only) - 0% implemented
+- ⏳ **RL Networks:** **STUB** (39 lines, docstring only) - 0% implemented
+- ⏳ **Training Script:** **STUB** (47 lines, docstring only) - 0% implemented
+- ⏳ **GUI:** **STUB** (33 lines, docstring only) - 0% implemented
+- ⏳ **Data Pipeline:** Pen tracer complete (100%), preprocess/calibrate **STUBS** (26-36 lines each, 0% implemented)
 
 ### Test Coverage Statistics
-- **Total test files:** 13 (10 original + test_pen_tracer + test_pen_gcode + test_cpu_golden + test_cpu_visual_regression)
-- **Utils test suites:** 18 (combined into 1 file)
-- **Utils test cases:** 150+
-- **Pen tracer tests:** 25 (15 tracer + 10 G-code)
-- **CPU renderer tests:** 20 (5 golden + 7 physics + 8 visual)
-- **Non-utils tests:** 7 files (env, networks, etc.)
+- **Total test files:** 17 test modules
+- **Utils test suites:** 18 suites, 170 collected tests (combined into 1 file)
+- **Pen tracer tests:** 25 tests (tracer unit + G-code generation)
+- **CPU renderer tests:** 20 tests (5 golden + 7 physics + 8 visual regression)
+- **Other test files:** 13 additional test modules (many awaiting implementation)
+  - test_env_v1.py, test_env_resolutions.py, test_networks.py (awaiting module implementation)
+  - test_renderer.py, test_parity_cpu_vs_gpu.py (awaiting GPU renderer)
+  - test_action_scaling.py, test_gui_monitoring.py, test_paint_main.py
+  - test_reward_hacks.py, test_cpu_correctness.py
+  - reference_simulator.py (support file)
+- **Passing tests:** Utils (100%), CPU renderer (100%), Pen tracer (100%)
 - **Coverage:** 100% for utils layer, 100% for pen tracer, 96% for CPU renderer
+- **Note:** Some test files exist but modules they test are stubs (0 implementations)
 
 ### Code Quality Metrics
 - ✅ Zero linter errors
@@ -508,9 +555,37 @@ Current: v2.3.0 (per GlobalPlan.md)
 2. Physical robot integration
 3. CI/CD pipeline with golden tests
 
-## Notes
+## Critical Notes
 
-**Utils layer, Pen Tracer, and CPU Renderer are production-ready and fully tested.** The pen tracer provides a complete, gamut-aware solution for adding black pen outlines and hatching to complement CMY airbrush painting. The CPU renderer provides ground-truth physics for alcohol ink airbrush behavior with realistic transparent layering, speed-dependent opacity, and Z-dependent width. All subsequent layers can build on this solid foundation with confidence. The comprehensive test suite ensures no regressions as development continues.
+### ✅ Production-Ready Components
+**Utils layer, Pen Tracer, and CPU Renderer are production-ready and fully tested.** The pen tracer provides a complete, gamut-aware solution for adding black pen outlines and hatching to complement CMY airbrush painting. The CPU renderer provides ground-truth physics for alcohol ink airbrush behavior with realistic transparent layering, speed-dependent opacity, and Z-dependent width.
+
+### ⚠️ RL Training Pipeline Status
+**The RL training pipeline is currently in STUB phase.** The following critical components exist as docstring-only stubs:
+- `src/airbrush_simulator/differentiable_renderer.py` (39 lines)
+- `src/airbrush_robot_env/env_v1.py` (39 lines)
+- `src/rl_agent/networks.py` (39 lines)
+- `scripts/train.py` (47 lines)
+- `src/gui/main_window.py` (33 lines)
+
+**These modules need full implementation before RL training can begin.**
+
+### ✅ Manual Painting Capability
+The `scripts/paint.py` script is functional (328 lines) for manual stroke-by-stroke painting, though it requires manual stroke specification since the RL agent is not yet implemented.
+
+### 📋 Test Files vs Implementation
+**17 test files exist**, but many test modules that are not yet implemented (stubs). Test files like `test_env_v1.py`, `test_networks.py`, `test_renderer.py` are ready for when their corresponding modules are implemented.
+
+### 🎯 Implementation Gap
+**Estimated implementation gap:** ~3,000-5,000 lines of production code needed across:
+- GPU renderer: ~800-1,200 lines (nvdiffrast integration, gradient computation)
+- Environment: ~400-600 lines (observation/action space, reward computation)
+- Networks: ~600-800 lines (CoordConv, heatmap heads, ResNet backbone)
+- Training: ~300-500 lines (rl-games integration, HPO, monitoring)
+- GUI: ~800-1,200 lines (PyQt tabs, widgets, watchdog)
+- Data pipeline: ~200-400 lines (preprocess, calibrate)
+
+**Foundation is solid (7,800+ lines utils + renderers + tests), but RL pipeline requires significant implementation work.**
 
 ### Recent Additions (2025-11-01)
 

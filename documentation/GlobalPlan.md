@@ -1,3 +1,14 @@
+# **Hybrid AI Painter – Engineering Plan**
+
+> ⚠️ **NOTE:** This is a **design and architecture document** that describes the planned system.  
+> For **current implementation status**, see `PROJECT_STATUS.md`.  
+> **As of 2025-11-02:** Foundation layer complete (utils, CPU renderer, pen tracer).  
+> RL pipeline (GPU renderer, environment, networks, training, GUI) is in stub phase.
+
+---
+
+## **Key Design Principles**
+
 - **Multi-resolution architecture** (physics/reward at high fidelity, observation downsampled for speed).
 - **Fixed stroke cap** (you enforce it; no stroke penalties).
 - **Pure quality objective** (no time/ink costs).
@@ -9,7 +20,7 @@
 - **Scanner input is PNG/JPEG from a printer‑scanner** (consistent lighting).
 - **DGX Spark optimized** (BF16, channels-last, full-frame compute).
 
-# **Hybrid AI Painter – Engineering Plan**
+---
 
 ## **0) Executive overview (what this system ships)**
 

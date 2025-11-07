@@ -411,16 +411,36 @@ shadow_hatching:
   # Coverage Limits
   # ──────────────────────────────────────────────────────────────────────────
   # 
-  # max_hatch_coverage: Maximum fraction of canvas covered by hatching (0.0-1.0)
-  #   Prevents over-inking and ensures CMY colors dominate
-  #   RANGE: 0.10-0.75
-  #   - 0.10-0.20: Very sparse, pen as accent (current)
-  #   - 0.30-0.50: Moderate, pen and color balanced
-  #   - 0.60-0.75: Dense, pen-dominant illustration style
+  # max_hatch_coverage: Maximum fraction of ELIGIBLE ZONE covered by pen strokes (0.0-1.0)
+  #   This applies to regions that need hatching (out-of-gamut darks), NOT the whole canvas
+  #   
+  #   INTERPRETATION:
+  #   - The value represents the fraction of dark pixels that will be covered by actual ink
+  #   - Spacing and pen width naturally control coverage per pass (e.g., 2mm pen / 6mm spacing = 33%)
+  #   - If natural_coverage_per_pass × num_passes > max_hatch_coverage, hatching stops
+  #   
+  #   RANGE: 0.10-1.0
+  #   - 0.10-0.30: Very sparse, pen as light accent (current = 0.10)
+  #   - 0.40-0.60: Moderate density
+  #   - 0.70-1.0: Dense hatching (fills most of the eligible dark zones)
   # 
-  # CRITICAL: This is a hard limit. Once reached, no more hatching is added.
-  # Algorithm stops at darkest L* levels first, then progressively lighter.
-  max_hatch_coverage: 0.10
+  #   EXAMPLE: If 20% of your image needs hatching (out-of-gamut darks):
+  #     - max_hatch_coverage=0.10 means 10% of that 20% zone gets ink (2% of total canvas)
+  #     - max_hatch_coverage=0.50 means 50% of that 20% zone gets ink (10% of total canvas)
+  #     - max_hatch_coverage=1.00 means 100% of that 20% zone gets ink (20% of total canvas)
+  # 
+  # CRITICAL: This is a hard limit. Once reached, no more darkness levels are processed.
+  # Algorithm processes darkest L* levels first, then progressively lighter.
+  # 
+  # FOR YOUR PEN (0.10mm tip, spacing_scale=3):
+  #   Natural coverage per pass ≈ 44% (pen_width / effective_spacing)
+  #   Current limit (0.10) allows only ~0.2 passes → very sparse!
+  #   
+  #   RECOMMENDED VALUES:
+  #   - 0.50 → allows ~1 pass (light hatching)
+  #   - 1.00 → allows ~2 passes (moderate hatching)
+  #   - 2.00 → allows ~4 passes (dense hatching, cross-hatch possible)
+  max_hatch_coverage: 1.0
 
 # ============================================================================
 # CALIBRATION INTEGRATION

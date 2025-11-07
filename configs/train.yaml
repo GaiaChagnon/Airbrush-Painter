@@ -124,7 +124,7 @@ params:
     score_to_win: 100000       # Stop if mean reward reaches this (effectively disabled)
     max_epochs: 10000          # Maximum training epochs
     save_best_after: 50        # Start tracking best model after this many epochs
-    save_frequency: 10         # Save checkpoint every N epochs
+    save_frequency: 25         # Save checkpoint every N epochs
     print_stats: True          # Print training stats
     
     # PPO-specific parameters
@@ -139,10 +139,10 @@ params:
     mini_epochs: 4             # Number of SGD passes over collected data
     
     # Value function training
-    critic_coef: 2.0           # Value loss coefficient (relative to policy loss)
+    critic_coef: 4.0           # Value loss coefficient (relative to policy loss)
     clip_value: True           # Clip value function updates (stabilizes training)
     
-    seq_length: 4              # For RNN policies (not used, but required by rl_games)
+    seq_length: 1              # For RNN policies (not used, but required by rl_games)
     bounds_loss_coef: 0.0001   # Penalty for actions near boundaries (optional)
 
 # Custom agent network parameters (for our build_actor_critic function)
@@ -167,7 +167,7 @@ logging:
   file: "outputs/logs/train.log"
   rotate:
     mode: "size"
-    max_bytes: 50000000          # 50 MB
+    max_bytes: 10000000          # 10 MB
     backup_count: 5
   capture_warnings: true
   quiet_libs: ["matplotlib", "PIL", "numba", "urllib3"]

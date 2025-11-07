@@ -82,19 +82,21 @@ def compute_gamut_mask(
     min_l_expanded = min_luminance * (1 + margin)
     max_c_expanded = max_chroma * (1 + margin)
     
-    # Out of gamut if too dark
+    # Out of gamut if too dark (CMY can't reach deep blacks)
     too_dark = L < min_l_expanded
     
-    # Out of gamut if too saturated AND within problematic hue ranges
-    hue_ok = np.zeros_like(hue, dtype=bool)
+    # Check if hue is OUTSIDE CMY's reproducible ranges
+    hue_in_cmy_range = np.zeros_like(hue, dtype=bool)
     for h0, h1 in hue_ranges:
         if h0 <= h1:
-            hue_ok |= (hue >= h0) & (hue <= h1)
+            hue_in_cmy_range |= (hue >= h0) & (hue <= h1)
         else:
             # Wrap-around (e.g., [330, 30] for reds across 0°)
-            hue_ok |= (hue >= h0) | (hue <= h1)
+            hue_in_cmy_range |= (hue >= h0) | (hue <= h1)
     
-    too_saturated = (C > max_c_expanded) & hue_ok
+    # Out of gamut if too saturated (regardless of hue - CMY has chroma limits)
+    # This catches colors that are too vivid for CMY to reproduce
+    too_saturated = C > max_c_expanded
     
     out_of_gamut = (too_dark | too_saturated).astype(np.uint8) * 255
     
@@ -131,7 +133,7 @@ def extract_edges(
     L_u8 = np.clip(L_channel * 255.0 / 100.0, 0, 255).astype(np.uint8)
     
     # Bilateral filter: smooths gradients while preserving sharp edges
-    # This eliminates the dark-light-dark artifacts that cause double lines
+    # Single pass to maintain edge precision at true boundaries
     L_u8 = cv2.bilateralFilter(
         L_u8,
         d=cfg.bilateral_d,
@@ -157,12 +159,13 @@ def extract_edges(
     edges = skeletonize(edges > 0).astype(np.uint8) * 255
     
     # Dilate skeleton slightly to merge nearby parallel lines (from gradient artifacts)
-    # Then skeletonize again to get single centerline
     merge_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
         (cfg.merge_kernel_size, cfg.merge_kernel_size)
     )
     edges = cv2.dilate(edges, merge_kernel, iterations=1)
+    
+    # Skeletonize again to get single centerline
     edges = skeletonize(edges > 0).astype(np.uint8) * 255
     
     return edges
@@ -802,6 +805,11 @@ def make_pen_layer(
         gamut_coverage = gamut_mask.sum() / (H * W * 255)
         logger.info(f"  Out-of-gamut coverage: {gamut_coverage:.4f} ({gamut_coverage*100:.2f}%)")
         
+        # Debug: analyze LAB distribution
+        L_vals = img_lab[0].cpu().numpy()
+        logger.info(f"  Image L* range: [{L_vals.min():.1f}, {L_vals.max():.1f}], mean={L_vals.mean():.1f}")
+        logger.info(f"  Pixels below L*={gamut_cfg.min_luminance*(1+pen_tracer_cfg.calibration.margin):.1f}: {(L_vals < gamut_cfg.min_luminance*(1+pen_tracer_cfg.calibration.margin)).sum()} ({(L_vals < gamut_cfg.min_luminance*(1+pen_tracer_cfg.calibration.margin)).sum()/(H*W)*100:.1f}%)")
+        
         if pen_tracer_cfg.debug.save_gamut_mask:
             cv2.imwrite(str(debug_path / "gamut_mask.png"), gamut_mask)
     else:
@@ -819,19 +827,51 @@ def make_pen_layer(
         if pen_tracer_cfg.debug.save_edge_mask:
             cv2.imwrite(str(debug_path / "edge_mask.png"), edge_mask)
         
-        # Vectorize edges using contour-based approach
-        edge_polylines = vectorize_edges(
-            edge_mask,
-            pen_tracer_cfg.edge_detection.simplify_tol_px,
-            pen_tracer_cfg.edge_detection.min_length_px,
-            sx_mm_per_px,
-            sy_mm_per_px
-        )
+        # Vectorize edges using skeleton tracing (proper single-line extraction)
+        logger.info("  Tracing skeleton to polylines...")
+        edge_polylines_px = _trace_skeleton_to_polylines(edge_mask)
+        logger.info(f"  Initial skeleton polylines: {len(edge_polylines_px)}")
         
-        logger.info(f"  Found {len(edge_polylines)} edge contours")
+        # Link nearby endpoints and simplify
+        logger.info("  Linking and simplifying...")
+        link_gap_px = pen_tracer_cfg.edge_detection.link_gap_px if hasattr(pen_tracer_cfg.edge_detection, 'link_gap_px') else 10
+        link_angle_deg = pen_tracer_cfg.edge_detection.link_angle_deg if hasattr(pen_tracer_cfg.edge_detection, 'link_angle_deg') else 30
+        min_len_mm = pen_tracer_cfg.edge_detection.min_length_px * sy_mm_per_px
+        rdp_tol_mm = pen_tracer_cfg.edge_detection.simplify_tol_px * sy_mm_per_px
+        
+        edge_polylines_px = _link_and_simplify(
+            edge_polylines_px,
+            sx_mm_per_px,
+            sy_mm_per_px,
+            link_gap_px,
+            link_angle_deg,
+            min_len_mm,
+            rdp_tol_mm
+        )
+        logger.info(f"  After linking/simplifying: {len(edge_polylines_px)}")
+        
+        # Deduplicate parallel lines (critical for eliminating double traces!)
+        logger.info("  Deduplicating parallel lines...")
+        dedupe_min_sep_px = pen_tool_cfg.tip_diameter_mm / sy_mm_per_px * 1.5  # 1.5x tip diameter
+        dedupe_max_angle_deg = 15.0
+        edge_polylines_px = _dedupe_parallel(
+            edge_polylines_px,
+            dedupe_min_sep_px,
+            dedupe_max_angle_deg
+        )
+        logger.info(f"  After deduplication: {len(edge_polylines_px)}")
+        
+        # Convert to mm
+        edge_polylines_mm = []
+        for pts_px in edge_polylines_px:
+            pts_mm = np.stack([pts_px[:,0] * sx_mm_per_px,
+                              pts_px[:,1] * sy_mm_per_px], axis=1)
+            edge_polylines_mm.append(pts_mm)
+        
+        logger.info(f"  Final edge polylines: {len(edge_polylines_mm)}")
         
         # Add to paths
-        for polyline_mm in edge_polylines:
+        for polyline_mm in edge_polylines_mm:
             path_dict = {
                 'id': f"pen-{path_id_counter:06d}",
                 'kind': 'polyline',
@@ -856,6 +896,12 @@ def make_pen_layer(
             pen_tracer_cfg.shadow_hatching.darkness_levels,
             pen_tracer_cfg.shadow_hatching.min_area_px
         )
+        
+        logger.info(f"  Extracted {len(shadow_masks)} shadow levels:")
+        for (level_idx, passes), mask in shadow_masks.items():
+            coverage = mask.sum() / (H * W * 255)
+            level_cfg = pen_tracer_cfg.shadow_hatching.darkness_levels[level_idx]
+            logger.info(f"    Level {level_idx} (L* {level_cfg.l_min:.0f}-{level_cfg.l_max:.0f}): {coverage*100:.2f}% of canvas")
         
         # Apply morphological closing to connect nearby regions (reduce pen lifts)
         if pen_tracer_cfg.shadow_hatching.close_gaps_px > 0:
@@ -886,9 +932,27 @@ def make_pen_layer(
         min_spacing_px = pen_tracer_cfg.shadow_hatching.min_line_spacing_mm / sy_mm_per_px
         hatch_spacing_px = max(hatch_spacing_px, min_spacing_px)
         
+        # Natural coverage per pass based on pen width and spacing
+        pen_width_px = pen_tool_cfg.tip_diameter_mm / sy_mm_per_px
+        natural_coverage_per_pass = pen_width_px / hatch_spacing_px
+        
+        logger.info(f"  Hatch spacing: {hatch_spacing_px:.1f}px ({hatch_spacing_px*sy_mm_per_px:.2f}mm)")
+        logger.info(f"  Natural coverage per pass: {natural_coverage_per_pass*100:.1f}% (pen_width/spacing)")
+        
+        # Calculate total hatch-eligible pixels (sum of all shadow masks)
+        total_hatch_eligible_pixels = sum(mask.sum() / 255 for mask in shadow_masks.values())
+        if total_hatch_eligible_pixels == 0:
+            total_hatch_eligible_pixels = 1  # Avoid division by zero
+        
+        logger.info(f"  Hatch-eligible pixels: {total_hatch_eligible_pixels:.0f} ({total_hatch_eligible_pixels/(H*W)*100:.1f}% of canvas)")
+        
+        # max_hatch_coverage limits how much of the eligible zone gets strokes
+        # If natural_coverage_per_pass * num_passes > max_hatch_coverage, stop adding passes
+        # This is pass-based, not pixel-based (spacing already controls pixel coverage)
+        max_pass_coverage_fraction = pen_tracer_cfg.shadow_hatching.max_hatch_coverage
+        
         total_hatch_lines = 0
-        max_hatch_pixels = int(H * W * pen_tracer_cfg.shadow_hatching.max_hatch_coverage)
-        current_hatch_pixels = 0
+        total_passes_added = 0
         
         for level_idx, level in enumerate(pen_tracer_cfg.shadow_hatching.darkness_levels):
             key = (level_idx, level.passes)
@@ -904,12 +968,20 @@ def make_pen_layer(
             if mask.sum() == 0:
                 continue
             
-            # Check coverage limit
-            if current_hatch_pixels >= max_hatch_pixels:
-                logger.warning(f"  Skipping level {level_idx} - coverage limit reached ({current_hatch_pixels}/{max_hatch_pixels} pixels)")
+            # Calculate what this level would add to total coverage
+            # Each pass covers natural_coverage_per_pass of this mask's area
+            mask_area = mask.sum() / 255
+            mask_fraction_of_eligible = mask_area / total_hatch_eligible_pixels
+            level_coverage_contribution = natural_coverage_per_pass * level.passes * mask_fraction_of_eligible
+            
+            # Check if adding this level would exceed coverage limit
+            projected_coverage = (total_passes_added * natural_coverage_per_pass) + level_coverage_contribution
+            if projected_coverage > max_pass_coverage_fraction:
+                logger.warning(f"  Skipping level {level_idx} - would exceed coverage limit ({projected_coverage*100:.1f}% > {max_pass_coverage_fraction*100:.0f}%)")
                 break
             
             logger.info(f"  Generating {level.passes}-pass hatching (L* {level.l_min:.0f}-{level.l_max:.0f})...")
+            logger.info(f"    This level will add {level_coverage_contribution*100:.2f}% coverage")
             
             if pen_tracer_cfg.debug.save_shadow_masks:
                 cv2.imwrite(str(debug_path / f"shadow_mask_level{level_idx}.png"), mask)
@@ -938,19 +1010,8 @@ def make_pen_layer(
                 
                 logger.info(f"    Pass {pass_idx+1}/{level.passes} ({angle}°): {len(hatch_lines)} lines")
                 
-                # Add to paths and track coverage
+                # Add all lines from this pass
                 for line_mm in hatch_lines:
-                    # Estimate pixels covered by this line (accounting for pen tip width)
-                    line_length_mm = np.linalg.norm(np.diff(line_mm, axis=0), axis=1).sum()
-                    thick_px = max(1, int(pen_tool_cfg.tip_diameter_mm / sy_mm_per_px))
-                    line_length_px = line_length_mm / sy_mm_per_px
-                    line_area_px = int(np.ceil(line_length_px * thick_px))
-                    
-                    # Check if adding this line would exceed coverage limit
-                    if current_hatch_pixels + line_area_px > max_hatch_pixels:
-                        logger.warning(f"    Stopping - coverage limit reached")
-                        break
-                    
                     path_dict = {
                         'id': f"pen-{path_id_counter:06d}",
                         'kind': 'polyline',
@@ -962,17 +1023,13 @@ def make_pen_layer(
                     }
                     all_paths.append(path_dict)
                     path_id_counter += 1
-                    current_hatch_pixels += line_area_px
                     total_hatch_lines += 1
                 
-                if current_hatch_pixels >= max_hatch_pixels:
-                    break
-            
-            if current_hatch_pixels >= max_hatch_pixels:
-                break
+                total_passes_added += 1
         
-        actual_coverage = current_hatch_pixels / (H * W)
-        logger.info(f"  Final hatch coverage: {actual_coverage:.4f} ({actual_coverage*100:.2f}%)")
+        # Report final coverage
+        actual_coverage_fraction = total_passes_added * natural_coverage_per_pass
+        logger.info(f"  Final hatch coverage: {actual_coverage_fraction*100:.1f}% of eligible zone ({total_passes_added} passes)")
     
     logger.info(f"Generated {len(all_paths)} total paths")
     
