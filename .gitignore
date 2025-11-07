@@ -59,6 +59,11 @@ outputs/hpo_eval/
 outputs/studies/*.db
 outputs/ci/
 outputs/logs/*.log
+outputs/pen_batch_test/
+outputs/pen_test_final/
+outputs/pen_outline/
+outputs/quick_ci/
+outputs/cpu_demo/
 
 # G-code output
 gcode_output/**/*.gcode
