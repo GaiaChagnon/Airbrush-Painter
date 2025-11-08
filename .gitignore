@@ -65,6 +65,10 @@ outputs/pen_outline/
 outputs/quick_ci/
 outputs/cpu_demo/
 
+# Large generated vector files (pen tracer outputs)
+outputs/**/pen_vectors.yaml
+outputs/**/*.yaml
+
 # G-code output
 gcode_output/**/*.gcode
 gcode_output/**/*.yaml
