@@ -29,6 +29,7 @@ import hashlib
 from pathlib import Path
 from typing import Union
 
+import numpy as np
 import torch
 
 
@@ -105,6 +106,40 @@ def sha256_tensor(t: torch.Tensor) -> str:
     sha256 = hashlib.sha256()
     sha256.update(t_bytes)
     
+    return sha256.hexdigest()
+
+
+def sha256_numpy_image(img: np.ndarray) -> str:
+    """Compute SHA-256 hash of numpy image array.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        Image array, shape (H, W, C) or (H, W), any dtype
+
+    Returns
+    -------
+    str
+        SHA-256 hex digest (64 characters)
+
+    Notes
+    -----
+    Hash is computed over raw pixel bytes in C-contiguous order.
+    Includes dtype and shape in hash for strict equality.
+    Used for duplicate detection in preprocessing pipeline.
+
+    Examples
+    --------
+    >>> img = cv2.imread("image.png")
+    >>> img_hash = sha256_numpy_image(img)
+    >>> print(f"image_sha256: {img_hash}")
+    """
+    sha256 = hashlib.sha256()
+    # Include shape and dtype for strict matching
+    sha256.update(str(img.shape).encode('utf-8'))
+    sha256.update(str(img.dtype).encode('utf-8'))
+    # Hash pixel data
+    sha256.update(np.ascontiguousarray(img).tobytes())
     return sha256.hexdigest()
 
 

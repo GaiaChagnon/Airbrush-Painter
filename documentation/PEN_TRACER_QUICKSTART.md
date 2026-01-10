@@ -1,6 +1,8 @@
 # Pen Tracer Quick Start Guide
 
-**Purpose**: Extract black line art from images and generate pen tool paths for the Airbrush Painter system.
+**Purpose**: Extract black line art from images and generate optimized pen tool paths for the Airbrush Painter system.
+
+**Features**: Gamut-aware edge detection, sparse hatching, and intelligent path ordering (30-50% travel distance reduction).
 
 ---
 
@@ -194,6 +196,7 @@ offset_mm: [12.50, -6.20, 0.00]  # Tool offset from airbrush
 | `mean_luminance` | 0.70-0.99 | Average brightness (1.0 = white, 0.0 = black) |
 | `max_gap_frac` | 0.00-0.10 | Largest gap as fraction of component size |
 | `num_paths` | 10-1000 | Total number of generated paths |
+| `travel_distance_mm` | 100-5000 | Optimized pen travel distance (mm) |
 
 **Notes**:
 - Low `coverage_black` (<0.01) → Sparse line art or threshold too strict
@@ -283,12 +286,19 @@ gcode_generator.generate_pen_gcode(
    - 1000×1000 px: ~1-2 seconds
    - 2000×2000 px: ~4-8 seconds
    - 4000×4000 px: ~15-30 seconds
+   - Path ordering adds ~1-3 seconds for 1000+ paths
 
 2. **Memory**: Minimal (single image + masks in RAM)
    - 1000×1000 px: ~20 MB
    - 4000×4000 px: ~300 MB
 
-3. **Optimization**:
+3. **Path Ordering Performance**:
+   - <100 paths: GNN + 2-opt, ~0.1s
+   - 100-500 paths: GNN + limited 2-opt, ~1s
+   - >500 paths: GNN only, ~2-3s
+   - Travel distance reduction: 30-50%
+
+4. **Optimization**:
    - Disable debug output: `save_intermediates: false`
    - Reduce morphology iterations
    - Increase `min_area_px` to filter small components early

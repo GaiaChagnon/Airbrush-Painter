@@ -1,0 +1,70 @@
+# machine.yaml - Hardware configuration for Octopus Pro Painter
+#
+# This file configures the robot control system for the pen/airbrush machine.
+# All dimensions are in millimeters. Feed rates are in mm/min.
+
+# Klipper API connection
+connection:
+  socket_path: "/tmp/klippy_uds"    # Unix Domain Socket path for Klipper API
+  timeout_s: 5.0                    # Request timeout in seconds
+  reconnect_attempts: 3             # Number of reconnection attempts on failure
+
+# Physical work area (machine limits)
+machine:
+  work_area_mm:
+    x: 250.0                        # Maximum X travel
+    y: 350.0                        # Maximum Y travel
+    z: 40.0                         # Maximum Z travel
+
+# Canvas position within work area
+canvas:
+  offset_x_mm: 25.0                 # Distance from X home to canvas left edge
+  offset_y_mm: 25.0                 # Distance from Y home to canvas bottom edge
+  width_mm: 210.0                   # Canvas width (A4 = 210mm)
+  height_mm: 297.0                  # Canvas height (A4 = 297mm)
+  y_flip: true                      # Flip Y axis (image origin top-left vs machine origin bottom-left)
+
+# Z-axis seesaw states (belt mechanism with pen/airbrush on opposite ends)
+z_states:
+  travel_mm: 10.0                   # Both tools clear of surface
+  pen_work_mm: 20.0                 # Pen contacts paper (seesaw tilted toward pen)
+  airbrush_work_mm: 0.0             # Airbrush at spray height (seesaw tilted toward airbrush)
+
+# Tool definitions
+tools:
+  pen:
+    xy_offset_mm: [0.0, 0.0]        # XY offset relative to reference point (calibrate with crosshair test)
+    feed_mm_min: 1500               # Drawing speed
+    travel_feed_mm_min: 6000        # Rapid travel speed
+    plunge_feed_mm_min: 300         # Z lowering speed
+
+  airbrush:
+    xy_offset_mm: [0.0, 0.0]        # Reference tool (offsets are 0)
+    feed_mm_min: 3000               # Drawing/spray speed
+    travel_feed_mm_min: 6000        # Rapid travel speed
+    plunge_feed_mm_min: 300         # Z lowering speed
+    spray_height_mm: 3.0            # Height above canvas when spraying
+
+# Motion limits (conservative defaults)
+motion:
+  max_velocity_mm_s: 100.0          # Maximum velocity
+  max_accel_mm_s2: 1000.0           # Maximum acceleration
+  junction_deviation_mm: 0.05       # Junction deviation for path planning
+
+# Interactive mode settings
+interactive:
+  jog_increments_mm: [0.1, 1.0, 10.0, 50.0]  # Available jog step sizes
+  default_jog_increment_mm: 1.0              # Initial jog step size
+  position_poll_interval_ms: 100             # Position update rate
+
+# File execution settings
+file_execution:
+  gcode_directory: "/home/klipper/gcode_files"  # Directory for virtual_sdcard files
+
+# Future: pump configuration (disabled for pen-only operation)
+pumps:
+  enabled: false
+
+# Future: servo configuration (disabled for pen-only operation)
+servos:
+  enabled: false

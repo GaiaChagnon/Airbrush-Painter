@@ -47,23 +47,51 @@ htmlcov/
 # Data (large, not versioned)
 data/raw_images/*.png
 data/raw_images/*.jpg
+data/raw_images/**/*.png
+data/raw_images/**/*.jpg
+data/raw_images/**/*.jpeg
+data/raw_images/**/*.webp
+data/raw_images/**/*.bmp
+data/raw_images/**/*.tiff
+data/raw_images/**/*.tif
 data/calibration_scans/*.png
 data/validation_images/**/*.png
 data/target_images/**/*.png
+data/target_images/**/.preprocessed_manifest.yaml
 
 # Outputs (generated)
 outputs/checkpoints/*.pth
-outputs/training_monitor/
-outputs/final_paintings/
-outputs/hpo_eval/
+outputs/training_monitor/*
+!outputs/training_monitor/.gitkeep
+outputs/final_paintings/*
+!outputs/final_paintings/.gitkeep
+outputs/hpo_eval/*
+!outputs/hpo_eval/.gitkeep
 outputs/studies/*.db
-outputs/ci/
+outputs/ci/*
+!outputs/ci/.gitkeep
 outputs/logs/*.log
-outputs/pen_batch_test/
-outputs/pen_test_final/
-outputs/pen_outline/
-outputs/quick_ci/
-outputs/cpu_demo/
+outputs/pen_batch_test/*
+!outputs/pen_batch_test/.gitkeep
+outputs/pen_test_final/*
+!outputs/pen_test_final/.gitkeep
+outputs/pen_outline/*
+!outputs/pen_outline/.gitkeep
+outputs/pen_test_comparison/*
+!outputs/pen_test_comparison/.gitkeep
+outputs/pen_test_ordered/*
+!outputs/pen_test_ordered/.gitkeep
+outputs/quick_ci/*
+!outputs/quick_ci/.gitkeep
+outputs/cpu_demo/*
+!outputs/cpu_demo/.gitkeep
+
+# All generated images in outputs (catch-all for any test/debug images)
+outputs/**/*.png
+outputs/**/*.jpg
+outputs/**/*.jpeg
+outputs/**/*.bmp
+outputs/**/*.tiff
 
 # Large generated vector files (pen tracer outputs)
 outputs/**/pen_vectors.yaml

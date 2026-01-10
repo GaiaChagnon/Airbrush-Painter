@@ -13,7 +13,7 @@ from src.utils import logging_config
 # Parse CLI arguments
 parser = argparse.ArgumentParser(description="Test pen tracer on images")
 parser.add_argument("--input", "-i", type=str, 
-                    default="data/raw_images/desktop-wallpaper-drawing-nature-blue-drawing.jpg",
+                    default="data/target_images/cmy_only/hard",
                     help="Input image path or directory")
 parser.add_argument("--output", "-o", type=str, 
                     default="outputs/pen_test",
@@ -86,6 +86,26 @@ for idx, image_path in enumerate(image_paths, 1):
             cmy_canvas_path=cmy_canvas_path
         )
         
+        # Validate path ordering
+        from src.utils import validators
+        pen_vectors = validators.load_pen_vectors(result['pen_vectors_yaml'])
+        paths = pen_vectors.paths
+        
+        # Check 1: Path count integrity
+        total_paths = result['metrics']['num_edge_paths'] + result['metrics']['num_hatch_paths']
+        assert len(paths) == total_paths, f"Path count mismatch: {len(paths)} != {total_paths}"
+        
+        # Check 2: Role separation (edges before hatching)
+        edge_indices = [i for i, p in enumerate(paths) if p.role == 'outline']
+        hatch_indices = [i for i, p in enumerate(paths) if p.role == 'hatch']
+        
+        if edge_indices and hatch_indices:
+            assert max(edge_indices) < min(hatch_indices), "Edges should be drawn before hatching"
+        
+        # Check 3: Travel distance is logged
+        assert 'travel_distance_mm' in result['metrics'], "Travel distance not in metrics"
+        assert result['metrics']['travel_distance_mm'] >= 0, "Invalid travel distance"
+        
         results.append({
             'image': image_path.name,
             'result': result
@@ -95,6 +115,7 @@ for idx, image_path in enumerate(image_paths, 1):
         print(f"  • Edges: {result['metrics']['num_edge_paths']}")
         print(f"  • Hatches: {result['metrics']['num_hatch_paths']}")
         print(f"  • Coverage: {result['metrics']['coverage_black']*100:.1f}%")
+        print(f"  • Travel distance: {result['metrics']['travel_distance_mm']:.1f}mm")
         print(f"  • Output: {out_dir}")
         
     except Exception as e:
@@ -123,6 +144,7 @@ if results:
         print(f"  • Resolution: {metrics['resolution'][0]}×{metrics['resolution'][1]} px")
         print(f"  • Edges: {metrics['num_edge_paths']}, Hatches: {metrics['num_hatch_paths']}")
         print(f"  • Coverage: {metrics['coverage_black']*100:.1f}%")
+        print(f"  • Travel distance: {metrics['travel_distance_mm']:.1f}mm")
         print(f"  • Preview: {r['result']['pen_preview_png']}")
         print(f"  • Composite: {r['result']['composite_png']}")
 

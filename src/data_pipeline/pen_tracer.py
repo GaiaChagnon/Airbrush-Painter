@@ -691,6 +691,214 @@ def generate_hatch_pattern(
     return hatch_lines_mm
 
 
+def _path_endpoint_dist(p1: dict, p2: dict = None) -> float:
+    """Distance from p1's end to p2's start (mm)."""
+    if p2 is None:
+        return 0.0
+    pts1 = np.array(p1['points_mm'])
+    pts2 = np.array(p2['points_mm'])
+    return np.linalg.norm(pts1[-1] - pts2[0])
+
+
+def _compute_total_distance(paths: List[dict]) -> float:
+    """Compute total travel distance for ordered paths (mm)."""
+    total = 0.0
+    for i in range(len(paths) - 1):
+        total += _path_endpoint_dist(paths[i], paths[i+1])
+    return total
+
+
+def _greedy_nearest_neighbor(paths: List[dict], start_pos: np.ndarray = None) -> Tuple[List[dict], float]:
+    """Order paths using greedy nearest-neighbor algorithm with spatial indexing.
+    
+    Handles bidirectional paths (can draw from either end).
+    Uses KD-tree for O(N log N) complexity instead of O(N²).
+    
+    Parameters
+    ----------
+    paths : List[dict]
+        Unordered paths with 'points_mm' key
+    start_pos : np.ndarray, optional
+        Starting position [x, y] in mm, default [0, 0]
+    
+    Returns
+    -------
+    ordered_paths : List[dict]
+        Reordered paths (may have 'reversed' flag)
+    total_distance : float
+        Total travel distance in mm
+    """
+    if len(paths) == 0:
+        return [], 0.0
+    
+    if start_pos is None:
+        start_pos = np.array([0.0, 0.0])
+    
+    # Build spatial index for fast nearest-neighbor queries
+    # Store both start and end points for each path
+    from scipy.spatial import cKDTree
+    
+    endpoints = []
+    endpoint_meta = []  # (path_idx, is_end)
+    
+    for i, path in enumerate(paths):
+        pts = np.array(path['points_mm'])
+        endpoints.append(pts[0])
+        endpoint_meta.append((i, False))  # start point
+        endpoints.append(pts[-1])
+        endpoint_meta.append((i, True))   # end point
+    
+    endpoints = np.array(endpoints)
+    tree = cKDTree(endpoints)
+    
+    ordered = []
+    used = set()
+    current_pos = start_pos
+    total_dist = 0.0
+    
+    while len(used) < len(paths):
+        # Find k nearest endpoints - use larger k to handle clustered paths
+        # Query more than enough to ensure we find unused paths
+        k = min(len(endpoints), max(100, len(paths) - len(used) + 10))
+        dists, indices = tree.query(current_pos, k=k)
+        
+        # Ensure indices is iterable (single result returns scalar)
+        if not hasattr(indices, '__iter__'):
+            indices = [indices]
+            dists = [dists]
+        
+        # Find nearest unused path
+        best_idx = None
+        best_dist = float('inf')
+        best_reversed = False
+        
+        for dist, ep_idx in zip(dists, indices):
+            path_idx, is_end = endpoint_meta[ep_idx]
+            
+            if path_idx in used:
+                continue
+            
+            if dist < best_dist:
+                best_idx = path_idx
+                best_dist = dist
+                best_reversed = is_end  # If we're close to end, start from end
+        
+        if best_idx is None:
+            # Shouldn't happen with large k, but fallback to any unused path
+            for i in range(len(paths)):
+                if i not in used:
+                    best_idx = i
+                    pts = np.array(paths[i]['points_mm'])
+                    dist_start = np.linalg.norm(pts[0] - current_pos)
+                    dist_end = np.linalg.norm(pts[-1] - current_pos)
+                    best_dist = min(dist_start, dist_end)
+                    best_reversed = dist_end < dist_start
+                    break
+        
+        # Add best path
+        path = paths[best_idx].copy()
+        if best_reversed:
+            path['points_mm'] = list(reversed(path['points_mm']))
+            path['reversed'] = True
+        
+        ordered.append(path)
+        used.add(best_idx)
+        
+        # Update position
+        pts = np.array(path['points_mm'])
+        current_pos = pts[-1]
+        total_dist += best_dist
+    
+    return ordered, total_dist
+
+
+def _two_opt_refinement(paths: List[dict], max_iterations: int = 5) -> Tuple[List[dict], float]:
+    """Refine path order using 2-opt local search.
+    
+    Parameters
+    ----------
+    paths : List[dict]
+        Initial ordered paths
+    max_iterations : int
+        Maximum optimization iterations, default 5
+    
+    Returns
+    -------
+    refined_paths : List[dict]
+        Improved path order
+    total_distance : float
+        Total travel distance in mm
+    
+    Notes
+    -----
+    2-opt is O(N²) per iteration. For large path counts, we adaptively reduce
+    iterations or skip entirely to keep runtime under ~5 seconds.
+    """
+    if len(paths) < 3:
+        return paths, _compute_total_distance(paths)
+    
+    # Adaptive iteration limit based on path count
+    # O(N²) means 100 paths = ~10K ops, 500 paths = ~250K ops, 1000 paths = ~1M ops
+    n = len(paths)
+    if n > 500:
+        # Skip 2-opt for very large datasets (GNN is good enough)
+        return paths, _compute_total_distance(paths)
+    elif n > 200:
+        # Only 1 iteration for medium datasets
+        max_iterations = 1
+    elif n > 100:
+        # 2 iterations for smaller datasets
+        max_iterations = min(2, max_iterations)
+    
+    current = list(paths)
+    best_dist = _compute_total_distance(current)
+    
+    for iteration in range(max_iterations):
+        improved = False
+        
+        # Try swapping all pairs of segments
+        for i in range(len(current) - 2):
+            for j in range(i + 2, min(i + 50, len(current))):  # Limit window for speed
+                # Standard 2-opt: reverse segment [i+1:j+1]
+                # This reconnects: ...->i->i+1->...->j->j+1->... 
+                # to: ...->i->j->...(reversed)->i+1->j+1->...
+                
+                # Calculate improvement
+                # Remove edges: (i, i+1) and (j, j+1)
+                # Add edges: (i, j) and (i+1, j+1)
+                old_dist = (
+                    _path_endpoint_dist(current[i], current[i+1]) +
+                    (_path_endpoint_dist(current[j], current[j+1]) if j+1 < len(current) else 0)
+                )
+                
+                # After reversal, we need distances from i to j (now i+1 in sequence)
+                # and from old i+1 (now j in sequence) to j+1
+                # But we also need to reverse each path's direction in the segment
+                new_dist = (
+                    _path_endpoint_dist(current[i], current[j]) +
+                    (_path_endpoint_dist(current[i+1], current[j+1]) if j+1 < len(current) else 0)
+                )
+                
+                if new_dist < old_dist:
+                    # Reverse the segment and flip each path's direction
+                    segment = current[i+1:j+1]
+                    segment_reversed = []
+                    for path in reversed(segment):
+                        path_copy = path.copy()
+                        path_copy['points_mm'] = list(reversed(path_copy['points_mm']))
+                        segment_reversed.append(path_copy)
+                    current[i+1:j+1] = segment_reversed
+                    improved = True
+        
+        if not improved:
+            break
+        
+        # Recompute best distance
+        best_dist = _compute_total_distance(current)
+    
+    return current, best_dist
+
+
 def make_pen_layer(
     target_rgb_path: str,
     env_cfg_path: str,
@@ -1031,7 +1239,48 @@ def make_pen_layer(
         actual_coverage_fraction = total_passes_added * natural_coverage_per_pass
         logger.info(f"  Final hatch coverage: {actual_coverage_fraction*100:.1f}% of eligible zone ({total_passes_added} passes)")
     
-    logger.info(f"Generated {len(all_paths)} total paths")
+    logger.info(f"Generated {len(all_paths)} total paths (unordered)")
+    
+    # ========================================================================
+    # PATH ORDERING
+    # ========================================================================
+    logger.info("Optimizing path order (GNN + 2-opt)...")
+    
+    # Split by role
+    edge_paths = [p for p in all_paths if p['role'] == 'outline']
+    hatch_paths = [p for p in all_paths if p['role'] == 'hatch']
+    
+    logger.info(f"  Ordering {len(edge_paths)} edge paths...")
+    edge_paths_ordered, edge_dist = _greedy_nearest_neighbor(edge_paths)
+    edge_paths_ordered, edge_dist_refined = _two_opt_refinement(edge_paths_ordered)
+    
+    improvement_pct = ((edge_dist - edge_dist_refined) / edge_dist * 100) if edge_dist > 0 else 0
+    logger.info(f"  Edge travel distance: {edge_dist:.1f}mm (GNN) -> {edge_dist_refined:.1f}mm (2-opt, {improvement_pct:+.1f}%)")
+    
+    # Start hatching from end of last edge
+    if edge_paths_ordered:
+        last_edge_end = np.array(edge_paths_ordered[-1]['points_mm'][-1])
+    else:
+        last_edge_end = np.array([0.0, 0.0])
+    
+    logger.info(f"  Ordering {len(hatch_paths)} hatch paths...")
+    hatch_paths_ordered, hatch_dist = _greedy_nearest_neighbor(hatch_paths, start_pos=last_edge_end)
+    
+    # 2-opt (may be skipped for large path counts)
+    if len(hatch_paths) > 500:
+        logger.info(f"  Skipping 2-opt for {len(hatch_paths)} paths (too many for O(N²) optimization)")
+        logger.info(f"  Hatch travel distance: {hatch_dist:.1f}mm (GNN only)")
+        hatch_dist_refined = hatch_dist
+    else:
+        hatch_paths_ordered, hatch_dist_refined = _two_opt_refinement(hatch_paths_ordered)
+        improvement_pct = ((hatch_dist - hatch_dist_refined) / hatch_dist * 100) if hatch_dist > 0 else 0
+        logger.info(f"  Hatch travel distance: {hatch_dist:.1f}mm (GNN) -> {hatch_dist_refined:.1f}mm (2-opt, {improvement_pct:+.1f}%)")
+    
+    # Combine: edges first, then hatching
+    all_paths = edge_paths_ordered + hatch_paths_ordered
+    
+    total_travel = edge_dist_refined + hatch_dist_refined
+    logger.info(f"Total optimized travel distance: {total_travel:.1f}mm")
     
     # ========================================================================
     # SAVE PEN VECTORS
@@ -1138,7 +1387,8 @@ def make_pen_layer(
         'num_edge_paths': sum(1 for p in all_paths if p['role'] == 'outline'),
         'num_hatch_paths': sum(1 for p in all_paths if p['role'] == 'hatch'),
         'resolution': render_px,
-        'gamut_aware': pen_tracer_cfg.shadow_hatching.gamut_aware
+        'gamut_aware': pen_tracer_cfg.shadow_hatching.gamut_aware,
+        'travel_distance_mm': float(total_travel)
     }
     
     logger.info(f"Metrics: {metrics_data}")
