@@ -44,10 +44,11 @@ max_accel: 3000
 step_pin: PF13
 dir_pin: PF12
 enable_pin: PF14
-microsteps: 32
+microsteps: 16
 rotation_distance: 160
 velocity: 400
 accel: 8000
+step_pulse_duration: 0.000005
 '''
     with open('/home/gaia/printer.cfg', 'w') as f:
         f.write(config)
