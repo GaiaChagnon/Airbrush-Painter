@@ -305,7 +305,7 @@ class KlipperClient:
 
     # --- G-code Execution ---
 
-    def send_gcode(self, script: str, *, wait: bool = False) -> None:
+    def send_gcode(self, script: str, *, wait: bool = False, timeout: float | None = None) -> None:
         """
         Execute G-code via Klipper API.
 
@@ -317,6 +317,9 @@ class KlipperClient:
             If True, block until G-code execution completes.
             Note: completion means script was processed, not motion finished.
             Use M400 in the script to wait for motion completion.
+        timeout : float | None
+            Request timeout in seconds. If None, uses the client's default timeout.
+            Some commands like STEPPER_BUZZ take longer and need increased timeout.
 
         Raises
         ------
@@ -324,7 +327,7 @@ class KlipperClient:
             If G-code execution fails.
         """
         try:
-            self._send_request("gcode/script", {"script": script})
+            self._send_request("gcode/script", {"script": script}, timeout=timeout)
             logger.debug("Sent G-code: %s", script.replace("\n", " | ")[:80])
         except KlipperError as e:
             raise GCodeError(f"G-code execution failed: {e}") from e

@@ -1,0 +1,30 @@
+BTT Octopus Pro V1.1 - Driver 0 Pin Analysis
+=============================================
+
+Driver 0 (Motor 0) connections:
+- STEP: PF13 ✓ (configured)
+- DIR:  PF12 ✓ (configured)  
+- EN:   PF14 ✓ (configured)
+- DIAG: PG6  (used as endstop in config)
+- UART: PC4  (NOT configured - good!)
+
+CRITICAL OBSERVATION:
+====================
+Your endstop_pin: PG6 is the DIAG pin for Driver 0!
+
+On the Octopus, PG6 is the DIAG0 pin which is used for:
+- TMC driver diagnostics (StallGuard, etc.)
+- Sensorless homing
+- Driver status feedback
+
+If the Octopus firmware is trying to read this pin and the DM542TE
+is outputting something on it (or it's floating), this could cause
+issues with step generation timing!
+
+SOLUTION:
+=========
+1. Remove or comment out the endstop_pin (we're not homing yet)
+2. OR use a different pin for X endstop
+3. This will prevent any potential pin conflict
+
+Let me update printer.cfg now...

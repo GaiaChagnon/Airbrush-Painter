@@ -595,6 +595,12 @@ def test_seed_everything_reproducibility():
 
 def test_to_device_recursive():
     """Test recursive device movement."""
+    import warnings
+    if not torch_utils.cuda_is_functional():
+        pytest.skip("CUDA not functional")
+    
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
     t = torch.randn(2, 3)
     nested = {
         "a": t.clone(),
@@ -602,12 +608,12 @@ def test_to_device_recursive():
         "scalar": 42
     }
     
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dev = torch.device("cuda")
     moved = torch_utils.to_device_recursive(nested, dev)
     
-    assert moved["a"].device == dev
-    assert moved["b"][0].device == dev
-    assert moved["b"][1]["c"].device == dev
+        assert moved["a"].device.type == 'cuda'
+        assert moved["b"][0].device.type == 'cuda'
+        assert moved["b"][1]["c"].device.type == 'cuda'
     assert moved["scalar"] == 42
 
 
@@ -622,7 +628,7 @@ def test_set_channels_last():
             break
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not torch_utils.cuda_is_functional(), reason="CUDA not functional")
 def test_get_gpu_mem_highwater():
     """Test GPU memory high-water mark tracking."""
     device = torch.device('cuda:0')
@@ -805,7 +811,7 @@ def test_sha256_tensor_deterministic_cpu():
     assert h1 == h2
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not torch_utils.cuda_is_functional(), reason="CUDA not functional")
 def test_sha256_tensor_gpu():
     """Test tensor hashing works with GPU tensors."""
     t = torch.randn(50, 50, device='cuda')
@@ -1690,7 +1696,7 @@ def test_filter_strokes_by_bbox_empty_result():
     assert len(filtered) == 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not torch_utils.cuda_is_functional(), reason="CUDA not functional")
 def test_get_gpu_mem_info():
     """Test GPU memory information retrieval (critical for OOM debugging)."""
     mem_info = torch_utils.get_gpu_mem_info()
@@ -1706,7 +1712,7 @@ def test_get_gpu_mem_info():
     assert mem_info['reserved_mb'] >= mem_info['allocated_mb']
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not torch_utils.cuda_is_functional(), reason="CUDA not functional")
 def test_empty_cache():
     """Test CUDA cache clearing."""
     # Allocate some memory
@@ -1717,7 +1723,7 @@ def test_empty_cache():
     torch_utils.empty_cache()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not torch_utils.cuda_is_functional(), reason="CUDA not functional")
 def test_synchronize():
     """Test CUDA synchronization."""
     # Should not raise

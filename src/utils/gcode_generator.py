@@ -176,7 +176,8 @@ def load_macro(machine_cfg: validators.MachineV1, macro_name: str) -> List[str]:
 
 def validate_soft_limits(
     x: float, y: float, z: float,
-    machine_cfg: validators.MachineV1
+    machine_cfg: validators.MachineV1,
+    z_min: float = 0.0
 ) -> None:
     """Validate move against soft limits.
     
@@ -186,6 +187,9 @@ def validate_soft_limits(
         Machine coordinates (mm)
     machine_cfg : validators.MachineV1
         Machine configuration
+    z_min : float, optional
+        Minimum allowed Z value (default 0.0). Use negative values for pen tools
+        that can press below surface (e.g., -2.0 for pen drawing).
     
     Raises
     ------
@@ -200,8 +204,8 @@ def validate_soft_limits(
         raise ValueError(f"X={x:.2f} out of bounds [0, {work.x}]")
     if not (0 <= y <= work.y):
         raise ValueError(f"Y={y:.2f} out of bounds [0, {work.y}]")
-    if not (0 <= z <= work.z):
-        raise ValueError(f"Z={z:.2f} out of bounds [0, {work.z}]")
+    if not (z_min <= z <= work.z):
+        raise ValueError(f"Z={z:.2f} out of bounds [{z_min}, {work.z}]")
 
 
 def linearize_stroke(
@@ -551,7 +555,7 @@ def generate_pen_gcode(
         
         # Safe travel Z
         travel_z = pen_tool_cfg.safe_z_mm + tool_offset_z
-        validate_soft_limits(x0, y0, travel_z, machine_cfg)
+        validate_soft_limits(x0, y0, travel_z, machine_cfg, z_min=-2.0)
         lines.append(f"G0 X{x0:.3f} Y{y0:.3f} Z{travel_z:.3f}\n")
         
         # Pen down (plunge to drawing Z)
@@ -564,14 +568,14 @@ def generate_pen_gcode(
             machine_cfg.feed_units,
             machine_cfg
         )
-        validate_soft_limits(x0, y0, pen_z, machine_cfg)
+        validate_soft_limits(x0, y0, pen_z, machine_cfg, z_min=-2.0)
         lines.append(f"G1 Z{pen_z:.3f} F{plunge_feed:.1f}\n")
         
         # Draw polyline
         for i in range(1, len(pts_mach_offset)):
             x = pts_mach_offset[i, 0].item()
             y = pts_mach_offset[i, 1].item()
-            validate_soft_limits(x, y, pen_z, machine_cfg)
+            validate_soft_limits(x, y, pen_z, machine_cfg, z_min=-2.0)
             lines.append(f"G1 X{x:.3f} Y{y:.3f} F{pen_feed:.1f}\n")
         
         # Pen up

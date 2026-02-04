@@ -22,10 +22,40 @@ Reproducibility:
 import os
 import random
 from typing import Any, Dict, Optional
+import warnings
 
 import numpy as np
 import torch
 import torch.nn as nn
+
+
+def cuda_is_functional() -> bool:
+    """Check if CUDA is available and can actually execute operations.
+    
+    Returns
+    -------
+    bool
+        True if CUDA is available and functional, False otherwise.
+        
+    Notes
+    -----
+    This function tests actual CUDA execution, not just availability.
+    Useful for skipping GPU tests when hardware is incompatible (e.g.,
+    compute capability mismatch).
+    """
+    if not torch.cuda.is_available():
+        return False
+    
+    try:
+        # Try a simple operation
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            t = torch.tensor([1.0], device='cuda')
+            _ = t + 1.0
+            torch.cuda.synchronize()
+        return True
+    except RuntimeError:
+        return False
 
 
 def seed_everything(seed: int, deterministic_cudnn: bool = True) -> Dict[str, Any]:
