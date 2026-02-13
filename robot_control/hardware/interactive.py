@@ -1,8 +1,29 @@
-"""
-Interactive Controller.
+"""Interactive controller -- keyboard-driven manual control.
 
-Provides keyboard-driven manual control for testing and calibration.
-Terminal UI using Python curses (Linux native).
+Provides a terminal UI (Python ``curses``) for jog control, tool
+selection, homing, and single-stroke execution.  This is the primary
+interface during machine setup and calibration.
+
+Key map (configurable increments via ``machine.yaml``):
+
+    Arrow keys   -- jog X / Y
+    Page Up/Down -- jog Z up / down
+    +/-          -- cycle jog increment
+    H            -- home X and Y
+    P            -- select pen tool
+    A            -- select airbrush tool
+    U            -- tool up (raise)
+    D            -- tool down (lower)
+    O            -- move to canvas origin
+    Space        -- execute next stroke (step mode)
+    Esc          -- EMERGENCY STOP
+    Q            -- quit
+
+Safety:
+    - Every jog command checks soft limits before sending.
+    - Tool-down requires homed state.
+    - E-stop via Esc calls ``emergency_stop()`` (bypasses G-code queue).
+    - All jog moves use ``wait=True`` (one move at a time, no pile-up).
 """
 
 from __future__ import annotations
@@ -12,17 +33,21 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Literal
 
 from robot_control.configs.loader import MachineConfig
-from robot_control.hardware.klipper_client import KlipperClient, Position
+from robot_control.hardware.klipper_client import (
+    KlipperClient,
+    KlipperConnectionLost,
+    Position,
+)
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ControllerState:
-    """Current interactive controller state."""
+    """Snapshot of the interactive controller's runtime state."""
 
     position: Position | None
     tool: Literal["pen", "airbrush"]
@@ -33,11 +58,7 @@ class ControllerState:
 
 
 class InteractiveController:
-    """
-    Keyboard-driven manual control for testing and calibration.
-
-    Provides jog control, tool selection, and real-time position display
-    in a terminal UI.
+    """Terminal-based manual controller for testing and calibration.
 
     Parameters
     ----------
@@ -45,424 +66,253 @@ class InteractiveController:
         Connected Klipper API client.
     config : MachineConfig
         Machine configuration.
-
-    Examples
-    --------
-    >>> from robot_control.hardware.klipper_client import KlipperClient
-    >>> from robot_control.configs.loader import load_config
-    >>> config = load_config()
-    >>> with KlipperClient(config.connection.socket_path) as client:
-    ...     controller = InteractiveController(client, config)
-    ...     controller.run()  # Enters interactive mode
     """
 
-    # Key codes
-    KEY_UP = curses.KEY_UP
-    KEY_DOWN = curses.KEY_DOWN
-    KEY_LEFT = curses.KEY_LEFT
-    KEY_RIGHT = curses.KEY_RIGHT
-    KEY_PAGEUP = curses.KEY_PPAGE
-    KEY_PAGEDOWN = curses.KEY_NPAGE
+    def __init__(
+        self,
+        client: KlipperClient,
+        config: MachineConfig,
+    ) -> None:
+        self._client = client
+        self._cfg = config
 
-    def __init__(self, client: KlipperClient, config: MachineConfig) -> None:
-        self.client = client
-        self.config = config
-
-        # State
+        # Runtime state
         self._tool: Literal["pen", "airbrush"] = "pen"
         self._tool_up = True
-        self._jog_index = config.interactive.jog_increments_mm.index(
-            config.interactive.default_jog_increment_mm
-        )
-        self._position: Position | None = None
         self._homed = False
         self._status = "Ready"
+        self._position: Position | None = None
         self._running = False
 
-        # Threading
-        self._position_lock = threading.Lock()
-        self._position_thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
+        # Jog increments from config
+        self._increments = list(config.interactive.jog_increments_mm)
+        self._inc_idx = self._increments.index(
+            config.interactive.default_jog_increment_mm,
+        )
 
     @property
     def jog_increment(self) -> float:
-        """Current jog increment in mm."""
-        return self.config.interactive.jog_increments_mm[self._jog_index]
+        """Current jog step size in mm."""
+        return self._increments[self._inc_idx]
 
-    def get_state(self) -> ControllerState:
-        """Get current controller state."""
-        with self._position_lock:
-            return ControllerState(
-                position=self._position,
-                tool=self._tool,
-                tool_up=self._tool_up,
-                jog_increment=self.jog_increment,
-                homed=self._homed,
-                status=self._status,
-            )
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """
-        Enter interactive control mode.
+        """Launch the curses TUI.  Blocks until the user quits."""
+        curses.wrapper(self._main_loop)
 
-        Runs curses-based terminal UI until user quits (Q key).
-        """
+    def _main_loop(self, stdscr: curses.window) -> None:
+        """Curses event loop."""
+        stdscr.nodelay(False)
+        stdscr.timeout(int(self._cfg.interactive.position_poll_interval_ms))
+        curses.curs_set(0)
         self._running = True
-        self._stop_event.clear()
 
-        # Start position polling thread
-        self._position_thread = threading.Thread(
-            target=self._position_poll_loop,
-            daemon=True,
+        # Start position-polling thread
+        poll_stop = threading.Event()
+        poll_thread = threading.Thread(
+            target=self._poll_position, args=(poll_stop,), daemon=True,
         )
-        self._position_thread.start()
+        poll_thread.start()
 
-        # Check initial homing state
         try:
-            self._homed = self.client.is_homed("xy")
-        except Exception:
-            self._homed = False
-
-        # Run curses UI
-        try:
-            curses.wrapper(self._curses_main)
+            while self._running:
+                self._draw(stdscr)
+                key = stdscr.getch()
+                if key == -1:
+                    continue
+                self._handle_key(key, stdscr)
         finally:
+            poll_stop.set()
+            poll_thread.join(timeout=2.0)
+
+    # ------------------------------------------------------------------
+    # Position polling
+    # ------------------------------------------------------------------
+
+    def _poll_position(self, stop: threading.Event) -> None:
+        interval = self._cfg.interactive.position_poll_interval_ms / 1000.0
+        while not stop.is_set():
+            try:
+                self._position = self._client.get_position()
+            except Exception:  # noqa: BLE001
+                pass
+            stop.wait(interval)
+
+    # ------------------------------------------------------------------
+    # Key handling
+    # ------------------------------------------------------------------
+
+    def _handle_key(self, key: int, stdscr: curses.window) -> None:
+        if key == 27:  # Esc -> E-STOP
+            self._emergency_stop()
+        elif key == ord("q") or key == ord("Q"):
             self._running = False
-            self._stop_event.set()
-            if self._position_thread:
-                self._position_thread.join(timeout=1.0)
+        elif key == ord("h") or key == ord("H"):
+            self._home()
+        elif key == ord("p") or key == ord("P"):
+            self._select_tool("pen")
+        elif key == ord("a") or key == ord("A"):
+            self._select_tool("airbrush")
+        elif key == ord("u") or key == ord("U"):
+            self._tool_up_cmd()
+        elif key == ord("d") or key == ord("D"):
+            self._tool_down_cmd()
+        elif key == ord("o") or key == ord("O"):
+            self._goto_origin()
+        elif key == ord("+") or key == ord("="):
+            self._cycle_increment(1)
+        elif key == ord("-") or key == ord("_"):
+            self._cycle_increment(-1)
+        elif key == curses.KEY_UP:
+            self._jog(0, self.jog_increment)
+        elif key == curses.KEY_DOWN:
+            self._jog(0, -self.jog_increment)
+        elif key == curses.KEY_RIGHT:
+            self._jog(self.jog_increment, 0)
+        elif key == curses.KEY_LEFT:
+            self._jog(-self.jog_increment, 0)
+        elif key == curses.KEY_PPAGE:  # Page Up
+            self._jog_z(self.jog_increment)
+        elif key == curses.KEY_NPAGE:  # Page Down
+            self._jog_z(-self.jog_increment)
 
-    def _curses_main(self, stdscr: curses.window) -> None:
-        """Main curses event loop."""
-        # Configure curses
-        curses.curs_set(0)  # Hide cursor
-        stdscr.nodelay(True)  # Non-blocking input
-        stdscr.timeout(50)  # 50ms refresh rate
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
 
-        # Initialize color pairs if available
-        if curses.has_colors():
-            curses.start_color()
-            curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
-            curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
-            curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-            curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
-
-        while self._running:
-            # Handle input
-            key = stdscr.getch()
-            if key != -1:
-                if not self._handle_key(key):
-                    break  # Quit requested
-
-            # Redraw display
-            self._draw_display(stdscr)
-
-    def _handle_key(self, key: int) -> bool:
-        """
-        Handle keyboard input.
-
-        Returns False to quit, True to continue.
-        """
-        try:
-            # Quit
-            if key in (ord("q"), ord("Q")):
-                return False
-
-            # Emergency stop
-            if key == 27:  # Escape
-                self._emergency_stop()
-                return True
-
-            # Movement keys
-            if key == self.KEY_LEFT:
-                self._jog("X", -1)
-            elif key == self.KEY_RIGHT:
-                self._jog("X", 1)
-            elif key == self.KEY_UP:
-                self._jog("Y", 1)
-            elif key == self.KEY_DOWN:
-                self._jog("Y", -1)
-            elif key == self.KEY_PAGEUP:
-                self._jog("Z", 1)
-            elif key == self.KEY_PAGEDOWN:
-                self._jog("Z", -1)
-
-            # Jog increment
-            elif key in (ord("+"), ord("=")):
-                self._change_jog_increment(1)
-            elif key in (ord("-"), ord("_")):
-                self._change_jog_increment(-1)
-
-            # Homing
-            elif key in (ord("h"), ord("H")):
-                self._home()
-
-            # Tool selection
-            elif key in (ord("p"), ord("P")):
-                self._select_tool("pen")
-            elif key in (ord("a"), ord("A")):
-                self._select_tool("airbrush")
-
-            # Tool up/down
-            elif key in (ord("u"), ord("U")):
-                self._tool_up_cmd()
-            elif key in (ord("d"), ord("D")):
-                self._tool_down_cmd()
-
-            # Go to origin
-            elif key in (ord("o"), ord("O")):
-                self._go_to_origin()
-
-        except Exception as e:
-            self._status = f"Error: {e}"
-            logger.error("Key handler error: %s", e)
-
-        return True
-
-    def _jog(self, axis: str, direction: int) -> None:
-        """Execute jog move on specified axis."""
-        if not self._homed and axis in ("X", "Y"):
-            self._status = "Home required before XY jog"
+    def _jog(self, dx: float, dy: float) -> None:
+        """Relative XY jog with soft-limit check."""
+        if self._position is None:
+            self._status = "No position -- home first"
             return
+        nx = self._position.x + dx
+        ny = self._position.y + dy
+        wa = self._cfg.work_area
+        if nx < 0 or nx > wa.x or ny < 0 or ny > wa.y:
+            self._status = f"Soft limit: X={nx:.1f} Y={ny:.1f}"
+            return
+        tc = self._cfg.get_tool(self._tool)
+        f_val = tc.travel_feed_mm_s * 60.0
+        self._client.send_gcode(
+            f"G91\nG0 X{dx:.3f} Y{dy:.3f} F{f_val:.1f}\nG90\nM400",
+        )
+        self._status = f"Jog X{dx:+.1f} Y{dy:+.1f}"
 
-        distance = self.jog_increment * direction
-        feed = self.config.get_tool(self._tool).travel_feed_mm_min
-
-        # Build G-code
-        gcode = f"G91\nG0 {axis}{distance:.3f} F{feed:.0f}\nG90\nM400"
-
-        self._status = f"Jogging {axis} {'+' if direction > 0 else ''}{distance:.3f}mm"
-        try:
-            self.client.send_gcode(gcode)
-        except Exception as e:
-            self._status = f"Jog failed: {e}"
-
-    def _change_jog_increment(self, delta: int) -> None:
-        """Change jog increment by index delta."""
-        new_index = self._jog_index + delta
-        if 0 <= new_index < len(self.config.interactive.jog_increments_mm):
-            self._jog_index = new_index
-            self._status = f"Jog increment: {self.jog_increment}mm"
+    def _jog_z(self, dz: float) -> None:
+        """Relative Z jog with soft-limit check."""
+        if self._position is None:
+            self._status = "No position -- home first"
+            return
+        nz = self._position.z + dz
+        if nz < 0 or nz > self._cfg.work_area.z:
+            self._status = f"Soft limit: Z={nz:.1f}"
+            return
+        tc = self._cfg.get_tool(self._tool)
+        f_val = tc.plunge_feed_mm_s * 60.0
+        self._client.send_gcode(
+            f"G91\nG0 Z{dz:.3f} F{f_val:.1f}\nG90\nM400",
+        )
+        self._status = f"Jog Z{dz:+.1f}"
 
     def _home(self) -> None:
-        """Home X and Y axes."""
-        self._status = "Homing X and Y..."
+        self._status = "Homing X Y..."
         try:
-            self.client.send_gcode("G28 X Y\nM400")
+            self._client.send_gcode("G28 X Y\nM400", timeout=30.0)
             self._homed = True
+            self._tool_up = True
             self._status = "Homed"
-        except Exception as e:
-            self._status = f"Home failed: {e}"
-            self._homed = False
+        except Exception as exc:  # noqa: BLE001
+            self._status = f"Home failed: {exc}"
 
     def _select_tool(self, tool: Literal["pen", "airbrush"]) -> None:
-        """Select active tool."""
         self._tool = tool
-        macro = "TOOL_PEN" if tool == "pen" else "TOOL_AIRBRUSH"
-        self._status = f"Selected {tool}"
+        macro = f"TOOL_{tool.upper()}"
         try:
-            self.client.send_gcode(f"{macro}\nM400")
-        except Exception as e:
-            self._status = f"Tool select failed: {e}"
+            self._client.send_gcode(f"{macro}\nM400")
+            self._tool_up = True
+            self._status = f"Tool: {tool}"
+        except Exception as exc:  # noqa: BLE001
+            self._status = f"Tool select failed: {exc}"
 
     def _tool_up_cmd(self) -> None:
-        """Raise tool to travel height."""
-        z = self.config.z_states.travel_mm
-        feed = self.config.get_tool(self._tool).plunge_feed_mm_min
-        self._status = "Raising tool..."
-        try:
-            self.client.send_gcode(f"G0 Z{z:.3f} F{feed:.0f}\nM400")
-            self._tool_up = True
-            self._status = "Tool up"
-        except Exception as e:
-            self._status = f"Tool up failed: {e}"
+        z = self._cfg.get_z_for_tool(self._tool, "travel")
+        tc = self._cfg.get_tool(self._tool)
+        f_val = tc.plunge_feed_mm_s * 60.0
+        self._client.send_gcode(f"G0 Z{z:.3f} F{f_val:.1f}\nM400")
+        self._tool_up = True
+        self._status = "Tool UP"
 
     def _tool_down_cmd(self) -> None:
-        """Lower tool to work height."""
         if not self._homed:
-            self._status = "Home required before tool down"
+            self._status = "Cannot lower tool -- not homed"
             return
+        z = self._cfg.get_z_for_tool(self._tool, "work")
+        tc = self._cfg.get_tool(self._tool)
+        f_val = tc.plunge_feed_mm_s * 60.0
+        self._client.send_gcode(f"G1 Z{z:.3f} F{f_val:.1f}\nM400")
+        self._tool_up = False
+        self._status = "Tool DOWN"
 
-        z = self.config.get_z_for_tool(self._tool, "work")
-        feed = self.config.get_tool(self._tool).plunge_feed_mm_min
-        self._status = "Lowering tool..."
-        try:
-            self.client.send_gcode(f"G1 Z{z:.3f} F{feed:.0f}\nM400")
-            self._tool_up = False
-            self._status = f"Tool down ({self._tool})"
-        except Exception as e:
-            self._status = f"Tool down failed: {e}"
-
-    def _go_to_origin(self) -> None:
-        """Move to canvas origin (0, 0)."""
+    def _goto_origin(self) -> None:
         if not self._homed:
-            self._status = "Home required"
+            self._status = "Cannot go to origin -- not homed"
             return
+        ox = self._cfg.canvas.offset_x_mm
+        oy = self._cfg.canvas.offset_y_mm
+        tc = self._cfg.get_tool(self._tool)
+        f_val = tc.travel_feed_mm_s * 60.0
+        self._client.send_gcode(
+            f"G0 X{ox:.3f} Y{oy:.3f} F{f_val:.1f}\nM400",
+        )
+        self._status = f"At canvas origin ({ox:.1f}, {oy:.1f})"
 
-        # Ensure tool is up
-        self._tool_up_cmd()
-
-        mx, my = self.config.canvas_to_machine(0, 0, self._tool)
-        feed = self.config.get_tool(self._tool).travel_feed_mm_min
-        self._status = "Moving to canvas origin..."
-        try:
-            self.client.send_gcode(f"G0 X{mx:.3f} Y{my:.3f} F{feed:.0f}\nM400")
-            self._status = "At canvas origin"
-        except Exception as e:
-            self._status = f"Move failed: {e}"
+    def _cycle_increment(self, direction: int) -> None:
+        self._inc_idx = (self._inc_idx + direction) % len(self._increments)
+        self._status = f"Jog step: {self.jog_increment} mm"
 
     def _emergency_stop(self) -> None:
-        """Trigger emergency stop."""
-        self._status = "EMERGENCY STOP!"
-        try:
-            self.client.emergency_stop()
-        except Exception:
-            pass
+        self._client.emergency_stop()
         self._homed = False
+        self._status = "!!! EMERGENCY STOP !!!"
+        logger.warning("E-STOP triggered from interactive controller")
 
-    def _position_poll_loop(self) -> None:
-        """Background thread for position updates."""
-        interval = self.config.interactive.position_poll_interval_ms / 1000.0
+    # ------------------------------------------------------------------
+    # Display
+    # ------------------------------------------------------------------
 
-        while not self._stop_event.is_set():
-            try:
-                pos = self.client.get_position()
-                with self._position_lock:
-                    self._position = pos
-            except Exception as e:
-                logger.debug("Position poll error: %s", e)
+    def _draw(self, stdscr: curses.window) -> None:
+        """Render the terminal UI."""
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        cw = min(w - 2, 60)  # content width
 
-            self._stop_event.wait(interval)
+        pos = self._position
+        px = f"{pos.x:.3f}" if pos else "---"
+        py = f"{pos.y:.3f}" if pos else "---"
+        pz = f"{pos.z:.3f}" if pos else "---"
 
-    def _draw_display(self, stdscr: curses.window) -> None:
-        """Draw the terminal UI."""
-        stdscr.clear()
-        height, width = stdscr.getmaxyx()
+        tool_state = "up" if self._tool_up else "DOWN"
 
-        # Header
-        self._draw_header(stdscr, width)
-
-        # Position display
-        self._draw_position(stdscr, 3)
-
-        # State display
-        self._draw_state(stdscr, 8)
-
-        # Help
-        self._draw_help(stdscr, 14, height)
-
-        stdscr.refresh()
-
-    def _draw_header(self, stdscr: curses.window, width: int) -> None:
-        """Draw header bar."""
-        header = " INTERACTIVE CONTROL "
-        padding = (width - len(header)) // 2
-
-        if curses.has_colors():
-            stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-        stdscr.addstr(0, 0, "═" * width)
-        stdscr.addstr(1, padding, header)
-        stdscr.addstr(2, 0, "═" * width)
-        if curses.has_colors():
-            stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-
-    def _draw_position(self, stdscr: curses.window, start_row: int) -> None:
-        """Draw position display."""
-        with self._position_lock:
-            pos = self._position
-
-        stdscr.addstr(start_row, 2, "Position:", curses.A_BOLD)
-
-        if pos:
-            stdscr.addstr(start_row + 1, 4, f"X: {pos.x:8.3f} mm")
-            stdscr.addstr(start_row + 2, 4, f"Y: {pos.y:8.3f} mm")
-            stdscr.addstr(start_row + 3, 4, f"Z: {pos.z:8.3f} mm")
-        else:
-            stdscr.addstr(start_row + 1, 4, "X: ---")
-            stdscr.addstr(start_row + 2, 4, "Y: ---")
-            stdscr.addstr(start_row + 3, 4, "Z: ---")
-
-    def _draw_state(self, stdscr: curses.window, start_row: int) -> None:
-        """Draw state display."""
-        stdscr.addstr(start_row, 2, "State:", curses.A_BOLD)
-
-        # Tool
-        tool_str = f"Tool: {self._tool.upper()}"
-        if self._tool_up:
-            tool_str += " (up)"
-        else:
-            tool_str += " (down)"
-        stdscr.addstr(start_row + 1, 4, tool_str)
-
-        # Jog increment
-        stdscr.addstr(start_row + 2, 4, f"Jog Step: {self.jog_increment} mm")
-
-        # Homed status
-        if self._homed:
-            if curses.has_colors():
-                stdscr.attron(curses.color_pair(1))
-            stdscr.addstr(start_row + 3, 4, "Homed: YES")
-            if curses.has_colors():
-                stdscr.attroff(curses.color_pair(1))
-        else:
-            if curses.has_colors():
-                stdscr.attron(curses.color_pair(2))
-            stdscr.addstr(start_row + 3, 4, "Homed: NO")
-            if curses.has_colors():
-                stdscr.attroff(curses.color_pair(2))
-
-        # Status message
-        if curses.has_colors():
-            stdscr.attron(curses.color_pair(3))
-        stdscr.addstr(start_row + 4, 4, f"Status: {self._status}")
-        if curses.has_colors():
-            stdscr.attroff(curses.color_pair(3))
-
-    def _draw_help(self, stdscr: curses.window, start_row: int, max_height: int) -> None:
-        """Draw help text."""
-        if start_row >= max_height - 8:
-            return
-
-        stdscr.addstr(start_row, 2, "Controls:", curses.A_BOLD)
-        help_lines = [
-            "[←→↑↓] Jog XY    [PgUp/Dn] Jog Z    [+/-] Step size",
-            "[H] Home XY      [O] Go to origin",
-            "[P] Pen tool     [A] Airbrush tool",
-            "[U] Tool up      [D] Tool down",
-            "[Esc] E-STOP     [Q] Quit",
+        lines = [
+            f"{'INTERACTIVE CONTROL':^{cw}}",
+            "-" * cw,
+            f"  Position:  X: {px:>10}   Y: {py:>10}   Z: {pz:>10}",
+            f"  Tool:      {self._tool.upper()} ({tool_state})",
+            f"  Jog Step:  {self.jog_increment} mm",
+            f"  State:     {self._status}",
+            "-" * cw,
+            "  [Arrows] Jog XY   [PgUp/Dn] Jog Z   [+/-] Step size",
+            "  [H] Home          [P] Pen       [A] Airbrush",
+            "  [U] Up            [D] Down      [O] Canvas origin",
+            "  [Esc] E-STOP      [Q] Quit",
         ]
 
-        for i, line in enumerate(help_lines):
-            row = start_row + 1 + i
-            if row < max_height - 1:
-                stdscr.addstr(row, 4, line)
+        for row, line in enumerate(lines):
+            if row >= h - 1:
+                break
+            stdscr.addnstr(row, 1, line, w - 2)
 
-
-def run_interactive(
-    socket_path: str | None = None,
-    config_path: str | None = None,
-) -> None:
-    """
-    Convenience function to run interactive control.
-
-    Parameters
-    ----------
-    socket_path : str | None
-        Klipper socket path. Uses config default if None.
-    config_path : str | None
-        Config file path. Uses default if None.
-    """
-    from robot_control.configs.loader import load_config
-
-    config = load_config(config_path)
-
-    if socket_path is None:
-        socket_path = config.connection.socket_path
-
-    with KlipperClient(
-        socket_path,
-        timeout=config.connection.timeout_s,
-        reconnect_attempts=config.connection.reconnect_attempts,
-    ) as client:
-        controller = InteractiveController(client, config)
-        controller.run()
+        stdscr.refresh()

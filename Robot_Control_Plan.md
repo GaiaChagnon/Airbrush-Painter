@@ -354,17 +354,42 @@ Low-level Klipper API communication. Handles socket connection, JSON message fra
 | Responsibility | Details |
 |----------------|---------|
 | Connection management | Connect to UDS, handle reconnection |
+| **Auto-reconnect** | **Detect MCU reset / Octopus power-cycle and re-establish connection** |
 | Message framing | JSON + 0x03 terminator |
 | Request/response matching | Track by message ID |
 | Subscription handling | Process async state updates |
 | Error detection | Parse error responses, raise exceptions |
 | Emergency stop | Direct API call, no queue |
 
+### Auto-Reconnect on MCU Reset
+
+> **CHANGED Jan 29, 2026**: New requirement. When the Octopus is power-cycled or
+> reset, Klipper enters a shutdown/disconnect state. The client must detect this
+> and automatically re-establish the connection without manual intervention.
+
+**Behavior:**
+1. On any socket error (`BrokenPipeError`, `ConnectionResetError`, empty recv):
+   - Mark connection as lost.
+   - Begin reconnection loop: attempt to reconnect up to `reconnect_attempts` times,
+     sleeping `reconnect_interval_s` between attempts (both from `machine.yaml`).
+   - After reconnecting, send `FIRMWARE_RESTART` to re-initialize the MCU.
+   - Wait for Klipper to reach "ready" state (poll `info` endpoint).
+   - Re-subscribe to any active subscriptions.
+2. If reconnection fails after all attempts, raise `KlipperConnectionLost`.
+3. Callers can check `is_connected` property; long-running loops (calibration,
+   interactive) should handle `KlipperConnectionLost` gracefully (warn user,
+   offer retry).
+
+**Why this matters**: During development and testing, the Octopus frequently gets
+power-cycled or hits firmware errors. Without auto-reconnect, every test script
+must be restarted manually.
+
 ### Interface
 
 **Lifecycle**
 - `connect()` → Establish socket connection, verify `info` response
 - `disconnect()` → Clean socket close
+- `reconnect()` → Attempt to re-establish a lost connection (called automatically)
 - `is_connected` → Connection status property
 
 **Commands**
@@ -401,11 +426,13 @@ Each request gets a unique ID. Responses are matched by ID. This allows:
 
 | Error Type | Detection | Action |
 |------------|-----------|--------|
-| Connection failed | Socket exception | Raise `ConnectionError` |
-| Klipper not ready | `info` returns non-ready state | Raise `KlipperNotReady` |
+| Connection failed | Socket exception on initial connect | Raise `ConnectionError` |
+| **Connection lost** | **BrokenPipe / empty recv during operation** | **Auto-reconnect loop (see above)** |
+| **Reconnect exhausted** | **All retry attempts failed** | **Raise `KlipperConnectionLost`** |
+| Klipper not ready | `info` returns non-ready state | Wait + retry, then raise `KlipperNotReady` |
 | G-code error | Response contains error field | Raise `GCodeError` with message |
 | Timeout | No response within deadline | Raise `TimeoutError` |
-| Shutdown | Klipper reports shutdown state | Raise `KlipperShutdown` |
+| Shutdown | Klipper reports shutdown state | Attempt `FIRMWARE_RESTART`, then reconnect |
 
 ---
 
@@ -784,68 +811,125 @@ results = routines.calibrate_steps_per_mm(client, config, axis="X")
 
 ```yaml
 # machine.yaml - Hardware configuration for Octopus Pro Painter
+#
+# This is the single source of truth for machine dimensions, stepper
+# hardware, and tool configuration. The code reads this file at startup.
+# Change values here — do NOT hardcode them in Python.
 
-# Klipper API connection
+# ─── Klipper API connection ──────────────────────────────────────────
 connection:
   socket_path: "/tmp/klippy_uds"
   timeout_s: 5.0
-  reconnect_attempts: 3
+  reconnect_attempts: 5          # Retries if Octopus was power-cycled
+  reconnect_interval_s: 2.0      # Seconds between reconnect attempts
+  auto_reconnect: true           # Re-establish connection on MCU reset
 
-# Physical work area
+# ─── Physical work area (measure your machine) ──────────────────────
+# These are the ACTUAL travel limits of each axis in mm.
+# Must match position_max in printer.cfg.
 machine:
   work_area_mm:
-    x: 250.0
-    y: 350.0
-    z: 40.0
+    x: 250.0                    # CHANGE to actual X travel
+    y: 350.0                    # CHANGE to actual Y travel
+    z: 40.0                     # CHANGE to actual Z travel
 
-# Canvas position within work area  
+# ─── Canvas position within work area ────────────────────────────────
 canvas:
-  offset_x_mm: 25.0      # Distance from X home to canvas left edge
-  offset_y_mm: 25.0      # Distance from Y home to canvas bottom edge
-  width_mm: 210.0        # A4 width
-  height_mm: 297.0       # A4 height
+  offset_x_mm: 25.0             # Distance from X home to canvas left edge
+  offset_y_mm: 25.0             # Distance from Y home to canvas bottom edge
+  width_mm: 210.0               # A4 width (or actual canvas)
+  height_mm: 297.0              # A4 height (or actual canvas)
 
-# Z-axis seesaw states (your belt mechanism)
+# ─── Z-axis seesaw states ────────────────────────────────────────────
 z_states:
-  travel_mm: 10.0        # Both tools clear
-  pen_work_mm: 20.0      # Pen contacts paper
-  airbrush_work_mm: 0.0  # Airbrush at spray height
+  travel_mm: 10.0               # Both tools clear of paper
+  pen_work_mm: 20.0             # Pen contacts paper
+  airbrush_work_mm: 0.0         # Airbrush at spray height
 
-# Tool definitions
+# ─── Tool definitions ────────────────────────────────────────────────
 tools:
   pen:
-    xy_offset_mm: [0.0, 0.0]     # Calibrate with crosshair test
-    feed_mm_min: 1500            # Drawing speed
-    travel_feed_mm_min: 6000     # Rapid speed
-    plunge_feed_mm_min: 300      # Z lowering speed
+    xy_offset_mm: [0.0, 0.0]    # Calibrate with crosshair test
+    feed_mm_s: 25.0              # Drawing speed (mm/s)
+    travel_feed_mm_s: 80.0       # Rapid speed (mm/s)
+    plunge_feed_mm_s: 5.0        # Z lowering speed (mm/s)
 
   airbrush:
-    xy_offset_mm: [0.0, 0.0]     # Reference tool (offsets are 0)
-    feed_mm_min: 3000
-    travel_feed_mm_min: 6000
+    xy_offset_mm: [0.0, 0.0]
+    feed_mm_s: 50.0
+    travel_feed_mm_s: 80.0
+    plunge_feed_mm_s: 5.0
     spray_height_mm: 3.0         # Height above canvas when spraying
 
-# Motion limits (conservative for pen)
-motion:
-  max_velocity_mm_s: 100.0
-  max_accel_mm_s2: 1000.0
-  junction_deviation_mm: 0.05
+# ─── Stepper / driver hardware ───────────────────────────────────────
+# Documents the physical motor+driver configuration so that all code
+# (calibration, motion tests, printer.cfg generation) stays consistent.
+#
+# All XY axes share the same motor/driver/belt/pulley combination.
+# Z may differ — update z_rotation_distance separately when wired.
+steppers:
+  motor_type: "0.9deg"           # 400 native full steps/rev
+  driver: "DM542TE"
+  driver_pulses_per_rev: 1600    # Set via DM542TE DIP switches (4× for 0.9° motor)
+  wiring: "common_anode"         # Octopus drives +, - to GND
+  enable_pin_inverted: false     # common_anode → enable is NOT inverted (no "!")
+  step_pulse_duration_s: 0.000005  # 5 µs — required for DM542TE via LS08 buffer
+  direction_reversal_pause_s: 0.5  # 500 ms pause between rapid direction reversals
 
-# Interactive mode settings  
+  # Klipper stepper settings (derived from above)
+  klipper_microsteps: 4          # 400 × 4 = 1600 = driver_pulses_per_rev
+  xy_rotation_distance: 32.0     # GT2 belt (2mm pitch) × 16T pulley = 32mm/rev
+  z_rotation_distance: null      # TBD — fill in when Z is wired
+
+  # Belt & pulley specs (for reference / calibration calculations)
+  belt_type: "GT2"
+  belt_pitch_mm: 2.0
+  pulley_teeth: 16
+  pulley_bore_mm: 5.0
+
+# ─── Axis-to-Motor mapping (Octopus Pro V1.0.1 H723) ────────────────
+# This section is informational — pin assignments live in printer.cfg.
+# It exists so the code knows which Octopus slots are used.
+axes:
+  y:
+    octopus_slot: "Motor 0"
+    motors: 1                    # Single motor
+    endstop_pin: "DIAG0 (PG6)"
+    endstop_type: "NO_to_GND"   # Normally open, closes to ground
+    homing_side: "min"           # Endstop at position_min (0)
+  x:
+    octopus_slot: "Motor 2_1 + Motor 2_2"
+    motors: 2                    # Dual motor (stepper_x + stepper_x1)
+    endstop_pin: "DIAG1 (PG9)"
+    endstop_type: "NO_to_GND"
+    homing_side: "min"
+  z:
+    octopus_slot: "TBD"
+    motors: 1
+    endstop_pin: null            # No endstop yet
+    homing_side: null
+
+# ─── Motion limits ───────────────────────────────────────────────────
+# Start conservative; increase after running calibration patterns.
+motion:
+  max_velocity_mm_s: 80.0        # ~2.5 RPS at rotation_distance=32
+  max_accel_mm_s2: 3000.0        # Conservative start
+  junction_deviation_mm: 0.05
+  homing_speed_mm_s: 30.0
+
+# ─── Interactive mode settings ───────────────────────────────────────
 interactive:
   jog_increments_mm: [0.1, 1.0, 10.0, 50.0]
   default_jog_increment_mm: 1.0
   position_poll_interval_ms: 100
 
-# Virtual SD card path (for file-run mode)
+# ─── File execution (virtual_sdcard) ─────────────────────────────────
 file_execution:
   gcode_directory: "/home/klipper/gcode_files"
-  
-# Future: pump configuration (disabled for pen-only)
+
+# ─── Future hardware (disabled) ──────────────────────────────────────
 pumps:
   enabled: false
-  
-# Future: servo configuration (disabled for pen-only)  
 servos:
   enabled: false
 ```
@@ -855,13 +939,139 @@ servos:
 On load, validate:
 - Socket path exists (or warn if klippy not running)
 - Canvas fits within work area
+- Canvas + offsets do not exceed machine travel
 - Tool offsets are within reasonable bounds
 - Z states are ordered correctly (travel between work positions)
+- `xy_rotation_distance` matches `belt_pitch_mm × pulley_teeth`
+- `klipper_microsteps × 400` equals `driver_pulses_per_rev`
 - Feed rates don't exceed motion limits
 
 ---
 
+## 12A. Hardware Specifications & Test Findings
+
+> **CHANGED Jan 29, 2026**: Initial hardware test findings from motor bring-up.
+> **CHANGED Jan 29, 2026 (rev 2)**: Added axis-to-motor mapping, endstop config,
+> corrected rotation_distance to 32mm using actual GT2 16T pulley specs, added
+> dual-motor X axis (Motor 2_1 + 2_2).
+
+### Axis-to-Motor Mapping (Octopus Pro V1.0.1 H723)
+
+| Axis | Octopus Slot | Step Pin | Dir Pin | Enable Pin | Role |
+|------|-------------|----------|---------|------------|------|
+| **Y** | Motor 0 | PF13 | PF12 | PF14 | Single Y motor |
+| **X** (motor 1) | Motor 2_1 | PF11 | PG3 | PG5 | Dual X — left side |
+| **X** (motor 2) | Motor 2_2 | PG4 | PC1 | PA0 | Dual X — right side |
+| **Z** | TBD | TBD | TBD | TBD | Seesaw / pen-lift mechanism |
+
+**Important**: Motor 0 is Y (not X as previously assumed). X uses two motors
+(Motor 2_1 and 2_2) that move in tandem. In Klipper, these are `[stepper_x]` and
+`[stepper_x1]`.
+
+### Endstops
+
+| Axis | Pin | Octopus Label | Switch Type | Wiring |
+|------|-----|---------------|-------------|--------|
+| Y | PG6 | DIAG0 | NO (normally open) | Connects to GND when triggered |
+| X | PG9 | DIAG1 | NO (normally open) | Connects to GND when triggered |
+
+- **Single-side homing only** — endstops are on one end of each axis, not both.
+- Klipper pin config: `^PG6` / `^PG9` — the `^` enables the internal pull-up;
+  pin reads HIGH normally, LOW when the switch triggers.
+- With dual X motors and a single X endstop, there is **no automatic squareness
+  guarantee**. The gantry must be mechanically constrained or a manual squaring
+  procedure must be run each session.
+
+### Belt & Pulley System
+
+All XY axes use the same belt/pulley:
+
+| Component | Spec |
+|-----------|------|
+| Belt | GT2, 6 mm wide, toothed |
+| Pulley | 16 teeth, 5.00 mm bore H7, clamping screws |
+| Belt pitch | 2.000 mm (GT2 standard) |
+| **Travel per motor revolution** | **2 mm × 16 teeth = 32.000 mm** |
+
+Z axis belt/pulley: TBD (may differ — document when wired).
+
+### Motor & Driver Specifications (All Axes)
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Motor type | 0.9°/step (400 native steps/rev) | All motors are 0.9°, NOT 1.8° |
+| Driver | DM542TE | External driver, common-anode wiring to Octopus |
+| Driver microstepping | 1600 pulses/rev | Set via DM542TE DIP switches (= 4× for 400-step motor) |
+| Wiring | Common-anode | `-` pins connect to GND; Octopus drives `+` pins HIGH to activate |
+| Enable pin polarity | Non-inverted (no `!`) | `VALUE=1` enables driver; `!` prefix would BREAK it |
+| Step pulse duration | 5 µs (`step_pulse_duration: 0.000005`) | DM542TE spec ≥2.5 µs; 5 µs needed for LS08 buffer path |
+
+### Klipper Configuration Derivation
+
+For the math to be correct, Klipper's internal step count per "rotation" must match
+the driver's pulses-per-revolution:
+
+```
+Klipper sends: full_steps_per_rev × microsteps = pulses per "Klipper rotation"
+Driver expects: 1600 pulses = 1 physical revolution
+Physical travel: 32 mm per revolution (GT2 16T)
+
+Match condition: 400 × microsteps = 1600  →  microsteps = 4
+
+Therefore:
+  microsteps: 4
+  rotation_distance: 32    (actual mm per revolution)
+  steps_per_mm = (400 × 4) / 32 = 50
+```
+
+**Why microsteps=4 (not 16)?** With an external driver like the DM542TE, each Klipper
+"step" is one physical pulse to the driver. The driver itself handles sub-step
+interpolation. Setting `microsteps=4` means Klipper sends exactly 1600 pulses per
+revolution, matching the driver 1:1. Setting `microsteps=16` would send 6400 pulses
+per revolution, making the motor spin 4× more than Klipper expects (or requiring
+`rotation_distance=128` to compensate — less intuitive).
+
+### Tested Performance Limits (Motor 0, Y axis)
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Max tested velocity | 2.5 RPS (80 mm/s with correct rotation_distance=32) | Smooth operation |
+| Max tested accel | 8000 mm/s² | No missed steps |
+| Direction reversal | 500 ms pause required | Without pause, stalls at >1 RPS |
+
+**Note**: The motor test script (`test_manual_stepper.py`) currently uses
+`microsteps=16, rotation_distance=160` which is a 160/128=1.25× overestimate —
+the motor physically turns ~20% less than commanded. This should be corrected to
+`microsteps=4, rotation_distance=32` now that we know the actual pulley.
+
+### Key Discoveries (from Bring-Up)
+
+1. **Enable polarity is non-inverted** for common-anode wiring. With `!PF14`, the
+   driver never enables and the motor doesn't lock.
+
+2. **Standard `stepper_x` + `kinematics: cartesian` motion commands (`G1`, `FORCE_MOVE`)
+   failed** during initial testing, while `STEPPER_BUZZ` (direct GPIO toggle) and
+   hardware PWM on the step pin worked. Root cause was a combination of enable polarity
+   timing and insufficient pulse width.
+
+3. **`manual_stepper` bypasses kinematics** and was the path that finally worked with
+   Klipper's motion planner. Production config should use standard `[stepper_x/y]`
+   with `kinematics: cartesian`, but `manual_stepper` is the validated fallback
+   for single-motor diagnostics.
+
+4. **`step_pulse_duration: 0.000005`** (5 µs) eliminated vibration and missed steps.
+   The DM542TE spec says ≥2.5 µs minimum, but the signal path through the LS08/HCT08
+   logic buffer benefits from wider pulses.
+
+5. **500 ms pause between direction reversals** prevents missed steps at high speed.
+
+---
+
 ## 13. Klipper printer.cfg Requirements
+
+> **CHANGED Jan 29, 2026 (rev 2)**: Complete rewrite. Motor 0 is now Y axis.
+> X axis is dual-motor (Motor 2_1 + 2_2). rotation_distance corrected to 32mm
+> (GT2 16T pulley). Endstops on DIAG0 (Y) and DIAG1 (X). See Section 12A.
 
 Your Klipper configuration must include:
 
@@ -869,61 +1079,106 @@ Your Klipper configuration must include:
 
 ```ini
 [mcu]
-serial: /dev/serial/by-id/usb-Klipper_stm32h723xx_XXXXX
+serial: /dev/serial/by-id/usb-Klipper_stm32h723xx_130028001051313234353230-if00
 
-[stepper_x]
+[printer]
+kinematics: cartesian
+max_velocity: 200               # mm/s — conservative; increase after calibration
+max_accel: 3000                 # mm/s² — conservative; increase after calibration
+
+# ─── Y AXIS ── Motor 0 ───────────────────────────────────────────────
+# Single motor, single endstop on DIAG0
+# 0.9° stepper, DM542TE at 1600 pulses/rev, GT2 16T pulley
+[stepper_y]
 step_pin: PF13
 dir_pin: PF12
-enable_pin: !PF14
-microsteps: 16
-rotation_distance: 40        # Calibrate this
-endstop_pin: ^PG6
+enable_pin: PF14                # NOT inverted — common-anode wiring
+microsteps: 4                   # 400 × 4 = 1600 = driver pulses/rev
+rotation_distance: 32           # GT2 belt × 16 teeth = 2mm × 16 = 32mm/rev
+step_pulse_duration: 0.000005   # 5 µs — required for DM542TE via LS08 buffer
+endstop_pin: ^PG6               # DIAG0, NO switch to GND, pull-up enabled
 position_endstop: 0
-position_max: 250
-homing_speed: 50
+position_max: 350               # CHANGE THIS to actual Y travel in mm
+homing_speed: 30
+homing_positive_dir: false      # Endstop is at the min (0) end
 
-[stepper_y]
-step_pin: PG0
-dir_pin: PG1
-enable_pin: !PF15
-microsteps: 16
-rotation_distance: 40        # Calibrate this
-endstop_pin: ^PG9
-position_endstop: 0
-position_max: 350
-homing_speed: 50
-
-[stepper_y1]                 # Second Y motor
+# ─── X AXIS ── Motor 2_1 (primary) ───────────────────────────────────
+# Dual motor X axis — this is the primary with endstop
+[stepper_x]
 step_pin: PF11
 dir_pin: PG3
-enable_pin: !PG5
-microsteps: 16
-rotation_distance: 40        # Must match stepper_y
+enable_pin: PG5                 # NOT inverted — common-anode wiring
+microsteps: 4
+rotation_distance: 32           # GT2 16T — same as Y
+step_pulse_duration: 0.000005
+endstop_pin: ^PG9               # DIAG1, NO switch to GND, pull-up enabled
+position_endstop: 0
+position_max: 250               # CHANGE THIS to actual X travel in mm
+homing_speed: 30
+homing_positive_dir: false      # Endstop is at the min (0) end
 
-[stepper_z]
+# ─── X AXIS ── Motor 2_2 (secondary, mirrors stepper_x) ──────────────
+# No endstop — moves in tandem with stepper_x
+[stepper_x1]
 step_pin: PG4
 dir_pin: PC1
-enable_pin: !PA0
-microsteps: 16
-rotation_distance: 8         # Calibrate for your belt/pulley
-position_min: -5             # Allow negative for seesaw
-position_max: 40
-# No endstop - calibrate manually
+enable_pin: PA0                 # NOT inverted — common-anode wiring
+microsteps: 4
+rotation_distance: 32           # Must match stepper_x exactly
+step_pulse_duration: 0.000005
+
+# ─── Z AXIS ── TBD ───────────────────────────────────────────────────
+# Z motor port, pulley, and endstop are not yet wired.
+# Uncomment and fill in when Z is connected.
+# [stepper_z]
+# step_pin: TBD
+# dir_pin: TBD
+# enable_pin: TBD
+# microsteps: 4
+# rotation_distance: TBD        # Depends on Z belt/pulley — may differ from XY
+# step_pulse_duration: 0.000005
+# position_min: -5              # Allow negative for seesaw
+# position_max: 40
+# # No endstop — calibrate manually or add one
 ```
+
+### Endstop Wiring Detail
+
+Both endstops are **NO (normally open)** mechanical switches:
+
+```
+Switch open (not triggered):  pin floats → internal pull-up reads HIGH
+Switch closed (triggered):    pin connects to GND → reads LOW
+```
+
+Klipper interprets `^PG6` as: enable pull-up, trigger on LOW. This is correct
+for NO switches wired to GND.
+
+**Physical location**: Both endstops are on one side only (the min/home end).
+There are no max-end endstops — Klipper's `position_max` soft limit is the
+only protection against over-travel.
 
 ### Z Reference (Session Repeatability)
 
-Named Z states (travel / pen_work / airbrush_work) are good, but they require a repeatable Z reference per session. With no Z endstop, you must choose at least one:
+Named Z states (travel / pen_work / airbrush_work) are good, but they require a
+repeatable Z reference per session. With no Z endstop, you must choose at least one:
 - Add a Z endstop at a known reference (recommended if practical).
 - Use a mechanical hard-stop + a controlled "home to hard stop" procedure.
 - Use a touch-off / calibration dock you run each session.
 
-Treat Z calibration as **required at power-up** and **required after any fault / emergency stop / collision**, otherwise "Z=20" is not a meaningful physical height.
+Treat Z calibration as **required at power-up** and **required after any fault /
+emergency stop / collision**, otherwise "Z=20" is not a meaningful physical height.
 
-### Dual-Y Squareness (If Your Mechanics Can Rack)
+### Dual-X Squareness
 
-If your Y gantry can rack (two Y motors without a mechanically tying belt/rigid gantry), homing to a single Y endstop does not guarantee squareness. If racking is possible, plan for:
-- A second Y endstop (one per side) and a squaring procedure.
+With two X motors and a single X endstop, there is no automatic squareness
+guarantee. The X gantry can rack (skew) if one motor misses steps or the
+mechanics allow twist. Mitigation options:
+- **Mechanical**: Ensure the gantry is rigid enough that racking is physically
+  impossible (preferred).
+- **Second endstop**: Add one per side of the X axis, use Klipper's
+  `[homing_override]` to home each motor independently and square the gantry.
+- **Manual**: Run a squaring check each session using a calibration pattern.
 
 ### Required Modules
 
@@ -1161,6 +1416,216 @@ python scripts/test_connection.py
 6. **Emergency stop via API**: Direct endpoint, not queued G-code
 7. **Calibration-first**: Extensive tools to get the machine right before production use
 8. **Fail-safe defaults**: Tool up between operations, valves closed by default (future)
+
+---
+
+## 18. Planned Full Rewrite of `robot_control/`
+
+> **CHANGED Jan 29, 2026 (rev 2)**: The entire `robot_control/` package will be
+> rewritten from scratch. This section serves as a checklist of every requirement
+> that the new code must satisfy, derived from hardware testing and this plan.
+> The existing code should be treated as reference only — do not patch it.
+
+### Why Rewrite (Not Patch)
+
+The existing code was written before hardware testing revealed:
+1. Motor 0 is Y (not X) — all axis assumptions are wrong.
+2. X is dual-motor (Motor 2_1 + 2_2) — not accounted for.
+3. `rotation_distance` was wrong (40 or 160 vs. correct 32).
+4. `microsteps` was wrong (16 vs. correct 4).
+5. Auto-reconnect was not implemented.
+6. Machine dimensions should come from config YAML, not hardcoded.
+7. Endstop configuration was placeholder.
+8. Feed rates were in mm/min in some places, mm/s in others (inconsistent).
+
+### Requirements for the New Code
+
+#### A. `machine.yaml` (Config File)
+
+Must contain all the fields documented in Section 12. The code must:
+- Read `machine.yaml` at startup as the single source of truth.
+- Validate all fields (Section 12 validation checklist).
+- Never hardcode machine dimensions, rotation_distance, feed rates, pin
+  assignments, or stepper parameters — always read from config.
+- Provide sensible error messages if fields are missing or invalid.
+
+#### B. `klipper_client.py` (Klipper API Client)
+
+Must implement:
+- UDS connection with JSON + 0x03 framing (existing protocol is correct).
+- **Auto-reconnect** on MCU reset / power-cycle (Section 6):
+  - Detect broken socket (BrokenPipe, empty recv, ConnectionReset).
+  - Retry loop: `reconnect_attempts` × `reconnect_interval_s` from config.
+  - After reconnecting: send `FIRMWARE_RESTART`, wait for "ready" state.
+  - Re-subscribe to any active object subscriptions.
+  - Raise `KlipperConnectionLost` if all retries fail.
+- `emergency_stop()` via dedicated API endpoint (not queued G-code).
+- `get_position()` via `objects/query` (not M114 parsing).
+- `wait_for_idle()` that polls toolhead state.
+- All timeouts configurable via `machine.yaml`.
+
+#### C. Axis & Motor Configuration
+
+The code must understand:
+
+| Axis | Klipper Section(s) | Motors | Endstop |
+|------|--------------------|--------|---------|
+| Y | `[stepper_y]` | Motor 0 (PF13/PF12/PF14) | DIAG0 (^PG6) |
+| X | `[stepper_x]` + `[stepper_x1]` | Motor 2_1 (PF11/PG3/PG5) + Motor 2_2 (PG4/PC1/PA0) | DIAG1 (^PG9) |
+| Z | `[stepper_z]` (TBD) | TBD | TBD |
+
+All motor parameters for all axes:
+- `microsteps: 4` (400 full steps × 4 = 1600 = driver pulses/rev)
+- `rotation_distance: 32` (GT2 2mm pitch × 16 teeth)
+- `step_pulse_duration: 0.000005` (5 µs)
+- `enable_pin` is NOT inverted (common-anode wiring)
+
+#### D. Homing
+
+- Home X and Y only (Z has no endstop yet).
+- `G28 X Y` — Klipper handles the homing sequence.
+- After homing, verify position via `objects/query`.
+- With single-side endstops, homing always goes to position_min (0).
+
+#### E. printer.cfg Generation (Optional but Recommended)
+
+Consider generating `printer.cfg` from `machine.yaml` so there is one config
+to maintain. If not generating, at minimum validate that `machine.yaml` and
+`printer.cfg` are consistent at startup (e.g., check `rotation_distance` match).
+
+#### F. Feed Rate Convention
+
+Standardize on **mm/s** throughout the Python code. Convert to Klipper's
+`F` parameter (mm/min) only at the G-code generation boundary:
+`F_value = feed_mm_s * 60.0`.
+
+#### G. Direction Reversal Pause
+
+When generating G-code that reverses direction at high speed (e.g., rapid
+back-and-forth patterns), insert a `G4 P500` (500 ms dwell) or equivalent
+pause between direction changes. Read the value from
+`steppers.direction_reversal_pause_s` in config.
+
+#### H. Calibration Routines
+
+- `rotation_distance` default must be `32.0` (from config, not hardcoded).
+- Steps/mm calibration must output the correct formula:
+  `new_rotation_distance = old × (commanded / measured)`.
+- Squareness check pattern for dual-X gantry.
+
+### Files to Create (New Structure)
+
+```
+robot_control/
+├── __init__.py
+├── configs/
+│   ├── __init__.py
+│   ├── loader.py              # Load + validate machine.yaml
+│   └── machine.yaml           # The config file (Section 12 spec)
+├── hardware/
+│   ├── __init__.py
+│   ├── klipper_client.py      # UDS client with auto-reconnect
+│   ├── job_executor.py        # File-run + interactive modes
+│   └── interactive.py         # Keyboard jog, manual control
+├── job_ir/
+│   ├── __init__.py
+│   └── operations.py          # Job IR dataclasses
+├── calibration/
+│   ├── __init__.py
+│   ├── patterns.py            # Test pattern generators
+│   ├── routines.py            # Guided calibration sequences
+│   └── measurement.py         # Measurement math
+├── gcode/
+│   ├── __init__.py
+│   └── generator.py           # Job IR → G-code (transforms here)
+├── scripts/
+│   ├── test_connection.py     # Verify Klipper API works
+│   ├── test_motion.py         # Basic XY motion + endstop tests
+│   ├── calibrate.py           # Calibration entry point
+│   ├── run_job.py             # Production job runner
+│   └── interactive_control.py # Manual control entry point
+└── tests/
+    ├── __init__.py
+    ├── test_klipper_client.py # Mock UDS + reconnect tests
+    ├── test_gcode_generator.py
+    ├── test_job_ir.py
+    └── test_calibration.py
+```
+
+### Key Differences from Existing Code
+
+| Aspect | Old Code | New Requirement |
+|--------|----------|-----------------|
+| X axis motor | Motor 0 (PF13/PF12/PF14) | Motor 2_1 + 2_2 (dual) |
+| Y axis motor | Not defined correctly | Motor 0 (PF13/PF12/PF14) |
+| microsteps | 16 | 4 |
+| rotation_distance | 40.0 (hardcoded default) | 32.0 (from config) |
+| Feed rate units | Mixed mm/min and mm/s | mm/s everywhere, convert at G-code boundary |
+| Reconnect | Not implemented | Auto-reconnect with retry loop |
+| Config source | Some from YAML, some hardcoded | Everything from `machine.yaml` |
+| Endstops | Placeholder pins | DIAG0 (^PG6) for Y, DIAG1 (^PG9) for X |
+| Dual motors | Not supported | stepper_x + stepper_x1 |
+| Z axis | Hardcoded pins | TBD, commented out until wired |
+
+---
+
+## 19. Diagnostic Test Scripts (Reference)
+
+> Documents the test scripts created during motor bring-up, for future reference
+> when debugging hardware issues.
+
+| Script | Purpose | Status |
+|--------|---------|--------|
+| `test_manual_stepper.py` | Speed ramp + rapid 360° reversals via `manual_stepper` | **Working** — primary diagnostic tool |
+| `test_motor_pwm_spin.py` | Direct hardware PWM on step pin (bypasses motion planner) | **Working** — proves hardware path is functional |
+| `test_motor_0.py` | Initial STEPPER_BUZZ test | Superseded by `test_manual_stepper.py` |
+| `test_speed_sweep.py` | Speed sweep via G1 moves | Did not work with original config |
+| `test_force_move.py` | FORCE_MOVE testing | Did not work with original config |
+
+**Important**: `test_manual_stepper.py` currently uses `microsteps=16, rotation_distance=160`
+which has a ~20% scaling error. The correct values are `microsteps=4, rotation_distance=32`
+(see Section 12A). Update the test script when running it next.
+
+The `test_manual_stepper.py` configuration is the **canonical working reference** for
+motor bring-up procedure (enable check, motion check, speed ramp). When bringing up
+new axes (X dual motors, Z), start from its test sequence.
+
+---
+
+## 20. Changelog
+
+| Date | Section | Change |
+|------|---------|--------|
+| Jan 29, 2026 | 12A (new) | Added hardware test findings from motor bring-up |
+| Jan 29, 2026 | 13 | Fixed enable_pin polarity: `!PF14` → `PF14` (common-anode) |
+| Jan 29, 2026 | 13 | Added `step_pulse_duration: 0.000005` to all stepper sections |
+| Jan 29, 2026 | 13 | Changed motor assumption from 1.8° to 0.9° (400 steps/rev) |
+| Jan 29, 2026 | 13 | Changed `rotation_distance` from `40` to `160` for XY steppers |
+| Jan 29, 2026 | 13 | Added actual MCU serial ID |
+| Jan 29, 2026 | 12 (config) | Added `steppers:` section to machine.yaml spec |
+| Jan 29, 2026 | 12 (config) | Updated motion limits to tested values |
+| Jan 29, 2026 | 18 (new) | Added pending code changes checklist |
+| Jan 29, 2026 | 19 (new) | Added diagnostic test script reference |
+| Jan 29, 2026 | 12A (rev 2) | Corrected axis-to-motor mapping: Y=Motor 0, X=Motor 2_1+2_2 (dual) |
+| Jan 29, 2026 | 12A (rev 2) | Fixed rotation_distance: 160 → 32 (GT2 16T pulley = 2mm × 16 = 32mm) |
+| Jan 29, 2026 | 12A (rev 2) | Fixed microsteps: 16 → 4 (400 × 4 = 1600 = driver pulses/rev) |
+| Jan 29, 2026 | 12A (rev 2) | Added belt/pulley specs (GT2 6mm, 16T, 5mm bore) |
+| Jan 29, 2026 | 12A (rev 2) | Added endstop configuration (DIAG0=Y, DIAG1=X, NO to GND) |
+| Jan 29, 2026 | 13 (rev 2) | Complete rewrite of printer.cfg with correct axis mapping |
+| Jan 29, 2026 | 13 (rev 2) | Added dual-X motor config (stepper_x + stepper_x1) |
+| Jan 29, 2026 | 13 (rev 2) | Z axis marked TBD (not yet wired) |
+| Jan 29, 2026 | 12 (rev 2) | Complete rewrite of machine.yaml spec with stepper/axis/endstop sections |
+| Jan 29, 2026 | 12 (rev 2) | Added auto-reconnect config fields |
+| Jan 29, 2026 | 12 (rev 2) | Standardized feed rates to mm/s |
+| Jan 29, 2026 | 6 (rev 2) | Added auto-reconnect requirement for Klipper client |
+| Jan 29, 2026 | 6 (rev 2) | Added `reconnect()` to client interface |
+| Jan 29, 2026 | 6 (rev 2) | Updated error handling table with reconnect behavior |
+| Jan 29, 2026 | 18 (rev 2) | Replaced patch list with full rewrite plan for robot_control/ |
+| Feb 12, 2026 | 18 (impl) | Full rewrite of robot_control/ implemented: 28 files, ~6,300 lines |
+| Feb 12, 2026 | 12 (impl) | machine.yaml created with all Section 12 fields (steppers, axes, mm/s feeds, reconnect) |
+| Feb 12, 2026 | 6 (impl) | klipper_client.py with auto-reconnect, KlipperConnectionLost, FIRMWARE_RESTART, re-subscribe |
+| Feb 12, 2026 | 18.F (impl) | Feed rates standardised to mm/s; conversion to mm/min at G-code boundary only |
+| Feb 12, 2026 | 18.G (impl) | Direction reversal pause (G4 dwell) from steppers.direction_reversal_pause_s |
 
 ---
 

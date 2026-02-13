@@ -1,7 +1,9 @@
-"""
-Measurement Input and Calculations.
+"""Measurement input and calculation helpers for calibration routines.
 
-Helpers for interactive calibration routines that require user measurement input.
+Provides interactive user-prompt functions and the math needed to turn
+raw measurements into configuration corrections.
+
+All distance values are in **millimetres**.
 """
 
 from __future__ import annotations
@@ -12,9 +14,29 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Data containers
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class MeasurementResult:
-    """Result of a calibration measurement."""
+    """Result of a calibration measurement.
+
+    Parameters
+    ----------
+    commanded : float
+        Distance the machine was told to move (mm).
+    measured : float
+        Distance the user actually measured (mm).
+    error : float
+        ``commanded - measured`` (mm).
+    error_percent : float
+        ``error / commanded * 100``.
+    correction_factor : float
+        ``commanded / measured`` -- multiply the old config value by
+        this to get the corrected value.
+    """
 
     commanded: float
     measured: float
@@ -23,275 +45,233 @@ class MeasurementResult:
     correction_factor: float
 
 
+# ---------------------------------------------------------------------------
+# Interactive input helpers
+# ---------------------------------------------------------------------------
+
+
 def get_float_input(prompt: str, default: float | None = None) -> float:
-    """
-    Prompt user for a floating point value.
+    """Prompt the user for a float value.
 
     Parameters
     ----------
     prompt : str
-        Prompt message to display.
+        Message displayed.
     default : float | None
-        Default value if user presses Enter.
+        Value returned if the user presses Enter without typing.
 
     Returns
     -------
     float
-        User-entered value.
+        Validated user input.
     """
-    if default is not None:
-        prompt = f"{prompt} [{default}]: "
-    else:
-        prompt = f"{prompt}: "
-
+    suffix = f" [{default}]" if default is not None else ""
     while True:
+        raw = input(f"{prompt}{suffix}: ").strip()
+        if not raw and default is not None:
+            return default
         try:
-            response = input(prompt).strip()
-            if not response and default is not None:
-                return default
-            return float(response)
+            return float(raw)
         except ValueError:
-            print("Invalid number. Please enter a decimal value.")
+            logger.warning("Invalid number: %r -- try again", raw)
 
 
-def get_yes_no(prompt: str, default: bool | None = None) -> bool:
-    """
-    Prompt user for yes/no response.
+def get_yes_no(prompt: str, default: bool = True) -> bool:
+    """Prompt for a yes/no answer.
 
     Parameters
     ----------
     prompt : str
-        Prompt message to display.
-    default : bool | None
-        Default if user presses Enter. None means no default.
+        Question text.
+    default : bool
+        Default if Enter is pressed alone.
 
     Returns
     -------
     bool
-        True for yes, False for no.
     """
-    if default is True:
-        prompt = f"{prompt} [Y/n]: "
-    elif default is False:
-        prompt = f"{prompt} [y/N]: "
-    else:
-        prompt = f"{prompt} [y/n]: "
-
+    hint = "Y/n" if default else "y/N"
     while True:
-        response = input(prompt).strip().lower()
-        if not response and default is not None:
+        raw = input(f"{prompt} [{hint}]: ").strip().lower()
+        if not raw:
             return default
-        if response in ("y", "yes"):
+        if raw in ("y", "yes"):
             return True
-        if response in ("n", "no"):
+        if raw in ("n", "no"):
             return False
-        print("Please enter 'y' or 'n'.")
+        logger.warning("Please enter y or n")
 
 
-def get_choice(prompt: str, options: list[str], default: int = 0) -> int:
-    """
-    Prompt user to choose from options.
+def get_choice(prompt: str, choices: list[str], default: str | None = None) -> str:
+    """Prompt the user to pick from a list.
 
     Parameters
     ----------
     prompt : str
-        Prompt message.
-    options : list[str]
-        List of option descriptions.
-    default : int
-        Default option index.
+        Question text.
+    choices : list[str]
+        Valid option strings.
+    default : str | None
+        Default if Enter is pressed.
 
     Returns
     -------
-    int
-        Selected option index.
+    str
+        One of *choices*.
     """
-    print(prompt)
-    for i, option in enumerate(options):
-        marker = "*" if i == default else " "
-        print(f"  {marker} {i + 1}. {option}")
-
+    hint = ", ".join(choices)
+    suffix = f" [{default}]" if default else ""
     while True:
-        response = input(f"Choice [1-{len(options)}]: ").strip()
-        if not response:
+        raw = input(f"{prompt} ({hint}){suffix}: ").strip()
+        if not raw and default is not None:
             return default
-        try:
-            choice = int(response)
-            if 1 <= choice <= len(options):
-                return choice - 1
-        except ValueError:
-            pass
-        print(f"Please enter a number between 1 and {len(options)}.")
+        if raw in choices:
+            return raw
+        logger.warning("Invalid choice: %r -- pick from %s", raw, hint)
+
+
+# ---------------------------------------------------------------------------
+# Calculation helpers
+# ---------------------------------------------------------------------------
 
 
 def calculate_steps_correction(
     commanded: float,
     measured: float,
 ) -> MeasurementResult:
-    """
-    Calculate correction factor for steps/mm calibration.
+    """Compute the correction factor for a steps-per-mm calibration.
 
     Parameters
     ----------
     commanded : float
-        Distance that was commanded (mm).
+        Distance the machine was told to move (mm).
     measured : float
-        Distance that was actually traveled (mm).
+        Distance the user measured (mm).
 
     Returns
     -------
     MeasurementResult
-        Calculated correction values.
     """
     if measured <= 0:
-        raise ValueError("Measured distance must be positive")
-    if commanded <= 0:
-        raise ValueError("Commanded distance must be positive")
-
+        raise ValueError(f"measured must be > 0, got {measured}")
     error = commanded - measured
-    error_percent = 100.0 * error / commanded
-    correction_factor = commanded / measured
-
     return MeasurementResult(
         commanded=commanded,
         measured=measured,
         error=error,
-        error_percent=error_percent,
-        correction_factor=correction_factor,
+        error_percent=(error / commanded) * 100.0 if commanded else 0.0,
+        correction_factor=commanded / measured,
     )
 
 
 def calculate_new_rotation_distance(
-    current_rotation_distance: float,
-    correction_factor: float,
+    old_rotation_distance: float,
+    commanded: float,
+    measured: float,
 ) -> float:
-    """
-    Calculate new rotation_distance for Klipper config.
+    """Compute the corrected ``rotation_distance``.
+
+    Formula::
+
+        new = old * (commanded / measured)
 
     Parameters
     ----------
-    current_rotation_distance : float
-        Current Klipper rotation_distance value.
-    correction_factor : float
-        Calculated correction factor.
+    old_rotation_distance : float
+        Current value from config (mm/rev).
+    commanded : float
+        Distance commanded (mm).
+    measured : float
+        Distance actually moved (mm).
 
     Returns
     -------
     float
-        New rotation_distance value.
+        New ``rotation_distance`` value.
     """
-    # rotation_distance = (belt_pitch * pulley_teeth) / microsteps_per_step
-    # If we're traveling too far, we need to decrease rotation_distance
-    # If we're traveling too short, we need to increase rotation_distance
-    return current_rotation_distance / correction_factor
+    if measured <= 0:
+        raise ValueError(f"measured must be > 0, got {measured}")
+    return old_rotation_distance * (commanded / measured)
 
 
 def calculate_tool_offset(
-    reference_pos: tuple[float, float],
-    actual_pos: tuple[float, float],
+    pen_x: float,
+    pen_y: float,
+    airbrush_x: float,
+    airbrush_y: float,
 ) -> tuple[float, float]:
-    """
-    Calculate tool offset from crosshair alignment.
+    """Compute XY tool offset from crosshair measurements.
+
+    Both tools drew a crosshair at the same commanded position.  The
+    user measures the physical offset between the two marks.
 
     Parameters
     ----------
-    reference_pos : tuple[float, float]
-        Position where reference tool drew crosshair.
-    actual_pos : tuple[float, float]
-        Position where second tool's crosshair actually appears.
+    pen_x, pen_y : float
+        Measured centre of the pen crosshair (mm).
+    airbrush_x, airbrush_y : float
+        Measured centre of the airbrush crosshair (mm).
 
     Returns
     -------
     tuple[float, float]
-        XY offset to apply to second tool.
+        ``(offset_x, offset_y)`` to add to airbrush config so that it
+        aligns with the pen.
     """
-    offset_x = reference_pos[0] - actual_pos[0]
-    offset_y = reference_pos[1] - actual_pos[1]
-    return (offset_x, offset_y)
+    return (pen_x - airbrush_x, pen_y - airbrush_y)
 
 
 def binary_search_z(
-    initial_z: float,
-    min_z: float,
-    max_z: float,
+    prompt_fn: callable,
+    z_min: float,
+    z_max: float,
     tolerance: float = 0.05,
-) -> float | None:
-    """
-    Interactive binary search to find Z touch point.
+) -> float:
+    """Binary search for the Z touch-point.
 
     Parameters
     ----------
-    initial_z : float
-        Starting Z position.
-    min_z : float
-        Minimum allowed Z.
-    max_z : float
-        Maximum allowed Z.
+    prompt_fn : callable
+        ``prompt_fn(z) -> bool`` -- move to Z and ask user "is the tool
+        touching?" Returns ``True`` if touching.
+    z_min, z_max : float
+        Search bounds (mm).
     tolerance : float
-        Stop when range is smaller than this.
+        Stop when the search interval is smaller than this (mm).
 
     Returns
     -------
-    float | None
-        Found Z position, or None if cancelled.
+    float
+        Z position at the touch boundary (mm).
     """
-    low = min_z
-    high = max_z
-    current = initial_z
-
-    print(f"\nBinary search for Z touch point (tolerance: {tolerance}mm)")
-    print("Answer 'y' if tool is touching, 'n' if not touching, 'q' to quit")
-
-    while (high - low) > tolerance:
-        current = (low + high) / 2
-        print(f"\nCurrent Z: {current:.3f}mm")
-
-        response = input("Is tool touching? [y/n/q]: ").strip().lower()
-
-        if response == "q":
-            return None
-        elif response == "y":
-            # Touching - need to go higher (less pressure)
-            low = current
-        elif response == "n":
-            # Not touching - need to go lower (more contact)
-            high = current
+    while (z_max - z_min) > tolerance:
+        mid = (z_min + z_max) / 2.0
+        if prompt_fn(mid):
+            # Touching -- move away (increase Z if pen, decrease if airbrush)
+            z_min = mid
         else:
-            print("Please enter 'y', 'n', or 'q'")
-            continue
-
-    final = (low + high) / 2
-    print(f"\nFound Z touch point: {final:.3f}mm")
-    return final
+            z_max = mid
+    return (z_min + z_max) / 2.0
 
 
-def format_calibration_summary(results: dict) -> str:
-    """
-    Format calibration results for display.
+def format_calibration_summary(results: dict[str, object]) -> str:
+    """Format a calibration results dict as a human-readable summary.
 
     Parameters
     ----------
     results : dict
-        Calibration results dictionary.
+        Key-value pairs to display.
 
     Returns
     -------
     str
-        Formatted summary text.
+        Multi-line formatted string.
     """
-    lines = [
-        "=" * 50,
-        "CALIBRATION RESULTS",
-        "=" * 50,
-    ]
-
-    for key, value in results.items():
-        if isinstance(value, float):
-            lines.append(f"  {key}: {value:.4f}")
-        elif isinstance(value, tuple) and len(value) == 2:
-            lines.append(f"  {key}: ({value[0]:.3f}, {value[1]:.3f})")
+    lines = ["=" * 50, "  CALIBRATION RESULTS", "=" * 50]
+    for key, val in results.items():
+        if isinstance(val, float):
+            lines.append(f"  {key}: {val:.4f}")
         else:
-            lines.append(f"  {key}: {value}")
-
+            lines.append(f"  {key}: {val}")
     lines.append("=" * 50)
     return "\n".join(lines)

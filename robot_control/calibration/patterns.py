@@ -1,10 +1,18 @@
-"""
-Calibration Pattern Generators.
+"""Calibration pattern generators.
 
-Generate test patterns for calibration and verification. Each pattern is a
-function that returns Job IR operations.
+Each function returns a flat ``list[Operation]`` ready for execution
+via the job executor.  All dimensions are in **millimetres**, using
+canvas-relative coordinates.
 
-All dimensions are in millimeters, canvas-relative coordinates.
+Common parameters accepted by every pattern:
+
+    origin : tuple[float, float]
+        Bottom-left corner of the pattern on the canvas (mm).
+        Default depends on the pattern (often centred on A4 canvas).
+    tool : str | None
+        ``"pen"`` or ``"airbrush"``.  ``None`` keeps the current tool.
+    feed : float | None
+        Drawing speed override (mm/s).  ``None`` uses the tool default.
 """
 
 from __future__ import annotations
@@ -23,19 +31,23 @@ from robot_control.job_ir.operations import (
     ToolUp,
 )
 
+# Default canvas centre for A4 (210 x 297 mm) -- used when no origin given
+_A4_CX = 105.0
+_A4_CY = 148.5
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
 
 def _stroke(
     points: list[tuple[float, float]],
     feed: float | None = None,
 ) -> list[Operation]:
-    """
-    Create a complete stroke from polyline points.
-
-    Rapid to first point, lower tool, draw polyline, raise tool.
-    """
+    """Build a standard stroke: rapid -> down -> polyline -> up."""
     if len(points) < 2:
         raise ValueError("Stroke requires at least 2 points")
-
     return [
         RapidXY(x=points[0][0], y=points[0][1]),
         ToolDown(),
@@ -44,700 +56,492 @@ def _stroke(
     ]
 
 
-# --- Basic Geometry Patterns ---
+def _preamble(tool: str | None = None) -> list[Operation]:
+    """Optional tool selection + initial ToolUp."""
+    ops: list[Operation] = [ToolUp()]
+    if tool is not None:
+        ops.insert(0, SelectTool(tool=tool))
+    return ops
+
+
+# ---------------------------------------------------------------------------
+# Basic geometry patterns
+# ---------------------------------------------------------------------------
 
 
 def square(
     size_mm: float = 50.0,
-    origin: tuple[float, float] = (80.0, 120.0),
+    origin: tuple[float, float] = (_A4_CX - 25.0, _A4_CY - 25.0),
+    tool: str | None = None,
     feed: float | None = None,
 ) -> list[Operation]:
-    """
-    Draw a square.
+    """Square pattern -- verify XY scaling.
 
     Parameters
     ----------
     size_mm : float
-        Side length in mm.
-    origin : tuple[float, float]
-        Bottom-left corner position (x, y) on canvas.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations to draw the square.
+        Side length.
     """
-    x, y = origin
-    points = [
-        (x, y),
-        (x + size_mm, y),
-        (x + size_mm, y + size_mm),
-        (x, y + size_mm),
-        (x, y),  # Close the square
+    x0, y0 = origin
+    pts = [
+        (x0, y0),
+        (x0 + size_mm, y0),
+        (x0 + size_mm, y0 + size_mm),
+        (x0, y0 + size_mm),
+        (x0, y0),
     ]
-    return [ToolUp()] + _stroke(points, feed)
+    return _preamble(tool) + _stroke(pts, feed)
 
 
 def rectangle(
-    width_mm: float = 80.0,
-    height_mm: float = 60.0,
-    origin: tuple[float, float] = (60.0, 100.0),
+    width: float = 60.0,
+    height: float = 40.0,
+    origin: tuple[float, float] = (_A4_CX - 30.0, _A4_CY - 20.0),
+    tool: str | None = None,
     feed: float | None = None,
 ) -> list[Operation]:
-    """
-    Draw a rectangle.
-
-    Parameters
-    ----------
-    width_mm : float
-        Rectangle width in mm.
-    height_mm : float
-        Rectangle height in mm.
-    origin : tuple[float, float]
-        Bottom-left corner position on canvas.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations to draw the rectangle.
-    """
-    x, y = origin
-    points = [
-        (x, y),
-        (x + width_mm, y),
-        (x + width_mm, y + height_mm),
-        (x, y + height_mm),
-        (x, y),
+    """Rectangle pattern -- verify aspect ratio."""
+    x0, y0 = origin
+    pts = [
+        (x0, y0),
+        (x0 + width, y0),
+        (x0 + width, y0 + height),
+        (x0, y0 + height),
+        (x0, y0),
     ]
-    return [ToolUp()] + _stroke(points, feed)
+    return _preamble(tool) + _stroke(pts, feed)
 
 
 def cross(
     size_mm: float = 50.0,
-    center: tuple[float, float] = (105.0, 148.5),
+    origin: tuple[float, float] = (_A4_CX, _A4_CY),
+    tool: str | None = None,
     feed: float | None = None,
 ) -> list[Operation]:
+    """Crosshair pattern -- find centre, verify axes.
+
+    Draws two perpendicular lines centred at *origin*.
     """
-    Draw a cross (plus sign).
-
-    Useful for finding center and verifying axis alignment.
-
-    Parameters
-    ----------
-    size_mm : float
-        Total length of each arm.
-    center : tuple[float, float]
-        Center position on canvas.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations to draw the cross.
-    """
-    cx, cy = center
-    half = size_mm / 2
-
-    # Horizontal line
-    h_points = [(cx - half, cy), (cx + half, cy)]
-    # Vertical line
-    v_points = [(cx, cy - half), (cx, cy + half)]
-
-    return [ToolUp()] + _stroke(h_points, feed) + _stroke(v_points, feed)
+    half = size_mm / 2.0
+    cx, cy = origin
+    h_line = [(cx - half, cy), (cx + half, cy)]
+    v_line = [(cx, cy - half), (cx, cy + half)]
+    return _preamble(tool) + _stroke(h_line, feed) + _stroke(v_line, feed)
 
 
 def grid(
     rows: int = 5,
     cols: int = 5,
-    spacing_mm: float = 20.0,
-    origin: tuple[float, float] = (30.0, 50.0),
+    spacing: float = 20.0,
+    origin: tuple[float, float] = (30.0, 30.0),
+    tool: str | None = None,
     feed: float | None = None,
 ) -> list[Operation]:
-    """
-    Draw a grid pattern.
+    """Grid pattern -- overall accuracy check.
 
     Parameters
     ----------
-    rows : int
-        Number of horizontal lines.
-    cols : int
-        Number of vertical lines.
-    spacing_mm : float
-        Distance between lines.
-    origin : tuple[float, float]
-        Bottom-left corner position.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations to draw the grid.
+    rows, cols : int
+        Number of horizontal / vertical lines.
+    spacing : float
+        Distance between lines (mm).
     """
-    ops: list[Operation] = [ToolUp()]
+    ops = _preamble(tool)
+    w = (cols - 1) * spacing
+    h = (rows - 1) * spacing
     x0, y0 = origin
-    width = (cols - 1) * spacing_mm
-    height = (rows - 1) * spacing_mm
 
     # Horizontal lines
-    for i in range(rows):
-        y = y0 + i * spacing_mm
-        ops.extend(_stroke([(x0, y), (x0 + width, y)], feed))
+    for r in range(rows):
+        y = y0 + r * spacing
+        ops.extend(_stroke([(x0, y), (x0 + w, y)], feed))
 
     # Vertical lines
-    for j in range(cols):
-        x = x0 + j * spacing_mm
-        ops.extend(_stroke([(x, y0), (x, y0 + height)], feed))
-
-    return ops
-
-
-def diagonal(
-    size_mm: float = 50.0,
-    origin: tuple[float, float] = (80.0, 120.0),
-    feed: float | None = None,
-) -> list[Operation]:
-    """
-    Draw a diagonal line from corner to corner of a square.
-
-    Useful for verifying orthogonality.
-
-    Parameters
-    ----------
-    size_mm : float
-        Size of the bounding square.
-    origin : tuple[float, float]
-        Bottom-left corner position.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations to draw the diagonal.
-    """
-    x, y = origin
-    points = [(x, y), (x + size_mm, y + size_mm)]
-    return [ToolUp()] + _stroke(points, feed)
-
-
-def circle(
-    diameter_mm: float = 50.0,
-    center: tuple[float, float] = (105.0, 148.5),
-    segments: int = 64,
-    feed: float | None = None,
-) -> list[Operation]:
-    """
-    Draw a circle approximated by line segments.
-
-    Parameters
-    ----------
-    diameter_mm : float
-        Circle diameter in mm.
-    center : tuple[float, float]
-        Center position on canvas.
-    segments : int
-        Number of line segments (more = smoother).
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations to draw the circle.
-    """
-    cx, cy = center
-    radius = diameter_mm / 2
-
-    points: list[tuple[float, float]] = []
-    for i in range(segments + 1):
-        angle = 2 * math.pi * i / segments
-        x = cx + radius * math.cos(angle)
-        y = cy + radius * math.sin(angle)
-        points.append((x, y))
-
-    return [ToolUp()] + _stroke(points, feed)
-
-
-# --- Calibration-Specific Patterns ---
-
-
-def ruler_x(
-    length_mm: float = 100.0,
-    tick_spacing_mm: float = 10.0,
-    tick_height_mm: float = 5.0,
-    origin: tuple[float, float] = (50.0, 148.5),
-    feed: float | None = None,
-) -> list[Operation]:
-    """
-    Draw a horizontal ruler with tick marks.
-
-    Used for calibrating X axis steps/mm.
-
-    Parameters
-    ----------
-    length_mm : float
-        Total ruler length.
-    tick_spacing_mm : float
-        Distance between tick marks.
-    tick_height_mm : float
-        Height of tick marks.
-    origin : tuple[float, float]
-        Left end of ruler.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations to draw the ruler.
-    """
-    ops: list[Operation] = [ToolUp()]
-    x0, y0 = origin
-
-    # Main horizontal line
-    ops.extend(_stroke([(x0, y0), (x0 + length_mm, y0)], feed))
-
-    # Tick marks
-    num_ticks = int(length_mm / tick_spacing_mm) + 1
-    for i in range(num_ticks):
-        x = x0 + i * tick_spacing_mm
-        # Taller tick every 50mm
-        h = tick_height_mm * 1.5 if (i * tick_spacing_mm) % 50 == 0 else tick_height_mm
+    for c in range(cols):
+        x = x0 + c * spacing
         ops.extend(_stroke([(x, y0), (x, y0 + h)], feed))
 
     return ops
 
 
-def ruler_y(
-    length_mm: float = 100.0,
-    tick_spacing_mm: float = 10.0,
-    tick_height_mm: float = 5.0,
-    origin: tuple[float, float] = (105.0, 50.0),
+def diagonal(
+    size_mm: float = 100.0,
+    origin: tuple[float, float] = (55.0, 98.5),
+    tool: str | None = None,
     feed: float | None = None,
 ) -> list[Operation]:
-    """
-    Draw a vertical ruler with tick marks.
+    """Diagonal line corner-to-corner -- verify orthogonality."""
+    x0, y0 = origin
+    return _preamble(tool) + _stroke(
+        [(x0, y0), (x0 + size_mm, y0 + size_mm)], feed,
+    )
 
-    Used for calibrating Y axis steps/mm.
+
+def circle(
+    diameter: float = 50.0,
+    segments: int = 72,
+    origin: tuple[float, float] = (_A4_CX, _A4_CY),
+    tool: str | None = None,
+    feed: float | None = None,
+) -> list[Operation]:
+    """Circle (polyline approximation) -- verify smooth motion.
 
     Parameters
     ----------
-    length_mm : float
-        Total ruler length.
-    tick_spacing_mm : float
-        Distance between tick marks.
-    tick_height_mm : float
-        Width of tick marks.
-    origin : tuple[float, float]
-        Bottom end of ruler.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations to draw the ruler.
+    diameter : float
+        Circle diameter (mm).
+    segments : int
+        Number of line segments approximating the circle.
     """
-    ops: list[Operation] = [ToolUp()]
+    r = diameter / 2.0
+    cx, cy = origin
+    pts: list[tuple[float, float]] = []
+    for i in range(segments + 1):
+        angle = 2.0 * math.pi * i / segments
+        pts.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
+    return _preamble(tool) + _stroke(pts, feed)
+
+
+# ---------------------------------------------------------------------------
+# Calibration-specific patterns
+# ---------------------------------------------------------------------------
+
+
+def ruler_x(
+    length: float = 100.0,
+    tick_spacing: float = 10.0,
+    tick_length: float = 5.0,
+    origin: tuple[float, float] = (55.0, _A4_CY),
+    tool: str | None = None,
+    feed: float | None = None,
+) -> list[Operation]:
+    """Ruler along X axis with tick marks -- measure X steps/mm.
+
+    Parameters
+    ----------
+    length : float
+        Total ruler length (mm).
+    tick_spacing : float
+        Distance between tick marks (mm).
+    tick_length : float
+        Length of each tick perpendicular to the ruler (mm).
+    """
     x0, y0 = origin
+    ops = _preamble(tool)
 
-    # Main vertical line
-    ops.extend(_stroke([(x0, y0), (x0, y0 + length_mm)], feed))
+    # Main line
+    ops.extend(_stroke([(x0, y0), (x0 + length, y0)], feed))
 
-    # Tick marks
-    num_ticks = int(length_mm / tick_spacing_mm) + 1
-    for i in range(num_ticks):
-        y = y0 + i * tick_spacing_mm
-        # Taller tick every 50mm
-        w = tick_height_mm * 1.5 if (i * tick_spacing_mm) % 50 == 0 else tick_height_mm
-        ops.extend(_stroke([(x0, y), (x0 + w, y)], feed))
+    # Ticks
+    n_ticks = int(length / tick_spacing) + 1
+    for i in range(n_ticks):
+        tx = x0 + i * tick_spacing
+        ops.extend(_stroke([(tx, y0 - tick_length / 2), (tx, y0 + tick_length / 2)], feed))
+
+    return ops
+
+
+def ruler_y(
+    length: float = 100.0,
+    tick_spacing: float = 10.0,
+    tick_length: float = 5.0,
+    origin: tuple[float, float] = (_A4_CX, 48.5),
+    tool: str | None = None,
+    feed: float | None = None,
+) -> list[Operation]:
+    """Ruler along Y axis with tick marks -- measure Y steps/mm."""
+    x0, y0 = origin
+    ops = _preamble(tool)
+
+    ops.extend(_stroke([(x0, y0), (x0, y0 + length)], feed))
+
+    n_ticks = int(length / tick_spacing) + 1
+    for i in range(n_ticks):
+        ty = y0 + i * tick_spacing
+        ops.extend(_stroke([(x0 - tick_length / 2, ty), (x0 + tick_length / 2, ty)], feed))
 
     return ops
 
 
 def crosshair_grid(
+    spacing: float = 30.0,
+    arm_length: float = 5.0,
     rows: int = 3,
     cols: int = 3,
-    spacing_mm: float = 50.0,
-    crosshair_size_mm: float = 10.0,
-    origin: tuple[float, float] = (50.0, 80.0),
+    origin: tuple[float, float] = (60.0, 103.5),
+    tool: str | None = None,
     feed: float | None = None,
 ) -> list[Operation]:
-    """
-    Draw a grid of crosshairs.
-
-    Used for tool offset calibration - draw with one tool, then overlay
-    with the other to measure offset.
+    """Grid of crosshairs -- tool-offset calibration.
 
     Parameters
     ----------
-    rows : int
-        Number of crosshair rows.
-    cols : int
-        Number of crosshair columns.
-    spacing_mm : float
-        Distance between crosshairs.
-    crosshair_size_mm : float
-        Total size of each crosshair.
-    origin : tuple[float, float]
-        Position of bottom-left crosshair.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations to draw the crosshair grid.
+    spacing : float
+        Distance between crosshair centres (mm).
+    arm_length : float
+        Half-length of each crosshair arm (mm).
     """
-    ops: list[Operation] = [ToolUp()]
+    ops = _preamble(tool)
     x0, y0 = origin
-    half = crosshair_size_mm / 2
-
-    for i in range(rows):
-        for j in range(cols):
-            cx = x0 + j * spacing_mm
-            cy = y0 + i * spacing_mm
-
-            # Horizontal line
-            ops.extend(_stroke([(cx - half, cy), (cx + half, cy)], feed))
-            # Vertical line
-            ops.extend(_stroke([(cx, cy - half), (cx, cy + half)], feed))
-
+    for r in range(rows):
+        for c in range(cols):
+            cx = x0 + c * spacing
+            cy = y0 + r * spacing
+            # Horizontal arm
+            ops.extend(_stroke([(cx - arm_length, cy), (cx + arm_length, cy)], feed))
+            # Vertical arm
+            ops.extend(_stroke([(cx, cy - arm_length), (cx, cy + arm_length)], feed))
     return ops
 
 
 def speed_test(
-    lengths_mm: list[float] | None = None,
-    speeds_mm_min: list[float] | None = None,
+    lengths: list[float] | None = None,
+    speeds: list[float] | None = None,
+    spacing: float = 10.0,
     origin: tuple[float, float] = (30.0, 50.0),
-    line_spacing_mm: float = 10.0,
+    tool: str | None = None,
 ) -> list[Operation]:
-    """
-    Draw lines at different speeds to find optimal feed rate.
+    """Lines at increasing speeds -- find max reliable speed.
 
     Parameters
     ----------
-    lengths_mm : list[float] | None
-        Line lengths to test. Default: [50, 100, 150].
-    speeds_mm_min : list[float] | None
-        Feed rates to test. Default: [500, 1000, 1500, 2000, 3000].
-    origin : tuple[float, float]
-        Starting position for first line.
-    line_spacing_mm : float
-        Vertical spacing between lines.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations to draw speed test pattern.
+    lengths : list[float] | None
+        Line lengths (mm).  Default: [50, 100, 150].
+    speeds : list[float] | None
+        Feed rates to test (mm/s).  Default: [10, 25, 50, 75, 100].
+    spacing : float
+        Vertical spacing between lines (mm).
     """
-    if lengths_mm is None:
-        lengths_mm = [50.0, 100.0, 150.0]
-    if speeds_mm_min is None:
-        speeds_mm_min = [500.0, 1000.0, 1500.0, 2000.0, 3000.0]
+    if lengths is None:
+        lengths = [50.0, 100.0, 150.0]
+    if speeds is None:
+        speeds = [10.0, 25.0, 50.0, 75.0, 100.0]
 
-    ops: list[Operation] = [ToolUp()]
+    ops = _preamble(tool)
     x0, y0 = origin
-
     row = 0
-    for length in lengths_mm:
-        for speed in speeds_mm_min:
-            y = y0 + row * line_spacing_mm
+    for length in lengths:
+        for speed in speeds:
+            y = y0 + row * spacing
             ops.extend(_stroke([(x0, y), (x0 + length, y)], feed=speed))
             row += 1
+    return ops
 
+
+def acceleration_test(
+    distance: float = 20.0,
+    repeats: int = 10,
+    origin: tuple[float, float] = (80.0, _A4_CY),
+    tool: str | None = None,
+    feed: float | None = None,
+) -> list[Operation]:
+    """Short back-and-forth moves -- tune acceleration.
+
+    Parameters
+    ----------
+    distance : float
+        Length of each move (mm).
+    repeats : int
+        Number of back-and-forth cycles.
+    """
+    ops = _preamble(tool)
+    x0, y0 = origin
+    pts: list[tuple[float, float]] = []
+    for i in range(repeats):
+        if i % 2 == 0:
+            pts.append((x0 + distance, y0))
+        else:
+            pts.append((x0, y0))
+    if len(pts) >= 2:
+        ops.extend(_stroke([(x0, y0)] + pts, feed))
     return ops
 
 
 def backlash_test(
-    distance_mm: float = 20.0,
+    distance: float = 10.0,
     repeats: int = 5,
-    origin: tuple[float, float] = (105.0, 148.5),
+    spacing: float = 5.0,
+    origin: tuple[float, float] = (80.0, 100.0),
+    tool: str | None = None,
     feed: float | None = None,
 ) -> list[Operation]:
-    """
-    Draw forward/reverse pattern to detect backlash.
+    """Forward/reverse pattern -- detect backlash.
 
-    If backlash exists, the overlapping lines will show visible gaps
-    or offsets on direction reversals.
+    Draws overlapping lines that should coincide if there is no
+    backlash.  Visible gap = backlash present.
 
     Parameters
     ----------
-    distance_mm : float
-        Distance to travel in each direction.
+    distance : float
+        Line length (mm).
     repeats : int
-        Number of forward/reverse cycles.
-    origin : tuple[float, float]
-        Starting position.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations to draw backlash test.
+        Number of forward/reverse pairs.
+    spacing : float
+        Vertical spacing between pairs (mm).
     """
-    ops: list[Operation] = [ToolUp()]
+    ops = _preamble(tool)
     x0, y0 = origin
-
-    # Draw horizontal forward/reverse pattern
-    points: list[tuple[float, float]] = [(x0, y0)]
     for i in range(repeats):
-        if i % 2 == 0:
-            points.append((x0 + distance_mm, y0))
-        else:
-            points.append((x0, y0))
-
-    ops.extend(_stroke(points, feed))
-
-    # Draw vertical forward/reverse pattern
-    v_points: list[tuple[float, float]] = [(x0 + distance_mm + 10, y0)]
-    for i in range(repeats):
-        if i % 2 == 0:
-            v_points.append((x0 + distance_mm + 10, y0 + distance_mm))
-        else:
-            v_points.append((x0 + distance_mm + 10, y0))
-
-    ops.extend(_stroke(v_points, feed))
-
+        y = y0 + i * spacing
+        # Forward
+        ops.extend(_stroke([(x0, y), (x0 + distance, y)], feed))
+        # Reverse (should overlap)
+        ops.extend(_stroke([(x0 + distance, y + 0.5), (x0, y + 0.5)], feed))
     return ops
 
 
 def z_touch_pattern(
     positions: list[tuple[float, float]] | None = None,
-    dot_size_mm: float = 2.0,
+    tool: str | None = None,
     feed: float | None = None,
 ) -> list[Operation]:
-    """
-    Draw small marks at specified positions for Z calibration.
-
-    Used to verify pen touches paper at each position.
+    """Dots at multiple positions for Z-height calibration.
 
     Parameters
     ----------
     positions : list[tuple[float, float]] | None
-        Canvas positions to mark. Default: 5x3 grid.
-    dot_size_mm : float
-        Size of each mark.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations to draw Z touch pattern.
+        Canvas positions where the tool should briefly touch.
+        Default: centre + four corners of a 50 mm square.
     """
     if positions is None:
-        # Default 5x3 grid across canvas
+        cx, cy = _A4_CX, _A4_CY
         positions = [
-            (30, 50), (105, 50), (180, 50),
-            (30, 148), (105, 148), (180, 148),
-            (30, 247), (105, 247), (180, 247),
+            (cx, cy),
+            (cx - 25, cy - 25),
+            (cx + 25, cy - 25),
+            (cx + 25, cy + 25),
+            (cx - 25, cy + 25),
         ]
 
-    ops: list[Operation] = [ToolUp()]
-
-    for x, y in positions:
-        # Draw small cross at each position
-        half = dot_size_mm / 2
-        ops.extend(_stroke([(x - half, y), (x + half, y)], feed))
-        ops.extend(_stroke([(x, y - half), (x, y + half)], feed))
-
+    ops = _preamble(tool)
+    for px, py in positions:
+        ops.extend([
+            RapidXY(x=px, y=py),
+            ToolDown(),
+            ToolUp(),
+        ])
     return ops
 
 
-# --- Pen-Specific Patterns ---
+# ---------------------------------------------------------------------------
+# Pen-specific patterns
+# ---------------------------------------------------------------------------
 
 
 def line_weight_test(
-    speeds_mm_min: list[float] | None = None,
-    line_length_mm: float = 80.0,
-    origin: tuple[float, float] = (60.0, 50.0),
-    line_spacing_mm: float = 8.0,
+    speeds: list[float] | None = None,
+    length: float = 60.0,
+    spacing: float = 8.0,
+    origin: tuple[float, float] = (75.0, 80.0),
+    tool: str | None = None,
 ) -> list[Operation]:
-    """
-    Draw parallel lines at different speeds to test line weight.
-
-    Slower speeds typically produce thicker lines with pen.
+    """Parallel lines at different speeds -- pen pressure vs speed.
 
     Parameters
     ----------
-    speeds_mm_min : list[float] | None
-        Feed rates to test. Default: [300, 500, 800, 1000, 1500, 2000].
-    line_length_mm : float
-        Length of each test line.
-    origin : tuple[float, float]
-        Starting position.
-    line_spacing_mm : float
-        Vertical spacing between lines.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations for line weight test.
+    speeds : list[float] | None
+        Feed rates (mm/s).  Default: [5, 10, 15, 25, 40, 60].
     """
-    if speeds_mm_min is None:
-        speeds_mm_min = [300.0, 500.0, 800.0, 1000.0, 1500.0, 2000.0]
+    if speeds is None:
+        speeds = [5.0, 10.0, 15.0, 25.0, 40.0, 60.0]
 
-    ops: list[Operation] = [ToolUp()]
+    ops = _preamble(tool)
     x0, y0 = origin
-
-    for i, speed in enumerate(speeds_mm_min):
-        y = y0 + i * line_spacing_mm
-        ops.extend(_stroke([(x0, y), (x0 + line_length_mm, y)], feed=speed))
-
+    for i, spd in enumerate(speeds):
+        y = y0 + i * spacing
+        ops.extend(_stroke([(x0, y), (x0 + length, y)], feed=spd))
     return ops
 
 
 def corner_test(
     angles: list[float] | None = None,
-    arm_length_mm: float = 30.0,
-    origin: tuple[float, float] = (50.0, 50.0),
-    spacing_mm: float = 40.0,
+    arm_length: float = 20.0,
+    spacing: float = 30.0,
+    origin: tuple[float, float] = (40.0, 80.0),
+    tool: str | None = None,
     feed: float | None = None,
 ) -> list[Operation]:
-    """
-    Draw corners at various angles to test sharp corner quality.
+    """Zigzag patterns at different corner angles -- sharp corner quality.
 
     Parameters
     ----------
     angles : list[float] | None
-        Angles in degrees. Default: [30, 45, 60, 90, 120, 150].
-    arm_length_mm : float
-        Length of each corner arm.
-    origin : tuple[float, float]
-        Starting position.
-    spacing_mm : float
-        Horizontal spacing between corners.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations for corner test.
+        Corner angles in degrees.  Default: [30, 45, 60, 90, 120].
+    arm_length : float
+        Length of each arm (mm).
     """
     if angles is None:
-        angles = [30.0, 45.0, 60.0, 90.0, 120.0, 150.0]
+        angles = [30.0, 45.0, 60.0, 90.0, 120.0]
 
-    ops: list[Operation] = [ToolUp()]
+    ops = _preamble(tool)
     x0, y0 = origin
-
-    for i, angle in enumerate(angles):
-        cx = x0 + i * spacing_mm
-
-        # Draw V shape centered at (cx, y0)
-        half_angle_rad = math.radians(angle / 2)
-
-        # Left arm
-        lx = cx - arm_length_mm * math.sin(half_angle_rad)
-        ly = y0 + arm_length_mm * math.cos(half_angle_rad)
-
-        # Right arm
-        rx = cx + arm_length_mm * math.sin(half_angle_rad)
-        ry = y0 + arm_length_mm * math.cos(half_angle_rad)
-
-        # Draw from left arm tip, through vertex, to right arm tip
-        ops.extend(_stroke([(lx, ly), (cx, y0), (rx, ry)], feed))
-
+    for i, angle_deg in enumerate(angles):
+        cx = x0 + i * spacing
+        # Compute two arms at the given angle
+        half_rad = math.radians(angle_deg / 2.0)
+        dx = arm_length * math.sin(half_rad)
+        dy = arm_length * math.cos(half_rad)
+        pts = [
+            (cx - dx, y0 + dy),
+            (cx, y0),
+            (cx + dx, y0 + dy),
+        ]
+        ops.extend(_stroke(pts, feed))
     return ops
 
 
 def fine_detail_test(
-    spacing_mm: list[float] | None = None,
-    line_length_mm: float = 30.0,
+    spacings: list[float] | None = None,
+    length: float = 30.0,
     num_lines: int = 5,
-    origin: tuple[float, float] = (50.0, 100.0),
-    group_spacing_mm: float = 20.0,
+    origin: tuple[float, float] = (60.0, 80.0),
+    tool: str | None = None,
     feed: float | None = None,
 ) -> list[Operation]:
-    """
-    Draw groups of closely spaced parallel lines.
-
-    Tests minimum feature size and line merge behavior.
+    """Closely spaced parallel lines -- minimum feature size.
 
     Parameters
     ----------
-    spacing_mm : list[float] | None
-        Line spacings to test. Default: [0.5, 1.0, 1.5, 2.0, 3.0].
-    line_length_mm : float
-        Length of each line.
+    spacings : list[float] | None
+        Line spacings to test (mm).  Default: [2.0, 1.0, 0.5, 0.3].
     num_lines : int
         Number of lines per group.
-    origin : tuple[float, float]
-        Starting position.
-    group_spacing_mm : float
-        Horizontal spacing between groups.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations for fine detail test.
     """
-    if spacing_mm is None:
-        spacing_mm = [0.5, 1.0, 1.5, 2.0, 3.0]
+    if spacings is None:
+        spacings = [2.0, 1.0, 0.5, 0.3]
 
-    ops: list[Operation] = [ToolUp()]
+    ops = _preamble(tool)
     x0, y0 = origin
+    group_gap = 15.0
+    x_cursor = x0
 
-    group_x = x0
-    for spacing in spacing_mm:
-        # Draw vertical lines with this spacing
-        for i in range(num_lines):
-            x = group_x + i * spacing
-            ops.extend(_stroke([(x, y0), (x, y0 + line_length_mm)], feed))
-
-        group_x += (num_lines - 1) * spacing + group_spacing_mm
+    for sp in spacings:
+        for j in range(num_lines):
+            lx = x_cursor + j * sp
+            ops.extend(_stroke([(lx, y0), (lx, y0 + length)], feed))
+        x_cursor += num_lines * sp + group_gap
 
     return ops
 
 
-# --- Convenience Functions ---
+# ---------------------------------------------------------------------------
+# Composite patterns
+# ---------------------------------------------------------------------------
 
 
-def full_calibration_suite(
-    canvas_center: tuple[float, float] = (105.0, 148.5),
+def calibration_suite(
+    tool: str | None = None,
     feed: float | None = None,
 ) -> list[Operation]:
+    """Run the full calibration pattern suite in one job.
+
+    Includes: square, cross, ruler_x, ruler_y, diagonal, circle.
     """
-    Generate a complete calibration pattern suite.
-
-    Combines multiple patterns for comprehensive calibration.
-
-    Parameters
-    ----------
-    canvas_center : tuple[float, float]
-        Canvas center for pattern placement.
-    feed : float | None
-        Drawing feed rate in mm/min.
-
-    Returns
-    -------
-    list[Operation]
-        Job IR operations for full calibration suite.
-    """
-    ops: list[Operation] = [ToolUp()]
-
-    # Center cross
-    ops.extend(cross(size_mm=30, center=canvas_center, feed=feed))
-
-    # Corner squares (25mm at each corner area)
-    for ox, oy in [(20, 20), (165, 20), (20, 252), (165, 252)]:
-        ops.extend(square(size_mm=25, origin=(ox, oy), feed=feed))
-
-    # Center circle
-    ops.extend(circle(diameter_mm=40, center=canvas_center, feed=feed))
-
-    # Rulers along edges
-    ops.extend(ruler_x(length_mm=150, origin=(30, 30), feed=feed))
-    ops.extend(ruler_y(length_mm=200, origin=(30, 50), feed=feed))
-
+    ops: list[Operation] = []
+    ops.extend(square(tool=tool, feed=feed))
+    ops.extend(cross(tool=tool, feed=feed))
+    ops.extend(ruler_x(tool=tool, feed=feed))
+    ops.extend(ruler_y(tool=tool, feed=feed))
+    ops.extend(diagonal(tool=tool, feed=feed))
+    ops.extend(circle(tool=tool, feed=feed))
     return ops

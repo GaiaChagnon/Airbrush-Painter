@@ -1,3 +1,1 @@
-"""
-Robot control test suite.
-"""
+"""Robot control test suite."""

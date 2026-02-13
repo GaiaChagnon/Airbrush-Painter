@@ -1,15 +1,18 @@
-"""
-Robot Control Package.
-
-Isolated control system for Klipper-based pen/airbrush robot. Communicates with
-Klipper via Unix Domain Socket API for motion control, calibration, and job execution.
+"""Robot control package for Klipper-based pen/airbrush machine.
 
 Subpackages:
-    hardware: Klipper client, job executor, interactive controls
-    job_ir: Intermediate representation for job operations
-    calibration: Test patterns and calibration routines
-    gcode: G-code generation from Job IR
-    configs: Machine configuration loading and validation
+    configs     -- Machine YAML config loading and validation
+    hardware    -- Klipper API client, job executor, interactive controller
+    job_ir      -- Job IR operation dataclasses
+    gcode       -- Job IR to G-code conversion
+    calibration -- Test patterns and guided calibration routines
+    scripts     -- Thin CLI entry points
 """
 
-__all__ = ["hardware", "job_ir", "calibration", "gcode", "configs"]
+__all__ = [
+    "calibration",
+    "configs",
+    "gcode",
+    "hardware",
+    "job_ir",
+]

@@ -1,34 +1,44 @@
-"""
-Job Intermediate Representation module.
+"""Job IR -- intermediate representation for painting jobs.
 
-Defines all possible job operations as immutable dataclasses. This vocabulary
-is the contract between vector data and G-code generation.
-
-All coordinates are in millimeters, canvas-relative.
+All operations are frozen dataclasses with canvas-relative mm coordinates.
 """
 
 from robot_control.job_ir.operations import (
-    Operation,
-    HomeXY,
-    SelectTool,
-    RapidXY,
-    LinearMove,
     DrawPolyline,
-    ToolUp,
-    ToolDown,
-    Stroke,
+    HomeXY,
     Job,
+    LinearMove,
+    Operation,
+    Purge,
+    RapidXY,
+    RefillPump,
+    SelectTool,
+    SetInkMix,
+    SprayOff,
+    SprayOn,
+    Stroke,
+    ToolDown,
+    ToolUp,
+    create_stroke,
+    operations_to_strokes,
 )
 
 __all__ = [
-    "Operation",
-    "HomeXY",
-    "SelectTool",
-    "RapidXY",
-    "LinearMove",
     "DrawPolyline",
-    "ToolUp",
-    "ToolDown",
-    "Stroke",
+    "HomeXY",
     "Job",
+    "LinearMove",
+    "Operation",
+    "Purge",
+    "RapidXY",
+    "RefillPump",
+    "SelectTool",
+    "SetInkMix",
+    "SprayOff",
+    "SprayOn",
+    "Stroke",
+    "ToolDown",
+    "ToolUp",
+    "create_stroke",
+    "operations_to_strokes",
 ]

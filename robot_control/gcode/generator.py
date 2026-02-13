@@ -1,19 +1,26 @@
-"""
-G-code generator.
+"""G-code generator -- Job IR operations to G-code strings.
 
-Converts Job IR operations to G-code strings with coordinate transforms
-and Z state mapping. All coordinate transforms happen here, not at runtime.
+All coordinate transforms (canvas offset, tool offset, Y-axis flip) are
+applied **here**, not at machine runtime.  The generated G-code uses
+absolute machine coordinates only -- no ``G92`` commands.
 
-Key principles:
-    - No G92 runtime offsets - all positions are absolute machine coordinates
-    - Canvas offset + tool offset applied during generation
-    - Semantic Z states mapped to configured values
-    - Soft-limit validation before generation
+Feed rate convention:
+    Python stores feed rates in **mm/s**.  This module converts to the
+    G-code ``F`` parameter (mm/min) at the generation boundary::
+
+        F_value = feed_mm_s * 60.0
+
+Direction reversal:
+    High-speed direction changes can stall the stepper driver.  When a
+    rapid travel reverses direction, this generator inserts a ``G4``
+    dwell whose duration comes from ``steppers.direction_reversal_pause_s``
+    in the machine config.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from io import StringIO
 from typing import Literal
 
@@ -34,262 +41,270 @@ logger = logging.getLogger(__name__)
 
 
 class GCodeError(Exception):
-    """Raised when G-code generation fails."""
+    """Raised when G-code generation fails due to invalid input."""
 
     pass
 
 
-class GCodeGenerator:
-    """
-    Convert Job IR operations to G-code.
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    Handles coordinate transforms (canvas to machine), Z state mapping,
-    and feed rate management. Validates positions against soft limits.
+
+def _f(feed_mm_s: float) -> str:
+    """Convert mm/s feed rate to G-code ``F`` parameter (mm/min)."""
+    return f"F{feed_mm_s * 60.0:.1f}"
+
+
+def _needs_reversal_pause(
+    prev_x: float | None,
+    prev_y: float | None,
+    cur_x: float,
+    cur_y: float,
+    next_x: float,
+    next_y: float,
+) -> bool:
+    """Detect a >90-degree direction change in XY rapids.
+
+    Returns ``True`` when the angle between the incoming and outgoing
+    travel vectors exceeds 90 degrees, which is prone to stalling the
+    DM542TE driver at high speed.
+    """
+    if prev_x is None or prev_y is None:
+        return False
+    dx1 = cur_x - prev_x
+    dy1 = cur_y - prev_y
+    dx2 = next_x - cur_x
+    dy2 = next_y - cur_y
+    dot = dx1 * dx2 + dy1 * dy2
+    return dot < 0  # >90 degree turn
+
+
+# ---------------------------------------------------------------------------
+# Generator
+# ---------------------------------------------------------------------------
+
+
+class GCodeGenerator:
+    """Convert Job IR operations to G-code.
 
     Parameters
     ----------
     config : MachineConfig
-        Machine configuration with work area, canvas, tools, and Z states.
+        Validated machine configuration.
 
-    Examples
-    --------
-    >>> from robot_control.configs.loader import load_config
-    >>> from robot_control.job_ir.operations import HomeXY, RapidXY, ToolDown, ToolUp
-    >>> config = load_config()
-    >>> gen = GCodeGenerator(config)
-    >>> ops = [HomeXY(), RapidXY(x=10, y=20), ToolDown(), ToolUp()]
-    >>> gcode = gen.generate(ops)
+    Notes
+    -----
+    Coordinate frame:
+        Canvas input uses a top-left origin with +Y pointing down
+        (image convention).  ``MachineConfig.canvas_to_machine()``
+        applies offset + Y-flip + tool offset to produce absolute
+        machine coordinates.
     """
 
     def __init__(self, config: MachineConfig) -> None:
-        self.config = config
-        self._current_tool: Literal["pen", "airbrush"] = "pen"
+        self._cfg = config
+        self._tool: str = "pen"
         self._tool_is_up: bool = True
+        self._last_rapid_x: float | None = None
+        self._last_rapid_y: float | None = None
 
-    def generate(
-        self,
-        operations: list[Operation],
-        *,
-        validate_limits: bool = True,
-        include_header: bool = True,
-    ) -> str:
-        """
-        Generate G-code from a list of operations.
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def generate(self, operations: list[Operation]) -> str:
+        """Generate G-code for a flat list of operations.
 
         Parameters
         ----------
         operations : list[Operation]
-            Job IR operations to convert.
-        validate_limits : bool
-            If True, validate all positions against soft limits before generation.
-        include_header : bool
-            If True, include initialization header (units, absolute mode).
+            Job IR operations (canvas-relative, mm).
 
         Returns
         -------
         str
-            Complete G-code program.
+            Complete G-code program including header and footer.
 
         Raises
         ------
         GCodeError
-            If validation fails or an unknown operation is encountered.
+            If any commanded position violates soft limits.
         """
-        if validate_limits:
-            self._validate_limits(operations)
-
-        self._current_tool = "pen"
-        self._tool_is_up = True
-
-        output = StringIO()
-
-        if include_header:
-            self._write_header(output)
+        buf = StringIO()
+        self._reset_state()
+        self._write_header(buf)
 
         for op in operations:
-            self._generate_operation(op, output)
+            self._generate_op(op, buf)
 
-        return output.getvalue()
+        self._write_footer(buf)
+        return buf.getvalue()
 
-    def generate_stroke(self, stroke: Stroke, *, include_barrier: bool = True) -> str:
-        """
-        Generate G-code for a single stroke.
+    def generate_stroke(self, stroke: Stroke) -> str:
+        """Generate G-code for a single stroke (interactive mode).
 
-        Used in interactive mode where strokes are sent one at a time.
-        Optionally includes M400 barrier for motion synchronization.
+        The output always ends with ``M400`` so that the Klipper API
+        blocks until physical motion completes.
 
         Parameters
         ----------
         stroke : Stroke
-            List of operations forming a stroke.
-        include_barrier : bool
-            If True, append M400 to wait for motion completion.
+            List of operations forming one atomic drawing unit.
 
         Returns
         -------
         str
-            G-code for the stroke.
+            G-code for this stroke, terminated by ``M400``.
         """
-        output = StringIO()
-
+        buf = StringIO()
         for op in stroke:
-            self._generate_operation(op, output)
+            self._generate_op(op, buf)
+        buf.write("M400\n")
+        return buf.getvalue()
 
-        if include_barrier:
-            output.write("M400 ; Wait for moves to complete\n")
+    # ------------------------------------------------------------------
+    # Internal: per-operation dispatch
+    # ------------------------------------------------------------------
 
-        return output.getvalue()
+    def _reset_state(self) -> None:
+        self._tool = "pen"
+        self._tool_is_up = True
+        self._last_rapid_x = None
+        self._last_rapid_y = None
 
-    def _write_header(self, output: StringIO) -> None:
-        """Write G-code initialization header."""
-        output.write("; Generated by robot_control GCodeGenerator\n")
-        output.write("G21 ; Units: millimeters\n")
-        output.write("G90 ; Absolute positioning\n")
-        output.write("\n")
-
-    def _generate_operation(self, op: Operation, output: StringIO) -> None:
-        """Generate G-code for a single operation."""
+    def _generate_op(self, op: Operation, buf: StringIO) -> None:
         if isinstance(op, HomeXY):
-            output.write("G28 X Y ; Home X and Y axes\n")
-
+            self._gen_home(buf)
         elif isinstance(op, SelectTool):
-            self._current_tool = op.tool
-            macro = "TOOL_PEN" if op.tool == "pen" else "TOOL_AIRBRUSH"
-            output.write(f"{macro} ; Select {op.tool} tool\n")
-
+            self._gen_select_tool(op, buf)
         elif isinstance(op, ToolUp):
-            z = self.config.z_states.travel_mm
-            feed = self.config.get_tool(self._current_tool).plunge_feed_mm_min
-            output.write(f"G0 Z{z:.3f} F{feed:.0f} ; Tool up (travel height)\n")
-            self._tool_is_up = True
-
+            self._gen_tool_up(buf)
         elif isinstance(op, ToolDown):
-            z = self.config.get_z_for_tool(self._current_tool, "work")
-            feed = self.config.get_tool(self._current_tool).plunge_feed_mm_min
-            output.write(f"G1 Z{z:.3f} F{feed:.0f} ; Tool down (work height)\n")
-            self._tool_is_up = False
-
+            self._gen_tool_down(buf)
         elif isinstance(op, RapidXY):
-            mx, my = self.config.canvas_to_machine(op.x, op.y, self._current_tool)
-            feed = self.config.get_tool(self._current_tool).travel_feed_mm_min
-            output.write(f"G0 X{mx:.3f} Y{my:.3f} F{feed:.0f} ; Rapid to ({op.x:.2f}, {op.y:.2f})\n")
-
+            self._gen_rapid(op, buf)
         elif isinstance(op, LinearMove):
-            mx, my = self.config.canvas_to_machine(op.x, op.y, self._current_tool)
-            feed = op.feed or self.config.get_tool(self._current_tool).feed_mm_min
-            output.write(f"G1 X{mx:.3f} Y{my:.3f} F{feed:.0f}\n")
-
+            self._gen_linear(op, buf)
         elif isinstance(op, DrawPolyline):
-            feed = op.feed or self.config.get_tool(self._current_tool).feed_mm_min
-            for i, (x, y) in enumerate(op.points):
-                mx, my = self.config.canvas_to_machine(x, y, self._current_tool)
-                if i == 0:
-                    # First point sets feed rate
-                    output.write(f"G1 X{mx:.3f} Y{my:.3f} F{feed:.0f}\n")
-                else:
-                    output.write(f"G1 X{mx:.3f} Y{my:.3f}\n")
-
+            self._gen_polyline(op, buf)
         else:
-            # Unknown operation - log warning but continue
-            logger.warning("Unknown operation type: %s", type(op).__name__)
+            logger.warning("Unsupported operation: %s", type(op).__name__)
 
-    def _validate_limits(self, operations: list[Operation]) -> None:
-        """
-        Validate all positions against soft limits.
+    # ------------------------------------------------------------------
+    # Individual generators
+    # ------------------------------------------------------------------
+
+    def _gen_home(self, buf: StringIO) -> None:
+        buf.write("; --- Home XY ---\n")
+        buf.write("G28 X Y\n")
+        self._tool_is_up = True
+
+    def _gen_select_tool(self, op: SelectTool, buf: StringIO) -> None:
+        self._tool = op.tool
+        buf.write(f"; Select tool: {op.tool}\n")
+        macro = f"TOOL_{op.tool.upper()}"
+        buf.write(f"{macro}\n")
+
+    def _gen_tool_up(self, buf: StringIO) -> None:
+        z = self._cfg.get_z_for_tool(self._tool, "travel")
+        tc = self._cfg.get_tool(self._tool)
+        buf.write(f"G0 Z{z:.3f} {_f(tc.plunge_feed_mm_s)}\n")
+        self._tool_is_up = True
+
+    def _gen_tool_down(self, buf: StringIO) -> None:
+        z = self._cfg.get_z_for_tool(self._tool, "work")
+        tc = self._cfg.get_tool(self._tool)
+        buf.write(f"G1 Z{z:.3f} {_f(tc.plunge_feed_mm_s)}\n")
+        self._tool_is_up = False
+
+    def _gen_rapid(self, op: RapidXY, buf: StringIO) -> None:
+        mx, my = self._cfg.canvas_to_machine(op.x, op.y, self._tool)
+        self._validate_xy(mx, my)
+        tc = self._cfg.get_tool(self._tool)
+
+        # Direction-reversal pause
+        pause_s = self._cfg.steppers.direction_reversal_pause_s
+        if (
+            pause_s > 0
+            and self._last_rapid_x is not None
+            and self._last_rapid_y is not None
+        ):
+            if _needs_reversal_pause(
+                self._last_rapid_x,
+                self._last_rapid_y,
+                mx,
+                my,
+                mx,
+                my,
+            ):
+                pause_ms = int(pause_s * 1000)
+                buf.write(f"G4 P{pause_ms}\n")
+
+        buf.write(f"G0 X{mx:.3f} Y{my:.3f} {_f(tc.travel_feed_mm_s)}\n")
+        self._last_rapid_x = mx
+        self._last_rapid_y = my
+
+    def _gen_linear(self, op: LinearMove, buf: StringIO) -> None:
+        mx, my = self._cfg.canvas_to_machine(op.x, op.y, self._tool)
+        self._validate_xy(mx, my)
+        tc = self._cfg.get_tool(self._tool)
+        feed = op.feed if op.feed is not None else tc.feed_mm_s
+        buf.write(f"G1 X{mx:.3f} Y{my:.3f} {_f(feed)}\n")
+
+    def _gen_polyline(self, op: DrawPolyline, buf: StringIO) -> None:
+        tc = self._cfg.get_tool(self._tool)
+        feed = op.feed if op.feed is not None else tc.feed_mm_s
+
+        for px, py in op.points:
+            mx, my = self._cfg.canvas_to_machine(px, py, self._tool)
+            self._validate_xy(mx, my)
+            buf.write(f"G1 X{mx:.3f} Y{my:.3f} {_f(feed)}\n")
+
+    # ------------------------------------------------------------------
+    # Header / footer
+    # ------------------------------------------------------------------
+
+    def _write_header(self, buf: StringIO) -> None:
+        buf.write("; Generated by robot_control G-code generator\n")
+        buf.write("; Units: mm, absolute positioning\n")
+        buf.write("G21 ; mm mode\n")
+        buf.write("G90 ; absolute positioning\n")
+        buf.write("\n")
+
+    def _write_footer(self, buf: StringIO) -> None:
+        buf.write("\n")
+        buf.write("; --- End of job ---\n")
+        # Ensure tool is up and return to home
+        z_travel = self._cfg.get_z_for_tool(self._tool, "travel")
+        tc = self._cfg.get_tool(self._tool)
+        buf.write(f"G0 Z{z_travel:.3f} {_f(tc.plunge_feed_mm_s)}\n")
+        buf.write(f"G0 X0 Y0 {_f(tc.travel_feed_mm_s)}\n")
+        buf.write("M400 ; wait for motion complete\n")
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def _validate_xy(self, mx: float, my: float) -> None:
+        """Reject positions outside the machine work area.
+
+        Parameters
+        ----------
+        mx, my : float
+            Absolute machine coordinates in mm.
 
         Raises
         ------
         GCodeError
-            If any position exceeds work area or canvas bounds.
+            If either coordinate is out of bounds.
         """
-        for op in operations:
-            if isinstance(op, RapidXY):
-                self._check_position(op.x, op.y, "RapidXY", is_drawing=False)
-            elif isinstance(op, LinearMove):
-                self._check_position(op.x, op.y, "LinearMove", is_drawing=True)
-            elif isinstance(op, DrawPolyline):
-                for i, (x, y) in enumerate(op.points):
-                    self._check_position(x, y, f"DrawPolyline point {i}", is_drawing=True)
-
-    def _check_position(
-        self,
-        x: float,
-        y: float,
-        context: str,
-        is_drawing: bool,
-    ) -> None:
-        """
-        Check if a canvas position is within valid bounds.
-
-        Parameters
-        ----------
-        x : float
-            Canvas X coordinate.
-        y : float
-            Canvas Y coordinate.
-        context : str
-            Description of the operation for error messages.
-        is_drawing : bool
-            If True, check against canvas bounds. If False, check work area.
-        """
-        # Convert to machine coordinates for work area check
-        mx, my = self.config.canvas_to_machine(x, y, self._current_tool)
-
-        # Check work area limits
-        if mx < 0 or mx > self.config.work_area.x:
+        wa = self._cfg.work_area
+        if mx < 0 or mx > wa.x:
             raise GCodeError(
-                f"{context}: X={x:.2f} (machine X={mx:.2f}) exceeds work area "
-                f"[0, {self.config.work_area.x:.1f}]"
+                f"X={mx:.3f} mm outside work area [0, {wa.x:.1f}]"
             )
-        if my < 0 or my > self.config.work_area.y:
+        if my < 0 or my > wa.y:
             raise GCodeError(
-                f"{context}: Y={y:.2f} (machine Y={my:.2f}) exceeds work area "
-                f"[0, {self.config.work_area.y:.1f}]"
+                f"Y={my:.3f} mm outside work area [0, {wa.y:.1f}]"
             )
-
-        # For drawing operations, also check canvas bounds
-        if is_drawing:
-            if x < 0 or x > self.config.canvas.width_mm:
-                raise GCodeError(
-                    f"{context}: X={x:.2f} exceeds canvas bounds "
-                    f"[0, {self.config.canvas.width_mm:.1f}]"
-                )
-            if y < 0 or y > self.config.canvas.height_mm:
-                raise GCodeError(
-                    f"{context}: Y={y:.2f} exceeds canvas bounds "
-                    f"[0, {self.config.canvas.height_mm:.1f}]"
-                )
-
-
-def generate_file(
-    operations: list[Operation],
-    output_path: str,
-    config: MachineConfig,
-) -> str:
-    """
-    Generate G-code and write to file.
-
-    Convenience function for file-run mode.
-
-    Parameters
-    ----------
-    operations : list[Operation]
-        Job IR operations to convert.
-    output_path : str
-        Path to write G-code file.
-    config : MachineConfig
-        Machine configuration.
-
-    Returns
-    -------
-    str
-        Path to the generated file.
-    """
-    gen = GCodeGenerator(config)
-    gcode = gen.generate(operations)
-
-    with open(output_path, "w") as f:
-        f.write(gcode)
-
-    logger.info("Generated G-code: %s (%d bytes)", output_path, len(gcode))
-    return output_path

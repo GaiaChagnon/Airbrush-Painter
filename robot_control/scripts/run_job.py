@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
-"""
-Run Job Script.
+"""Run a job from test patterns or a Job IR file.
 
-Execute a job from Job IR operations or draw test patterns.
+Usage::
 
-Usage:
     python -m robot_control.scripts.run_job --pattern square
     python -m robot_control.scripts.run_job --pattern grid --interactive
     python -m robot_control.scripts.run_job --pattern calibration-suite
-    python -m robot_control.scripts.run_job --file job.yaml
-
-Available patterns:
-    square, rectangle, cross, grid, circle, diagonal
-    ruler-x, ruler-y, crosshair-grid, speed-test, backlash-test
-    z-touch, line-weight, corner-test, fine-detail, calibration-suite
+    python -m robot_control.scripts.run_job --pattern square --step
 """
 
 from __future__ import annotations
@@ -23,7 +16,7 @@ import logging
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from robot_control.calibration import patterns
 from robot_control.configs.loader import load_config
@@ -37,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PATTERN_MAP = {
+PATTERN_MAP: dict[str, callable] = {
     "square": patterns.square,
     "rectangle": patterns.rectangle,
     "cross": patterns.cross,
@@ -53,196 +46,100 @@ PATTERN_MAP = {
     "line-weight": patterns.line_weight_test,
     "corner-test": patterns.corner_test,
     "fine-detail": patterns.fine_detail_test,
-    "calibration-suite": patterns.full_calibration_suite,
+    "calibration-suite": patterns.calibration_suite,
+    "acceleration-test": patterns.acceleration_test,
 }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run a job or test pattern",
+        description="Run job patterns",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"Available patterns: {', '.join(PATTERN_MAP.keys())}",
     )
     parser.add_argument(
-        "--socket",
-        "-s",
-        type=str,
-        help="Klipper socket path",
-    )
-    parser.add_argument(
-        "--config",
-        "-c",
-        type=str,
-        help="Configuration file path",
-    )
-
-    # Job source
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument(
-        "--pattern",
-        "-p",
-        type=str,
+        "--pattern", "-p",
         choices=list(PATTERN_MAP.keys()),
-        help="Test pattern to draw",
+        required=True,
+        help="Pattern to draw",
     )
-    source.add_argument(
-        "--file",
-        "-f",
-        type=str,
-        help="Job file to execute (YAML format)",
-    )
-
-    # Execution mode
+    parser.add_argument("--socket", "-s", type=str, help="Socket path")
+    parser.add_argument("--config", "-c", type=str, help="Config path")
     parser.add_argument(
-        "--interactive",
-        "-i",
+        "--interactive", "-i",
         action="store_true",
-        help="Use interactive mode (stroke-by-stroke)",
+        help="Use interactive (stroke-by-stroke) mode",
     )
     parser.add_argument(
         "--step",
         action="store_true",
-        help="Step mode (pause after each stroke)",
+        help="Step mode (pause between each stroke)",
     )
     parser.add_argument(
-        "--no-home",
-        action="store_true",
-        help="Skip homing (machine must already be homed)",
+        "--tool", "-t",
+        choices=["pen", "airbrush"],
+        default="pen",
+        help="Tool to use",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Generate G-code but don't execute",
-    )
-
-    # Pattern options
-    parser.add_argument(
-        "--size",
+        "--feed", "-f",
         type=float,
-        default=50.0,
-        help="Pattern size in mm (for applicable patterns)",
+        default=None,
+        help="Drawing speed override (mm/s)",
     )
-    parser.add_argument(
-        "--feed",
-        type=float,
-        help="Feed rate override (mm/min)",
-    )
-
     args = parser.parse_args()
 
-    # Load config
-    try:
-        config = load_config(args.config)
-    except Exception as e:
-        print(f"Error loading config: {e}")
-        sys.exit(1)
-
-    # Generate operations
-    ops: list[Operation] = []
-
-    if args.pattern:
-        print(f"Generating pattern: {args.pattern}")
-        pattern_fn = PATTERN_MAP[args.pattern]
-
-        # Build kwargs based on pattern
-        kwargs = {}
-        if args.feed:
-            kwargs["feed"] = args.feed
-
-        # Size-based patterns
-        if args.pattern in ("square", "cross", "circle", "diagonal"):
-            if args.pattern == "circle":
-                kwargs["diameter_mm"] = args.size
-            else:
-                kwargs["size_mm"] = args.size
-
-        ops = pattern_fn(**kwargs)
-
-    elif args.file:
-        print(f"Loading job file: {args.file}")
-        # TODO: Implement job file loading
-        print("Error: Job file loading not yet implemented")
-        sys.exit(1)
-
-    # Add homing if needed
-    if not args.no_home:
-        ops = [HomeXY(), ToolUp()] + ops
-
-    # Ensure we end with tool up
-    if not isinstance(ops[-1], ToolUp):
-        ops.append(ToolUp())
-
-    print(f"Job contains {len(ops)} operations")
-
-    # Dry run - just generate G-code
-    if args.dry_run:
-        from robot_control.gcode.generator import GCodeGenerator
-
-        gen = GCodeGenerator(config)
-        gcode = gen.generate(ops)
-        print("\n--- Generated G-code ---")
-        print(gcode)
-        print("--- End G-code ---")
-        return
-
-    # Execute
+    config = load_config(args.config)
     socket_path = args.socket or config.connection.socket_path
-    print(f"Connecting to Klipper at {socket_path}...")
+
+    # Build operations
+    pattern_fn = PATTERN_MAP[args.pattern]
+    try:
+        ops: list[Operation] = pattern_fn(tool=args.tool, feed=args.feed)
+    except TypeError:
+        # Some patterns don't accept tool/feed kwargs
+        ops = pattern_fn()
+
+    # Prepend homing
+    full_ops: list[Operation] = [HomeXY()] + ops + [ToolUp()]
+
+    client = KlipperClient(
+        socket_path=socket_path,
+        timeout=config.connection.timeout_s,
+        reconnect_attempts=config.connection.reconnect_attempts,
+        reconnect_interval=config.connection.reconnect_interval_s,
+        auto_reconnect=config.connection.auto_reconnect,
+    )
 
     try:
-        with KlipperClient(
-            socket_path,
-            timeout=config.connection.timeout_s,
-            reconnect_attempts=config.connection.reconnect_attempts,
-        ) as client:
-            print("Connected.\n")
+        client.connect()
+        executor = JobExecutor(client, config)
 
-            executor = JobExecutor(client, config)
+        if args.interactive or args.step:
+            print(f"Running '{args.pattern}' interactively "
+                  f"(step={'on' if args.step else 'off'})...")
+            executor.run_interactive(full_ops, step_mode=args.step)
+        else:
+            print(f"Running '{args.pattern}' via file mode...")
+            executor.run_file(full_ops, filename=f"{args.pattern}.gcode")
+            # Monitor progress
+            import time
+            while True:
+                prog = executor.get_file_progress()
+                print(f"\r  {prog.message}", end="", flush=True)
+                if prog.state.name == "IDLE":
+                    break
+                time.sleep(1.0)
+            print()
 
-            def progress_callback(progress):
-                pct = progress.progress_percent
-                print(
-                    f"\rProgress: {progress.completed_strokes}/{progress.total_strokes} "
-                    f"({pct:.1f}%) - {progress.elapsed_time:.1f}s",
-                    end="",
-                    flush=True,
-                )
-
-            executor.set_progress_callback(progress_callback)
-
-            if args.interactive or args.step:
-                print("Running in interactive mode...")
-                if args.step:
-                    print("Step mode: Press Enter after each stroke")
-
-                    def step_callback():
-                        input("\nPress Enter for next stroke (or Ctrl+C to cancel)...")
-                        return True
-
-                    success = executor.run_interactive(
-                        ops, step_mode=True, step_callback=step_callback
-                    )
-                else:
-                    success = executor.run_interactive(ops)
-
-                print()  # Newline after progress
-                if success:
-                    print("Job completed successfully.")
-                else:
-                    print("Job was cancelled.")
-            else:
-                print("Running in file mode...")
-                output_path = executor.run_file(ops)
-                print(f"G-code written to: {output_path}")
-                print("Print started. Use Klipper/Moonraker to monitor progress.")
+        print("Job complete.")
 
     except KeyboardInterrupt:
-        print("\nJob interrupted.")
+        print("\nInterrupted by user.")
+    except Exception as exc:
+        logger.error("Job error: %s", exc, exc_info=True)
         sys.exit(1)
-    except Exception as e:
-        print(f"\nError: {e}")
-        logger.exception("Job failed")
-        sys.exit(1)
+    finally:
+        client.disconnect()
 
 
 if __name__ == "__main__":

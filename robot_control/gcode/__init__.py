@@ -1,10 +1,5 @@
-"""
-G-code generation module.
+"""G-code generation from Job IR operations."""
 
-Converts Job IR operations to G-code strings with coordinate transforms
-and Z state mapping.
-"""
+from robot_control.gcode.generator import GCodeError, GCodeGenerator
 
-from robot_control.gcode.generator import GCodeGenerator
-
-__all__ = ["GCodeGenerator"]
+__all__ = ["GCodeError", "GCodeGenerator"]

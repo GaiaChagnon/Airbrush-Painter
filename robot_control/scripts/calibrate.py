@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""
-Calibration Script.
+"""Calibration entry point.
 
-Runs calibration routines for the robot.
+Runs one or more calibration routines interactively.
 
-Usage:
+Usage::
+
     python -m robot_control.scripts.calibrate              # Full calibration
     python -m robot_control.scripts.calibrate --steps-x    # X axis only
     python -m robot_control.scripts.calibrate --steps-y    # Y axis only
@@ -21,7 +21,7 @@ import logging
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from robot_control.calibration import routines
 from robot_control.configs.loader import load_config
@@ -39,115 +39,73 @@ def main() -> None:
         description="Robot calibration",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--socket",
-        "-s",
-        type=str,
-        help="Klipper socket path",
-    )
-    parser.add_argument(
-        "--config",
-        "-c",
-        type=str,
-        help="Configuration file path",
-    )
-
-    # Calibration options
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--full",
-        action="store_true",
-        help="Run full calibration sequence (default)",
-    )
-    group.add_argument(
-        "--steps-x",
-        action="store_true",
-        help="Calibrate X axis steps/mm",
-    )
-    group.add_argument(
-        "--steps-y",
-        action="store_true",
-        help="Calibrate Y axis steps/mm",
-    )
-    group.add_argument(
-        "--z-heights",
-        action="store_true",
-        help="Calibrate Z seesaw heights",
-    )
-    group.add_argument(
-        "--tool-offset",
-        action="store_true",
-        help="Calibrate tool offset",
-    )
-    group.add_argument(
-        "--speed",
-        action="store_true",
-        help="Calibrate drawing speed",
-    )
-    group.add_argument(
-        "--endstops",
-        action="store_true",
-        help="Verify endstop repeatability",
-    )
-
-    parser.add_argument(
-        "--rotation-distance",
-        type=float,
-        default=40.0,
-        help="Current rotation_distance for steps/mm calibration",
-    )
-
+    parser.add_argument("--socket", "-s", type=str, help="Socket path")
+    parser.add_argument("--config", "-c", type=str, help="Config file path")
+    parser.add_argument("--steps-x", action="store_true",
+                        help="Calibrate X steps/mm")
+    parser.add_argument("--steps-y", action="store_true",
+                        help="Calibrate Y steps/mm")
+    parser.add_argument("--z-heights", action="store_true",
+                        help="Calibrate Z heights")
+    parser.add_argument("--tool-offset", action="store_true",
+                        help="Calibrate tool XY offset")
+    parser.add_argument("--speed", action="store_true",
+                        help="Calibrate drawing speed")
+    parser.add_argument("--endstops", action="store_true",
+                        help="Verify endstop repeatability")
     args = parser.parse_args()
 
-    # Load config
-    try:
-        config = load_config(args.config)
-    except Exception as e:
-        print(f"Error loading config: {e}")
-        sys.exit(1)
-
+    config = load_config(args.config)
     socket_path = args.socket or config.connection.socket_path
 
-    # Connect
-    print(f"Connecting to Klipper at {socket_path}...")
-    try:
-        with KlipperClient(
-            socket_path,
-            timeout=config.connection.timeout_s,
-            reconnect_attempts=config.connection.reconnect_attempts,
-        ) as client:
-            print("Connected.\n")
+    # If no specific routine selected, run all
+    run_all = not any([
+        args.steps_x, args.steps_y, args.z_heights,
+        args.tool_offset, args.speed, args.endstops,
+    ])
 
-            # Run selected calibration
-            if args.steps_x:
-                routines.calibrate_steps_per_mm(
-                    client, config, "X", 100.0, args.rotation_distance
-                )
-            elif args.steps_y:
-                routines.calibrate_steps_per_mm(
-                    client, config, "Y", 100.0, args.rotation_distance
-                )
-            elif args.z_heights:
-                routines.calibrate_z_seesaw(client, config)
-            elif args.tool_offset:
-                routines.calibrate_tool_offset(client, config)
-            elif args.speed:
-                routines.calibrate_speed(client, config)
-            elif args.endstops:
-                routines.verify_endstops(client, config)
-            else:
-                # Default: full calibration
-                routines.run_full_calibration(client, config)
+    client = KlipperClient(
+        socket_path=socket_path,
+        timeout=config.connection.timeout_s,
+        reconnect_attempts=config.connection.reconnect_attempts,
+        reconnect_interval=config.connection.reconnect_interval_s,
+        auto_reconnect=config.connection.auto_reconnect,
+    )
+
+    try:
+        client.connect()
+
+        # Home before any calibration
+        print("\nHoming X Y before calibration...")
+        client.send_gcode("G28 X Y\nM400", timeout=30.0)
+
+        if args.steps_x or run_all:
+            routines.calibrate_steps_per_mm(client, config, axis="X")
+
+        if args.steps_y or run_all:
+            routines.calibrate_steps_per_mm(client, config, axis="Y")
+
+        if args.z_heights or run_all:
+            routines.calibrate_z_heights(client, config)
+
+        if args.tool_offset or run_all:
+            routines.calibrate_tool_offset(client, config)
+
+        if args.speed or run_all:
+            routines.calibrate_speed(client, config)
+
+        if args.endstops or run_all:
+            routines.verify_endstops(client, config)
+
+        print("\nCalibration complete.")
 
     except KeyboardInterrupt:
-        print("\nCalibration interrupted.")
+        print("\nCalibration interrupted by user.")
+    except Exception as exc:
+        logger.error("Calibration error: %s", exc, exc_info=True)
         sys.exit(1)
-    except Exception as e:
-        print(f"\nError: {e}")
-        logger.exception("Calibration failed")
-        sys.exit(1)
-
-    print("\nCalibration complete.")
+    finally:
+        client.disconnect()
 
 
 if __name__ == "__main__":

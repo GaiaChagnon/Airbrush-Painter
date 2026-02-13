@@ -1,13 +1,17 @@
-"""
-Klipper API Client.
+"""Klipper API client over Unix Domain Socket.
 
-Low-level communication with Klipper via Unix Domain Socket.
-Handles JSON message framing, request/response matching, and subscriptions.
+Handles:
+    - Socket connection with JSON + 0x03 (ETX) framing
+    - Request/response matching by unique message ID
+    - Async subscription notifications
+    - **Auto-reconnect** on MCU reset / Octopus power-cycle
+    - Emergency stop via dedicated API endpoint (bypasses G-code queue)
+    - Position / state queries via ``objects/query`` (no M114 parsing)
 
-Protocol:
-    - Messages are JSON objects terminated by 0x03 (ETX byte)
-    - Each request has a unique ID for response matching
-    - Subscriptions deliver async state updates
+Protocol reference:
+    https://www.klipper3d.org/API_Server.html
+
+All timeouts and retry counts come from ``MachineConfig.connection``.
 """
 
 from __future__ import annotations
@@ -22,126 +26,161 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-# ETX byte terminates each JSON message
+# ETX byte terminates each JSON message in the Klipper API protocol
 ETX = b"\x03"
-ETX_CHAR = "\x03"
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
 
 class KlipperError(Exception):
-    """Base exception for Klipper client errors."""
+    """Base exception for all Klipper client errors."""
 
     pass
 
 
-class ConnectionError(KlipperError):
-    """Raised when socket connection fails."""
+class KlipperConnectionError(KlipperError):
+    """Socket-level connection failure (initial or during operation)."""
+
+    pass
+
+
+class KlipperConnectionLost(KlipperError):
+    """All reconnect attempts exhausted after MCU reset / power-cycle."""
 
     pass
 
 
 class KlipperNotReady(KlipperError):
-    """Raised when Klipper is not in ready state."""
+    """Klipper is not in *ready* state (still starting up or in error)."""
 
     pass
 
 
 class GCodeError(KlipperError):
-    """Raised when G-code execution fails."""
+    """A ``gcode/script`` request returned an error."""
 
     pass
 
 
 class KlipperShutdown(KlipperError):
-    """Raised when Klipper enters shutdown state."""
+    """Klipper entered *shutdown* state (firmware fault / e-stop)."""
 
     pass
 
 
+# ---------------------------------------------------------------------------
+# Data containers
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class Position:
-    """Machine position in millimeters."""
+    """Machine position in millimetres."""
 
     x: float
     y: float
     z: float
-    e: float = 0.0  # Extruder position (unused for pen/airbrush)
+    e: float = 0.0
 
     @classmethod
     def from_list(cls, pos: list[float]) -> Position:
-        """Create Position from Klipper position list [x, y, z, e]."""
-        return cls(x=pos[0], y=pos[1], z=pos[2], e=pos[3] if len(pos) > 3 else 0.0)
+        """Create from Klipper's ``[x, y, z, e]`` list."""
+        return cls(
+            x=pos[0],
+            y=pos[1],
+            z=pos[2],
+            e=pos[3] if len(pos) > 3 else 0.0,
+        )
 
 
 @dataclass
 class PrinterStatus:
-    """Klipper printer status."""
+    """High-level printer status."""
 
-    state: str  # "ready", "startup", "shutdown", "error"
+    state: str  # "ready" | "startup" | "shutdown" | "error"
     state_message: str
-    homed_axes: str  # e.g., "xyz", "xy", ""
+    homed_axes: str  # e.g. "xy", "xyz", ""
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
 
 
 class KlipperClient:
-    """
-    Klipper API UDS client.
-
-    Provides structured access to Klipper's JSON API over Unix Domain Socket.
-    Handles connection management, message framing, and response matching.
+    """Klipper API UDS client with auto-reconnect.
 
     Parameters
     ----------
     socket_path : str
-        Path to Klipper's Unix Domain Socket (e.g., "/tmp/klippy_uds").
+        Path to ``klippy_uds`` Unix Domain Socket.
     timeout : float
-        Request timeout in seconds. Default: 5.0.
+        Default per-request timeout in seconds.
     reconnect_attempts : int
-        Number of reconnection attempts on failure. Default: 3.
+        Max reconnection tries after a lost connection.
+    reconnect_interval : float
+        Seconds to wait between reconnection attempts.
+    auto_reconnect : bool
+        If ``True``, automatically attempt reconnection on socket errors
+        during normal operation (not on initial ``connect()``).
 
     Examples
     --------
-    >>> client = KlipperClient("/tmp/klippy_uds")
-    >>> client.connect()
-    >>> pos = client.get_position()
-    >>> print(f"Position: X={pos.x}, Y={pos.y}, Z={pos.z}")
-    >>> client.send_gcode("G28 X Y")
-    >>> client.disconnect()
+    >>> with KlipperClient("/tmp/klippy_uds") as client:
+    ...     pos = client.get_position()
+    ...     client.send_gcode("G28 X Y")
     """
 
     def __init__(
         self,
         socket_path: str,
         timeout: float = 5.0,
-        reconnect_attempts: int = 3,
+        reconnect_attempts: int = 5,
+        reconnect_interval: float = 2.0,
+        auto_reconnect: bool = True,
     ) -> None:
         self.socket_path = socket_path
         self.timeout = timeout
         self.reconnect_attempts = reconnect_attempts
+        self.reconnect_interval = reconnect_interval
+        self.auto_reconnect = auto_reconnect
 
         self._sock: socket.socket | None = None
-        self._msg_id = 0
+        self._msg_id: int = 0
         self._lock = threading.Lock()
         self._recv_buffer = b""
 
-        # Subscription handling
-        self._subscription_callback: Callable[[dict[str, Any]], None] | None = None
-        self._subscription_thread: threading.Thread | None = None
-        self._stop_subscription = threading.Event()
+        # Subscription state
+        self._sub_callback: Callable[[dict[str, Any]], None] | None = None
+        self._sub_objects: dict[str, list[str] | None] | None = None
+        self._sub_thread: threading.Thread | None = None
+        self._stop_sub = threading.Event()
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
 
     @property
     def is_connected(self) -> bool:
-        """Check if socket connection is active."""
+        """``True`` when the socket is open."""
         return self._sock is not None
 
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
+
     def connect(self) -> None:
-        """
-        Establish socket connection to Klipper API.
+        """Establish connection and verify Klipper is responsive.
 
         Raises
         ------
-        ConnectionError
-            If connection fails after all retry attempts.
+        KlipperConnectionError
+            If the socket cannot be opened after retries.
         KlipperNotReady
-            If Klipper is not in ready state.
+            If Klipper reports a non-ready / error state.
         """
         for attempt in range(1, self.reconnect_attempts + 1):
             try:
@@ -151,43 +190,111 @@ class KlipperClient:
                     attempt,
                     self.reconnect_attempts,
                 )
-
-                self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self._sock = socket.socket(
+                    socket.AF_UNIX, socket.SOCK_STREAM,
+                )
                 self._sock.settimeout(self.timeout)
                 self._sock.connect(self.socket_path)
 
-                # Verify connection with info request
                 info = self._send_request("info", {})
                 state = info.get("state", "unknown")
 
                 if state == "shutdown":
-                    raise KlipperShutdown(f"Klipper is in shutdown state: {info}")
-                elif state == "error":
-                    raise KlipperNotReady(f"Klipper is in error state: {info}")
+                    raise KlipperShutdown(
+                        f"Klipper is in shutdown state: {info}"
+                    )
+                if state == "error":
+                    raise KlipperNotReady(
+                        f"Klipper is in error state: {info}"
+                    )
 
                 logger.info("Connected to Klipper (state: %s)", state)
                 return
 
-            except socket.error as e:
-                logger.warning("Connection attempt %d failed: %s", attempt, e)
+            except socket.error as exc:
+                logger.warning(
+                    "Connection attempt %d failed: %s", attempt, exc,
+                )
                 self._close_socket()
                 if attempt < self.reconnect_attempts:
-                    time.sleep(1.0)
+                    time.sleep(self.reconnect_interval)
 
-        raise ConnectionError(
+        raise KlipperConnectionError(
             f"Failed to connect to Klipper at {self.socket_path} "
             f"after {self.reconnect_attempts} attempts"
         )
 
     def disconnect(self) -> None:
-        """Close socket connection."""
+        """Cleanly close the connection."""
         self._stop_subscriptions()
         self._close_socket()
         logger.info("Disconnected from Klipper")
 
+    def reconnect(self) -> None:
+        """Re-establish a lost connection (MCU reset / power-cycle).
+
+        Sequence:
+            1. Retry the socket connection up to ``reconnect_attempts``.
+            2. Send ``FIRMWARE_RESTART`` to re-initialise the MCU link.
+            3. Poll ``info`` until Klipper reaches *ready* state.
+            4. Re-subscribe to any active object subscriptions.
+
+        Raises
+        ------
+        KlipperConnectionLost
+            If all reconnection attempts are exhausted.
+        """
+        logger.warning("Attempting reconnection to Klipper...")
+        self._close_socket()
+
+        for attempt in range(1, self.reconnect_attempts + 1):
+            try:
+                logger.info(
+                    "Reconnect attempt %d/%d",
+                    attempt,
+                    self.reconnect_attempts,
+                )
+                self._sock = socket.socket(
+                    socket.AF_UNIX, socket.SOCK_STREAM,
+                )
+                self._sock.settimeout(self.timeout)
+                self._sock.connect(self.socket_path)
+
+                # Connection is up -- try FIRMWARE_RESTART
+                try:
+                    self._send_request(
+                        "gcode/script",
+                        {"script": "FIRMWARE_RESTART"},
+                        timeout=10.0,
+                    )
+                except KlipperError:
+                    pass  # May error during restart; that's fine
+
+                # Wait for Klipper to become ready
+                if self._wait_for_ready(timeout=30.0):
+                    logger.info("Reconnected successfully")
+                    self._resubscribe()
+                    return
+
+            except socket.error as exc:
+                logger.warning(
+                    "Reconnect attempt %d failed: %s", attempt, exc,
+                )
+                self._close_socket()
+
+            time.sleep(self.reconnect_interval)
+
+        raise KlipperConnectionLost(
+            f"Lost connection to Klipper at {self.socket_path} and "
+            f"could not reconnect after {self.reconnect_attempts} attempts"
+        )
+
+    # ------------------------------------------------------------------
+    # Low-level transport
+    # ------------------------------------------------------------------
+
     def _close_socket(self) -> None:
-        """Close socket and reset state."""
-        if self._sock:
+        if self._sock is not None:
             try:
                 self._sock.close()
             except socket.error:
@@ -196,7 +303,6 @@ class KlipperClient:
         self._recv_buffer = b""
 
     def _next_id(self) -> int:
-        """Get next unique message ID."""
         self._msg_id += 1
         return self._msg_id
 
@@ -207,64 +313,59 @@ class KlipperClient:
         *,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """
-        Send request and wait for response.
+        """Send a JSON request and block until the matching response arrives.
 
-        Parameters
-        ----------
-        method : str
-            API method name (e.g., "info", "gcode/script").
-        params : dict
-            Method parameters.
-        timeout : float | None
-            Request timeout. Uses default if None.
-
-        Returns
-        -------
-        dict
-            Response result field.
+        Interleaved subscription notifications are dispatched to the
+        registered callback while waiting.
 
         Raises
         ------
-        ConnectionError
-            If not connected.
+        KlipperConnectionError
+            On socket-level failure (triggers auto-reconnect if enabled).
         TimeoutError
-            If response not received within timeout.
+            If the response is not received within *timeout*.
         KlipperError
-            If response contains error.
+            If the response contains an ``error`` field.
         """
         if not self._sock:
-            raise ConnectionError("Not connected to Klipper")
+            raise KlipperConnectionError("Not connected to Klipper")
 
         msg_id = self._next_id()
         request = {"id": msg_id, "method": method, "params": params}
-        request_bytes = json.dumps(request).encode("utf-8") + ETX
-
+        payload = json.dumps(request).encode("utf-8") + ETX
         timeout = timeout or self.timeout
 
         with self._lock:
             try:
-                self._sock.sendall(request_bytes)
+                self._sock.sendall(payload)
                 response = self._recv_response(msg_id, timeout)
             except socket.timeout:
-                raise TimeoutError(f"Request '{method}' timed out after {timeout}s")
-            except socket.error as e:
+                raise TimeoutError(
+                    f"Request '{method}' timed out after {timeout}s"
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError) as exc:
                 self._close_socket()
-                raise ConnectionError(f"Socket error: {e}")
+                if self.auto_reconnect:
+                    self.reconnect()
+                    # Retry the request once after successful reconnect
+                    return self._send_request(
+                        method, params, timeout=timeout,
+                    )
+                raise KlipperConnectionError(
+                    f"Socket error: {exc}"
+                ) from exc
 
         if "error" in response:
-            error = response["error"]
-            msg = error.get("message", str(error))
+            err = response["error"]
+            msg = err.get("message", str(err))
             raise KlipperError(f"Klipper error: {msg}")
 
         return response.get("result", {})
 
-    def _recv_response(self, expected_id: int, timeout: float) -> dict[str, Any]:
-        """
-        Receive and parse response with matching ID.
-
-        Handles subscription notifications that may arrive before response.
-        """
+    def _recv_response(
+        self, expected_id: int, timeout: float,
+    ) -> dict[str, Any]:
+        """Read messages until the one matching *expected_id* arrives."""
         deadline = time.monotonic() + timeout
 
         while True:
@@ -272,108 +373,124 @@ class KlipperClient:
             if remaining <= 0:
                 raise TimeoutError("Response timeout")
 
-            self._sock.settimeout(remaining)
+            self._sock.settimeout(remaining)  # type: ignore[union-attr]
 
-            # Read until we have a complete message
+            # Read until a complete message is buffered
             while ETX not in self._recv_buffer:
-                chunk = self._sock.recv(4096)
+                chunk = self._sock.recv(4096)  # type: ignore[union-attr]
                 if not chunk:
-                    raise ConnectionError("Connection closed by server")
+                    raise ConnectionResetError("Connection closed by server")
                 self._recv_buffer += chunk
 
-            # Extract first complete message
+            # Extract the first complete message
             idx = self._recv_buffer.index(ETX)
             msg_bytes = self._recv_buffer[:idx]
-            self._recv_buffer = self._recv_buffer[idx + 1 :]
+            self._recv_buffer = self._recv_buffer[idx + 1:]
 
             try:
                 msg = json.loads(msg_bytes.decode("utf-8"))
-            except json.JSONDecodeError as e:
-                logger.warning("Invalid JSON response: %s", e)
+            except json.JSONDecodeError as exc:
+                logger.warning("Invalid JSON from Klipper: %s", exc)
                 continue
 
-            # Check if this is our response
+            # Match by ID
             if msg.get("id") == expected_id:
                 return msg
 
-            # Handle subscription notification
-            if "method" in msg and self._subscription_callback:
+            # Dispatch subscription notification
+            if "method" in msg and self._sub_callback is not None:
                 try:
-                    self._subscription_callback(msg.get("params", {}))
-                except Exception as e:
-                    logger.error("Subscription callback error: %s", e)
+                    self._sub_callback(msg.get("params", {}))
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Subscription callback error: %s", exc)
 
-    # --- G-code Execution ---
+    # ------------------------------------------------------------------
+    # Readiness polling (used during reconnect)
+    # ------------------------------------------------------------------
 
-    def send_gcode(self, script: str, *, wait: bool = False, timeout: float | None = None) -> None:
-        """
-        Execute G-code via Klipper API.
+    def _wait_for_ready(self, timeout: float = 30.0) -> bool:
+        """Poll ``info`` until Klipper reports *ready* or *timeout*."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                info = self._send_request("info", {}, timeout=5.0)
+                if info.get("state") == "ready":
+                    return True
+            except (KlipperError, TimeoutError, OSError):
+                pass
+            time.sleep(1.0)
+        return False
+
+    # ------------------------------------------------------------------
+    # G-code execution
+    # ------------------------------------------------------------------
+
+    def send_gcode(
+        self,
+        script: str,
+        *,
+        wait: bool = False,
+        timeout: float | None = None,
+    ) -> None:
+        """Execute G-code via the Klipper API.
 
         Parameters
         ----------
         script : str
-            G-code to execute (single line or multi-line).
+            One or more G-code lines (newline-separated).
         wait : bool
-            If True, block until G-code execution completes.
-            Note: completion means script was processed, not motion finished.
-            Use M400 in the script to wait for motion completion.
+            If ``True``, the script should include ``M400`` so that the
+            API call blocks until physical motion completes.  The API
+            itself returns when the script is *accepted*, not when
+            motion finishes.
         timeout : float | None
-            Request timeout in seconds. If None, uses the client's default timeout.
-            Some commands like STEPPER_BUZZ take longer and need increased timeout.
-
-        Raises
-        ------
-        GCodeError
-            If G-code execution fails.
+            Per-request timeout override.
         """
         try:
-            self._send_request("gcode/script", {"script": script}, timeout=timeout)
-            logger.debug("Sent G-code: %s", script.replace("\n", " | ")[:80])
-        except KlipperError as e:
-            raise GCodeError(f"G-code execution failed: {e}") from e
+            self._send_request(
+                "gcode/script", {"script": script}, timeout=timeout,
+            )
+            logger.debug(
+                "Sent G-code: %s",
+                script.replace("\n", " | ")[:80],
+            )
+        except KlipperError as exc:
+            raise GCodeError(f"G-code execution failed: {exc}") from exc
 
     def emergency_stop(self) -> None:
-        """
-        Trigger immediate emergency stop.
+        """Immediate halt via dedicated API endpoint (not queued).
 
-        Uses dedicated API endpoint that bypasses G-code queue.
-        After emergency stop, use restart() to recover.
+        After calling this, use ``restart()`` or ``reconnect()`` to
+        recover.
         """
         logger.warning("EMERGENCY STOP triggered")
         try:
             self._send_request("emergency_stop", {})
         except KlipperShutdown:
-            pass  # Expected after emergency stop
-        except KlipperError as e:
-            logger.error("Emergency stop error: %s", e)
+            pass  # Expected after e-stop
+        except KlipperError as exc:
+            logger.error("Emergency stop error: %s", exc)
 
     def restart(self) -> None:
-        """
-        Restart Klipper after emergency stop or error.
-
-        May need to re-home after restart.
-        """
+        """Restart Klipper after e-stop or error.  May need re-homing."""
         logger.info("Restarting Klipper")
         try:
             self._send_request("gcode/restart", {})
         except KlipperError:
-            pass  # May get error during restart
-
-        # Wait for restart to complete
+            pass  # May error during restart transition
         time.sleep(2.0)
 
-    # --- State Queries ---
+    # ------------------------------------------------------------------
+    # State queries
+    # ------------------------------------------------------------------
 
     def get_position(self) -> Position:
-        """
-        Query current toolhead position.
-
-        Returns structured Position object, not parsed text.
+        """Query toolhead position via ``objects/query``.
 
         Returns
         -------
         Position
-            Current X, Y, Z, E position in mm.
+            Current X, Y, Z, E in mm.
         """
         result = self._send_request(
             "objects/query",
@@ -383,13 +500,12 @@ class KlipperClient:
         return Position.from_list(pos)
 
     def get_status(self) -> PrinterStatus:
-        """
-        Query printer state.
+        """Query high-level printer status.
 
         Returns
         -------
         PrinterStatus
-            Current state, message, and homed axes.
+            State, message, and homed axes.
         """
         result = self._send_request(
             "objects/query",
@@ -397,204 +513,194 @@ class KlipperClient:
                 "objects": {
                     "webhooks": ["state", "state_message"],
                     "toolhead": ["homed_axes"],
-                }
+                },
             },
         )
         status = result["status"]
-        webhooks = status.get("webhooks", {})
-        toolhead = status.get("toolhead", {})
-
+        wh = status.get("webhooks", {})
+        th = status.get("toolhead", {})
         return PrinterStatus(
-            state=webhooks.get("state", "unknown"),
-            state_message=webhooks.get("state_message", ""),
-            homed_axes=toolhead.get("homed_axes", ""),
+            state=wh.get("state", "unknown"),
+            state_message=wh.get("state_message", ""),
+            homed_axes=th.get("homed_axes", ""),
         )
 
     def is_homed(self, axes: str = "xy") -> bool:
-        """
-        Check if specified axes are homed.
-
-        Parameters
-        ----------
-        axes : str
-            Axes to check (e.g., "xy", "xyz").
-
-        Returns
-        -------
-        bool
-            True if all specified axes are homed.
-        """
+        """Check whether *axes* are homed (e.g. ``"xy"``, ``"xyz"``)."""
         status = self.get_status()
         return all(ax in status.homed_axes for ax in axes.lower())
 
     def is_idle(self) -> bool:
-        """
-        Check if toolhead is idle (no pending moves).
-
-        Returns
-        -------
-        bool
-            True if motion queue is empty.
-        """
+        """Check whether the toolhead motion queue is empty."""
         result = self._send_request(
             "objects/query",
             {"objects": {"toolhead": ["status"]}},
         )
-        status = result["status"]["toolhead"].get("status", "Ready")
-        return status.lower() == "ready"
+        th_status = result["status"]["toolhead"].get("status", "Ready")
+        return th_status.lower() == "ready"
 
     def wait_for_idle(self, timeout: float = 60.0) -> None:
-        """
-        Wait until toolhead is idle.
-
-        Parameters
-        ----------
-        timeout : float
-            Maximum wait time in seconds.
+        """Block until the toolhead becomes idle.
 
         Raises
         ------
         TimeoutError
-            If not idle within timeout.
+            If still busy after *timeout* seconds.
         """
         deadline = time.monotonic() + timeout
         while not self.is_idle():
             if time.monotonic() > deadline:
-                raise TimeoutError(f"Toolhead not idle after {timeout}s")
+                raise TimeoutError(
+                    f"Toolhead not idle after {timeout}s"
+                )
             time.sleep(0.1)
 
-    # --- Subscriptions ---
+    # ------------------------------------------------------------------
+    # Subscriptions
+    # ------------------------------------------------------------------
 
     def subscribe(
         self,
         objects: dict[str, list[str] | None],
         callback: Callable[[dict[str, Any]], None],
     ) -> None:
-        """
-        Subscribe to object state changes.
+        """Subscribe to Klipper object-model state changes.
 
         Parameters
         ----------
         objects : dict
-            Objects and attributes to subscribe to.
-            Example: {"toolhead": ["position"], "virtual_sdcard": None}
+            Objects and attribute lists to watch.
+            Example: ``{"toolhead": ["position"], "virtual_sdcard": None}``
         callback : callable
-            Function called with state updates. Receives dict of changed objects.
+            Invoked with a dict of changed objects on each notification.
         """
-        self._subscription_callback = callback
+        self._sub_callback = callback
+        self._sub_objects = objects
 
         self._send_request("objects/subscribe", {"objects": objects})
 
-        # Start background thread to handle notifications
-        self._stop_subscription.clear()
-        self._subscription_thread = threading.Thread(
-            target=self._subscription_loop,
-            daemon=True,
+        self._stop_sub.clear()
+        self._sub_thread = threading.Thread(
+            target=self._subscription_loop, daemon=True,
         )
-        self._subscription_thread.start()
+        self._sub_thread.start()
+
+    def unsubscribe(self) -> None:
+        """Stop receiving subscription updates."""
+        self._stop_subscriptions()
+
+    def _resubscribe(self) -> None:
+        """Re-establish subscriptions after a reconnect."""
+        if self._sub_objects is not None and self._sub_callback is not None:
+            logger.info("Re-subscribing to objects after reconnect")
+            self._stop_subscriptions()
+            self.subscribe(self._sub_objects, self._sub_callback)
 
     def _subscription_loop(self) -> None:
-        """Background thread for handling subscription updates."""
-        while not self._stop_subscription.is_set():
+        """Background thread that dispatches subscription notifications."""
+        while not self._stop_sub.is_set():
             try:
-                if self._sock and self._subscription_callback:
-                    # Check for pending messages
-                    self._sock.settimeout(0.1)
-                    try:
-                        chunk = self._sock.recv(4096)
-                        if chunk:
-                            self._recv_buffer += chunk
+                if self._sock is None or self._sub_callback is None:
+                    break
+                self._sock.settimeout(0.1)
+                try:
+                    chunk = self._sock.recv(4096)
+                    if not chunk:
+                        # Server closed -- attempt reconnect
+                        if self.auto_reconnect:
+                            self.reconnect()
+                        break
+                    self._recv_buffer += chunk
 
-                            # Process complete messages
-                            while ETX in self._recv_buffer:
-                                idx = self._recv_buffer.index(ETX)
-                                msg_bytes = self._recv_buffer[:idx]
-                                self._recv_buffer = self._recv_buffer[idx + 1 :]
-
-                                try:
-                                    msg = json.loads(msg_bytes.decode("utf-8"))
-                                    if "method" in msg:
-                                        self._subscription_callback(msg.get("params", {}))
-                                except (json.JSONDecodeError, Exception) as e:
-                                    logger.warning("Subscription parse error: %s", e)
-
-                    except socket.timeout:
-                        pass
-
-            except Exception as e:
-                if not self._stop_subscription.is_set():
-                    logger.error("Subscription loop error: %s", e)
+                    while ETX in self._recv_buffer:
+                        idx = self._recv_buffer.index(ETX)
+                        msg_bytes = self._recv_buffer[:idx]
+                        self._recv_buffer = self._recv_buffer[idx + 1:]
+                        try:
+                            msg = json.loads(msg_bytes.decode("utf-8"))
+                            if "method" in msg:
+                                self._sub_callback(
+                                    msg.get("params", {}),
+                                )
+                        except (json.JSONDecodeError, Exception) as exc:
+                            logger.warning(
+                                "Subscription parse error: %s", exc,
+                            )
+                except socket.timeout:
+                    pass
+            except Exception as exc:  # noqa: BLE001
+                if not self._stop_sub.is_set():
+                    logger.error("Subscription loop error: %s", exc)
                 break
 
     def _stop_subscriptions(self) -> None:
-        """Stop subscription handling."""
-        self._stop_subscription.set()
-        if self._subscription_thread and self._subscription_thread.is_alive():
-            self._subscription_thread.join(timeout=1.0)
-        self._subscription_callback = None
+        self._stop_sub.set()
+        if self._sub_thread is not None and self._sub_thread.is_alive():
+            self._sub_thread.join(timeout=2.0)
+        self._sub_callback = None
 
-    # --- Virtual SD Card (File-Run Mode) ---
+    # ------------------------------------------------------------------
+    # Virtual SD card (file-run mode)
+    # ------------------------------------------------------------------
 
     def start_print(self, filename: str) -> None:
-        """
-        Start printing a file from virtual_sdcard.
-
-        Parameters
-        ----------
-        filename : str
-            Name of G-code file in virtual_sdcard directory.
-        """
+        """Start printing *filename* from the ``virtual_sdcard`` dir."""
         logger.info("Starting print: %s", filename)
         self.send_gcode(f"SDCARD_PRINT_FILE FILENAME={filename}")
 
     def pause_print(self) -> None:
-        """Pause current print."""
+        """Pause the current file print."""
         logger.info("Pausing print")
         self.send_gcode("PAUSE")
 
     def resume_print(self) -> None:
-        """Resume paused print."""
+        """Resume a paused file print."""
         logger.info("Resuming print")
         self.send_gcode("RESUME")
 
     def cancel_print(self) -> None:
-        """Cancel current print."""
+        """Cancel the current file print."""
         logger.info("Cancelling print")
         self.send_gcode("CANCEL_PRINT")
 
     def get_print_progress(self) -> dict[str, Any]:
-        """
-        Query virtual_sdcard print progress.
+        """Query ``virtual_sdcard`` / ``print_stats`` progress.
 
         Returns
         -------
         dict
-            Progress info: is_active, progress, file_position, file_size.
+            Keys: ``is_active``, ``progress`` (0-1), ``state``,
+            ``duration`` (seconds).
         """
         result = self._send_request(
             "objects/query",
             {
                 "objects": {
-                    "virtual_sdcard": ["is_active", "progress", "file_position", "file_size"],
+                    "virtual_sdcard": [
+                        "is_active", "progress",
+                        "file_position", "file_size",
+                    ],
                     "print_stats": ["state", "print_duration"],
-                }
+                },
             },
         )
-        status = result["status"]
+        s = result["status"]
+        vsd = s.get("virtual_sdcard", {})
+        ps = s.get("print_stats", {})
         return {
-            "is_active": status.get("virtual_sdcard", {}).get("is_active", False),
-            "progress": status.get("virtual_sdcard", {}).get("progress", 0.0),
-            "state": status.get("print_stats", {}).get("state", "unknown"),
-            "duration": status.get("print_stats", {}).get("print_duration", 0.0),
+            "is_active": vsd.get("is_active", False),
+            "progress": vsd.get("progress", 0.0),
+            "state": ps.get("state", "unknown"),
+            "duration": ps.get("print_duration", 0.0),
         }
 
-    # --- Context Manager ---
+    # ------------------------------------------------------------------
+    # Context manager
+    # ------------------------------------------------------------------
 
     def __enter__(self) -> KlipperClient:
-        """Connect on context entry."""
         self.connect()
         return self
 
     def __exit__(self, *args: Any) -> None:
-        """Disconnect on context exit."""
         self.disconnect()

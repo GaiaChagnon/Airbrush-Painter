@@ -1,70 +1,126 @@
 # machine.yaml - Hardware configuration for Octopus Pro Painter
 #
-# This file configures the robot control system for the pen/airbrush machine.
-# All dimensions are in millimeters. Feed rates are in mm/min.
+# Single source of truth for machine dimensions, stepper hardware, and tool
+# configuration.  The code reads this file at startup via configs/loader.py.
+# Change values here -- do NOT hardcode them in Python.
+#
+# All linear dimensions are in millimeters.
+# All feed/speed values are in mm/s (converted to mm/min at G-code boundary).
 
-# Klipper API connection
+# --- Klipper API connection ------------------------------------------------
 connection:
-  socket_path: "/tmp/klippy_uds"    # Unix Domain Socket path for Klipper API
-  timeout_s: 5.0                    # Request timeout in seconds
-  reconnect_attempts: 3             # Number of reconnection attempts on failure
+  socket_path: "/tmp/klippy_uds"
+  timeout_s: 5.0
+  reconnect_attempts: 5            # Retries if Octopus was power-cycled
+  reconnect_interval_s: 2.0        # Seconds between reconnect attempts
+  auto_reconnect: true             # Re-establish connection on MCU reset
 
-# Physical work area (machine limits)
+# --- Physical work area (measure your machine) -----------------------------
+# These are the ACTUAL travel limits of each axis in mm.
+# Must match position_max in printer.cfg.
 machine:
   work_area_mm:
-    x: 250.0                        # Maximum X travel
-    y: 350.0                        # Maximum Y travel
-    z: 40.0                         # Maximum Z travel
+    x: 250.0                       # CHANGE to actual X travel
+    y: 350.0                       # CHANGE to actual Y travel
+    z: 40.0                        # CHANGE to actual Z travel
 
-# Canvas position within work area
+# --- Canvas position within work area --------------------------------------
 canvas:
-  offset_x_mm: 25.0                 # Distance from X home to canvas left edge
-  offset_y_mm: 25.0                 # Distance from Y home to canvas bottom edge
-  width_mm: 210.0                   # Canvas width (A4 = 210mm)
-  height_mm: 297.0                  # Canvas height (A4 = 297mm)
-  y_flip: true                      # Flip Y axis (image origin top-left vs machine origin bottom-left)
+  offset_x_mm: 25.0                # Distance from X home to canvas left edge
+  offset_y_mm: 25.0                # Distance from Y home to canvas bottom edge
+  width_mm: 210.0                  # A4 width (or actual canvas)
+  height_mm: 297.0                 # A4 height (or actual canvas)
 
-# Z-axis seesaw states (belt mechanism with pen/airbrush on opposite ends)
+# --- Z-axis seesaw states --------------------------------------------------
 z_states:
-  travel_mm: 10.0                   # Both tools clear of surface
-  pen_work_mm: 20.0                 # Pen contacts paper (seesaw tilted toward pen)
-  airbrush_work_mm: 0.0             # Airbrush at spray height (seesaw tilted toward airbrush)
+  travel_mm: 10.0                  # Both tools clear of paper
+  pen_work_mm: 20.0                # Pen contacts paper
+  airbrush_work_mm: 0.0            # Airbrush at spray height
 
-# Tool definitions
+# --- Tool definitions -------------------------------------------------------
+# All feed rates in mm/s.
 tools:
   pen:
-    xy_offset_mm: [0.0, 0.0]        # XY offset relative to reference point (calibrate with crosshair test)
-    feed_mm_min: 1500               # Drawing speed
-    travel_feed_mm_min: 6000        # Rapid travel speed
-    plunge_feed_mm_min: 300         # Z lowering speed
+    xy_offset_mm: [0.0, 0.0]       # Calibrate with crosshair test
+    feed_mm_s: 25.0                 # Drawing speed
+    travel_feed_mm_s: 80.0          # Rapid speed
+    plunge_feed_mm_s: 5.0           # Z lowering speed
 
   airbrush:
-    xy_offset_mm: [0.0, 0.0]        # Reference tool (offsets are 0)
-    feed_mm_min: 3000               # Drawing/spray speed
-    travel_feed_mm_min: 6000        # Rapid travel speed
-    plunge_feed_mm_min: 300         # Z lowering speed
+    xy_offset_mm: [0.0, 0.0]
+    feed_mm_s: 50.0
+    travel_feed_mm_s: 80.0
+    plunge_feed_mm_s: 5.0
     spray_height_mm: 3.0            # Height above canvas when spraying
 
-# Motion limits (conservative defaults)
+# --- Stepper / driver hardware ---------------------------------------------
+# Documents the physical motor+driver+belt+pulley combination so calibration,
+# motion tests, and printer.cfg generation stay consistent.
+#
+# All XY axes share the same motor/driver/belt/pulley combination.
+# Z may differ -- update z_rotation_distance separately when wired.
+steppers:
+  motor_type: "0.9deg"              # 400 native full steps/rev
+  driver: "DM542TE"
+  driver_pulses_per_rev: 1600       # DIP-switch setting (4x for 0.9deg motor)
+  wiring: "common_anode"            # Octopus drives +, - to GND
+  enable_pin_inverted: false        # common_anode -> enable is NOT inverted
+  step_pulse_duration_s: 0.000005   # 5 us -- required for DM542TE via LS08
+  direction_reversal_pause_s: 0.5   # 500 ms pause between rapid reversals
+
+  # Klipper stepper settings (derived from motor + driver)
+  klipper_microsteps: 4             # 400 x 4 = 1600 = driver_pulses_per_rev
+  xy_rotation_distance: 32.0        # GT2 belt (2 mm pitch) x 16T pulley
+  z_rotation_distance: null          # TBD -- fill in when Z is wired
+
+  # Belt & pulley specs (reference / calibration calculations)
+  belt_type: "GT2"
+  belt_pitch_mm: 2.0
+  pulley_teeth: 16
+  pulley_bore_mm: 5.0
+
+# --- Axis-to-Motor mapping (Octopus Pro V1.0.1 H723) ----------------------
+# Informational -- pin assignments live in printer.cfg.
+# Exists so calibration/test code knows which slots are used.
+axes:
+  y:
+    octopus_slot: "Motor 0"
+    motors: 1
+    endstop_pin: "DIAG0 (PG6)"
+    endstop_type: "NO_to_GND"
+    homing_side: "min"
+  x:
+    octopus_slot: "Motor 2_1 + Motor 2_2"
+    motors: 2                       # Dual motor (stepper_x + stepper_x1)
+    endstop_pin: "DIAG1 (PG9)"
+    endstop_type: "NO_to_GND"
+    homing_side: "min"
+  z:
+    octopus_slot: "TBD"
+    motors: 1
+    endstop_pin: null
+    homing_side: null
+
+# --- Motion limits ----------------------------------------------------------
+# Start conservative; increase after running calibration patterns.
 motion:
-  max_velocity_mm_s: 100.0          # Maximum velocity
-  max_accel_mm_s2: 1000.0           # Maximum acceleration
-  junction_deviation_mm: 0.05       # Junction deviation for path planning
+  max_velocity_mm_s: 80.0           # ~2.5 RPS at rotation_distance=32
+  max_accel_mm_s2: 3000.0           # Conservative start
+  junction_deviation_mm: 0.05
+  homing_speed_mm_s: 30.0
 
-# Interactive mode settings
+# --- Interactive mode settings ----------------------------------------------
 interactive:
-  jog_increments_mm: [0.1, 1.0, 10.0, 50.0]  # Available jog step sizes
-  default_jog_increment_mm: 1.0              # Initial jog step size
-  position_poll_interval_ms: 100             # Position update rate
+  jog_increments_mm: [0.1, 1.0, 10.0, 50.0]
+  default_jog_increment_mm: 1.0
+  position_poll_interval_ms: 100
 
-# File execution settings
+# --- File execution (virtual_sdcard) ----------------------------------------
 file_execution:
-  gcode_directory: "/home/klipper/gcode_files"  # Directory for virtual_sdcard files
+  gcode_directory: "/home/klipper/gcode_files"
 
-# Future: pump configuration (disabled for pen-only operation)
+# --- Future hardware (disabled) ---------------------------------------------
 pumps:
   enabled: false
-
-# Future: servo configuration (disabled for pen-only operation)
 servos:
   enabled: false

@@ -1,46 +1,15 @@
-"""
-Calibration module.
+"""Calibration patterns and guided routines.
 
-Provides test pattern generators and interactive calibration routines for
-machine setup and verification.
+Submodules:
+    patterns    -- Test pattern generators returning Job IR operations
+    routines    -- Interactive calibration sequences
+    measurement -- User input helpers and calculation functions
 """
 
-from robot_control.calibration.patterns import (
-    square,
-    rectangle,
-    cross,
-    grid,
-    circle,
-    ruler_x,
-    ruler_y,
-    crosshair_grid,
-    speed_test,
-    backlash_test,
-    z_touch_pattern,
-)
-from robot_control.calibration.routines import (
-    calibrate_steps_per_mm,
-    calibrate_tool_offset,
-    calibrate_z_seesaw,
-    calibrate_speed,
-    verify_endstops,
-)
+from robot_control.calibration import measurement, patterns, routines
 
 __all__ = [
-    "square",
-    "rectangle",
-    "cross",
-    "grid",
-    "circle",
-    "ruler_x",
-    "ruler_y",
-    "crosshair_grid",
-    "speed_test",
-    "backlash_test",
-    "z_touch_pattern",
-    "calibrate_steps_per_mm",
-    "calibrate_tool_offset",
-    "calibrate_z_seesaw",
-    "calibrate_speed",
-    "verify_endstops",
+    "measurement",
+    "patterns",
+    "routines",
 ]
