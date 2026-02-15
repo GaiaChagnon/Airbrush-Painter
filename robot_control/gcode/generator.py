@@ -20,12 +20,10 @@ Direction reversal:
 from __future__ import annotations
 
 import logging
-import math
 from io import StringIO
-from typing import Literal
-
 from robot_control.configs.loader import MachineConfig
 from robot_control.job_ir.operations import (
+    DrawArc,
     DrawPolyline,
     HomeXY,
     LinearMove,
@@ -188,6 +186,8 @@ class GCodeGenerator:
             self._gen_linear(op, buf)
         elif isinstance(op, DrawPolyline):
             self._gen_polyline(op, buf)
+        elif isinstance(op, DrawArc):
+            self._gen_arc(op, buf)
         else:
             logger.warning("Unsupported operation: %s", type(op).__name__)
 
@@ -260,6 +260,30 @@ class GCodeGenerator:
             mx, my = self._cfg.canvas_to_machine(px, py, self._tool)
             self._validate_xy(mx, my)
             buf.write(f"G1 X{mx:.3f} Y{my:.3f} {_f(feed)}\n")
+
+    def _gen_arc(self, op: DrawArc, buf: StringIO) -> None:
+        """Emit a G2 (CW) or G3 (CCW) arc command.
+
+        I/J offsets are in canvas-relative mm and must be transformed to
+        machine frame.  Because canvas_to_machine includes a Y-flip, the
+        J offset sign is also flipped, and CW/CCW sense reverses.
+        """
+        mx, my = self._cfg.canvas_to_machine(op.x, op.y, self._tool)
+        self._validate_xy(mx, my)
+        tc = self._cfg.get_tool(self._tool)
+        feed = op.feed if op.feed is not None else tc.feed_mm_s
+
+        # Canvas Y is flipped relative to machine Y: J sign inverts,
+        # and clockwise sense swaps.
+        mi = op.i
+        mj = -op.j
+        clockwise = not op.clockwise
+
+        cmd = "G2" if clockwise else "G3"
+        buf.write(
+            f"{cmd} X{mx:.3f} Y{my:.3f} "
+            f"I{mi:.3f} J{mj:.3f} {_f(feed)}\n"
+        )
 
     # ------------------------------------------------------------------
     # Header / footer

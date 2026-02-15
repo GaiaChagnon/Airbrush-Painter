@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from robot_control.job_ir.operations import (
+    DrawArc,
     DrawPolyline,
     HomeXY,
     LinearMove,
@@ -73,6 +74,23 @@ class TestOperationDataclasses:
     def test_draw_polyline_too_few_points(self) -> None:
         with pytest.raises(ValueError, match=">=\\s*2 points"):
             DrawPolyline(points=((0.0, 0.0),))
+
+    def test_draw_arc_clockwise(self) -> None:
+        op = DrawArc(x=10.0, y=0.0, i=5.0, j=0.0, clockwise=True)
+        assert op.clockwise is True
+        assert op.x == 10.0
+        assert op.i == 5.0
+        assert op.feed is None
+
+    def test_draw_arc_ccw_with_feed(self) -> None:
+        op = DrawArc(x=0.0, y=10.0, i=0.0, j=5.0, clockwise=False, feed=30.0)
+        assert op.clockwise is False
+        assert op.feed == 30.0
+
+    def test_draw_arc_frozen(self) -> None:
+        op = DrawArc(x=1.0, y=2.0, i=3.0, j=4.0)
+        with pytest.raises(AttributeError):
+            op.x = 99.0  # type: ignore[misc]
 
     def test_frozen(self) -> None:
         op = RapidXY(x=1.0, y=2.0)

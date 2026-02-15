@@ -299,6 +299,13 @@ def verify_endstops(
 ) -> dict[str, Any]:
     """Home, jog away, re-home, verify positions match.
 
+    Uses ``G28 X Y`` which works under cartesian kinematics.  Under the
+    current config, X homes to 0 (endstop at min) and Y homes to
+    ``work_area.y`` (endstop at max, ``homing_positive_dir: True``).
+
+    Endstop keys in the Klipper object model are ``stepper_x`` and
+    ``stepper_y`` (not ``manual_stepper`` names).
+
     Returns
     -------
     dict

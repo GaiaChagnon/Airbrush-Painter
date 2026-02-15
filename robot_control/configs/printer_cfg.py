@@ -1,0 +1,264 @@
+"""Generate a Klipper ``printer.cfg`` from a validated MachineConfig.
+
+The generated config uses ``kinematics: cartesian`` with native dual-X
+support via ``[stepper_x]`` + ``[stepper_x1]``.  Klipper's
+``LookupMultiRail`` automatically finds ``[stepper_x1]`` and adds it
+to the same rail as ``[stepper_x]``.  Both motors move together for
+ALL operations (G1, G28, FORCE_MOVE) without any sync commands.
+
+The Z axis drives a seesaw belt with effectors on both sides.  It has
+a physical limit switch (DIAG2 / PG10) and homes to position 80
+(``homing_side: max``).  Total mechanical travel is 80 mm.
+
+Sections generated:
+
+- ``[mcu]``                -- MCU serial path
+- ``[printer]``            -- cartesian kinematics and motion limits
+- ``[force_move]``         -- enables FORCE_MOVE for per-stepper tests
+- ``[gcode_arcs]``         -- enables G2/G3 arcs for smooth circles
+- ``[stepper_x]``          -- primary X motor (endstop owner)
+- ``[stepper_x1]``         -- secondary X motor (auto-synced to X rail)
+- ``[stepper_y]``          -- Y motor
+- ``[stepper_z]``          -- Z seesaw motor (physical endstop at min)
+
+Usage::
+
+    from robot_control.configs.loader import load_config
+    from robot_control.configs.printer_cfg import generate_printer_cfg
+
+    cfg = load_config()
+    printer_cfg_text = generate_printer_cfg(cfg)
+    Path("~/printer.cfg").expanduser().write_text(printer_cfg_text)
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from robot_control.configs.loader import AxisConfig, MachineConfig
+
+logger = logging.getLogger(__name__)
+
+# Arc interpolation resolution for [gcode_arcs] in mm.
+_ARC_RESOLUTION_MM = 0.5
+
+
+def _fmt_pulse_duration(seconds: float) -> str:
+    """Format step_pulse_duration as a fixed-point decimal string.
+
+    Klipper parses this value as a float.  Python's default repr for
+    very small floats uses scientific notation (``5e-06``), which
+    Klipper accepts but is hard to read in config files.  This helper
+    always produces ``0.000005`` style output.
+    """
+    return f"{seconds:.6f}"
+
+
+def _stepper_common(
+    cfg: MachineConfig,
+    rotation_distance: float | None = None,
+) -> str:
+    """Return the stepper parameter lines shared by all axes.
+
+    Parameters
+    ----------
+    rotation_distance : float | None
+        Override rotation_distance.  ``None`` uses
+        ``steppers.xy_rotation_distance``.
+    """
+    s = cfg.steppers
+    rot_dist = rotation_distance if rotation_distance is not None else s.xy_rotation_distance
+    return (
+        f"microsteps: {s.klipper_microsteps}\n"
+        f"full_steps_per_rotation: {s.full_steps_per_rotation}\n"
+        f"rotation_distance: {rot_dist}\n"
+        f"step_pulse_duration: {_fmt_pulse_duration(s.step_pulse_duration_s)}"
+    )
+
+
+def _endstop_pin_str(axis: AxisConfig) -> str:
+    """Build the full endstop pin string with polarity prefix.
+
+    Combines ``endstop_polarity`` (e.g. ``"^!"``) with the bare pin
+    name (e.g. ``"PG6"``) to produce ``"^!PG6"``.
+    """
+    polarity = axis.endstop_polarity or ""
+    return f"{polarity}{axis.endstop_pin}"
+
+
+def generate_printer_cfg(config: MachineConfig) -> str:
+    """Generate a complete Klipper printer.cfg from MachineConfig.
+
+    Parameters
+    ----------
+    config : MachineConfig
+        Validated machine configuration loaded from ``machine.yaml``.
+
+    Returns
+    -------
+    str
+        Full ``printer.cfg`` contents ready to write to disk.
+
+    Raises
+    ------
+    ValueError
+        If axis configuration is inconsistent (missing pins, wrong
+        motor counts for dual-X, etc.).
+    """
+    s = config.steppers
+    m = config.motion
+    wa = config.work_area
+    common = _stepper_common(config)
+
+    x_axis = config.axes.get("x")
+    y_axis = config.axes.get("y")
+    z_axis = config.axes.get("z")
+
+    if x_axis is None or y_axis is None or z_axis is None:
+        raise ValueError(
+            "MachineConfig must define 'x', 'y', and 'z' axes.  "
+            f"Found: {list(config.axes.keys())}"
+        )
+    if x_axis.motors != 2 or len(x_axis.pins) != 2:
+        raise ValueError(
+            f"X axis must have 2 motors for dual-X gantry, "
+            f"got {x_axis.motors} motor(s) / {len(x_axis.pins)} pin group(s)"
+        )
+
+    x_primary = x_axis.pins[0]
+    x_secondary = x_axis.pins[1]
+    y_pins = y_axis.pins[0]
+    z_pins = z_axis.pins[0]
+
+    # Y homing direction
+    y_homes_positive = y_axis.homing_side == "max"
+    y_endstop_pos = wa.y if y_homes_positive else 0.0
+
+    # Z homing direction
+    z_homes_positive = z_axis.homing_side == "max"
+    z_endstop_pos = wa.z if z_homes_positive else 0.0
+
+    lines: list[str] = []
+
+    # -- Header -------------------------------------------------------------
+    lines.append(
+        "# === AUTO-GENERATED PRINTER.CFG ===\n"
+        "# Generated by robot_control.configs.printer_cfg\n"
+        "#\n"
+        "# Cartesian kinematics with dual-X via [stepper_x1].\n"
+        f"# {s.motor_type} motor, {s.driver}, "
+        f"{s.klipper_microsteps} microsteps, "
+        f"{s.xy_rotation_distance} mm/rev\n"
+        f"# step_pulse_duration "
+        f"{_fmt_pulse_duration(s.step_pulse_duration_s)}"
+        f" -- MANDATORY for {s.driver}\n"
+    )
+
+    # -- [mcu] --------------------------------------------------------------
+    serial = config.connection.mcu_serial
+    if not serial:
+        raise ValueError(
+            "connection.mcu_serial must be set in machine.yaml "
+            "for printer.cfg generation"
+        )
+    lines.append(
+        f"[mcu]\n"
+        f"serial: {serial}\n"
+    )
+
+    # -- [printer] ----------------------------------------------------------
+    lines.append(
+        f"[printer]\n"
+        f"kinematics: cartesian\n"
+        f"max_velocity: {m.max_velocity_mm_s:.0f}\n"
+        f"max_accel: {m.max_accel_mm_s2:.0f}\n"
+        f"max_z_velocity: {m.max_velocity_mm_s:.0f}\n"
+        f"max_z_accel: {m.max_accel_mm_s2:.0f}\n"
+        f"square_corner_velocity: {m.square_corner_velocity_mm_s}\n"
+    )
+
+    # -- [force_move] -------------------------------------------------------
+    lines.append(
+        "[force_move]\n"
+        "enable_force_move: True\n"
+    )
+
+    # -- [gcode_arcs] -------------------------------------------------------
+    lines.append(
+        "[gcode_arcs]\n"
+        f"resolution: {_ARC_RESOLUTION_MM}\n"
+    )
+
+    # -- [stepper_x] -- primary X motor ------------------------------------
+    lines.append(
+        f"# --- X axis primary ({x_axis.octopus_slot.split('+')[0].strip()}) ---\n"
+        f"[stepper_x]\n"
+        f"step_pin: {x_primary.step}\n"
+        f"dir_pin: {x_primary.dir}\n"
+        f"enable_pin: {x_primary.enable}\n"
+        f"{common}\n"
+        f"endstop_pin: {_endstop_pin_str(x_axis)}\n"
+        f"position_endstop: 0\n"
+        f"position_min: 0\n"
+        f"position_max: {wa.x:.0f}\n"
+        f"homing_speed: {m.homing_speed_mm_s}\n"
+    )
+
+    # -- [stepper_x1] -- secondary X motor (auto-synced to X rail) ---------
+    lines.append(
+        f"# --- X axis secondary (auto-synced to stepper_x rail) ---\n"
+        f"[stepper_x1]\n"
+        f"step_pin: {x_secondary.step}\n"
+        f"dir_pin: {x_secondary.dir}\n"
+        f"enable_pin: {x_secondary.enable}\n"
+        f"{common}\n"
+    )
+
+    # -- [stepper_y] -------------------------------------------------------
+    y_homing_dir_line = (
+        "homing_positive_dir: True\n"
+        if y_homes_positive else ""
+    )
+    lines.append(
+        f"# --- Y axis ---\n"
+        f"[stepper_y]\n"
+        f"step_pin: {y_pins.step}\n"
+        f"dir_pin: {y_pins.dir}\n"
+        f"enable_pin: {y_pins.enable}\n"
+        f"{common}\n"
+        f"endstop_pin: {_endstop_pin_str(y_axis)}\n"
+        f"position_endstop: {y_endstop_pos:.0f}\n"
+        f"position_min: 0\n"
+        f"position_max: {wa.y:.0f}\n"
+        f"homing_speed: {m.homing_speed_mm_s}\n"
+        f"{y_homing_dir_line}"
+    )
+
+    # -- [stepper_z] -- seesaw belt axis ------------------------------------
+    # Klipper requires position_endstop inside [position_min, position_max],
+    # so position_max = wa.z (80).  The tighter 5..75 mm soft limits are
+    # enforced in the test script (Z_MIN_SAFE / Z_MAX_SAFE).
+    z_common = _stepper_common(config, s.z_rotation_distance)
+    z_homing_dir_line = (
+        "homing_positive_dir: True\n"
+        if z_homes_positive else ""
+    )
+    lines.append(
+        f"# --- Z axis (seesaw belt, physical endstop at "
+        f"{'max' if z_homes_positive else 'min'}) ---\n"
+        f"[stepper_z]\n"
+        f"step_pin: {z_pins.step}\n"
+        f"dir_pin: {z_pins.dir}\n"
+        f"enable_pin: {z_pins.enable}\n"
+        f"{z_common}\n"
+        f"endstop_pin: {_endstop_pin_str(z_axis)}\n"
+        f"position_endstop: {z_endstop_pos:.0f}\n"
+        f"position_min: 0\n"
+        f"position_max: {wa.z:.0f}\n"
+        f"homing_speed: {m.z_homing_speed_mm_s}\n"
+        f"{z_homing_dir_line}"
+    )
+
+    return "\n".join(lines)

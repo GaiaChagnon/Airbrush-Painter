@@ -4,6 +4,7 @@ All operations are frozen dataclasses with canvas-relative mm coordinates.
 """
 
 from robot_control.job_ir.operations import (
+    DrawArc,
     DrawPolyline,
     HomeXY,
     Job,
@@ -24,6 +25,7 @@ from robot_control.job_ir.operations import (
 )
 
 __all__ = [
+    "DrawArc",
     "DrawPolyline",
     "HomeXY",
     "Job",

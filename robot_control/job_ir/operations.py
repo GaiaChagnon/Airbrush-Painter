@@ -139,6 +139,35 @@ class DrawPolyline(Operation):
             )
 
 
+@dataclass(frozen=True, slots=True)
+class DrawArc(Operation):
+    """Circular arc at draw speed (G2/G3).
+
+    Uses the centre-offset (I/J) form.  The arc is drawn from the
+    current position to ``(x, y)`` with the centre of curvature at
+    ``(current + i, current + j)``.
+
+    Parameters
+    ----------
+    x, y : float
+        End-point in canvas mm.
+    i, j : float
+        Offset from the current position to the arc centre, in mm.
+        Signs matter: positive I is +X, positive J is +Y.
+    clockwise : bool
+        ``True`` for G2 (clockwise), ``False`` for G3 (counter-clockwise).
+    feed : float | None
+        Override feed rate (mm/s).  ``None`` uses the active tool default.
+    """
+
+    x: float
+    y: float
+    i: float
+    j: float
+    clockwise: bool = True
+    feed: float | None = None
+
+
 # ---------------------------------------------------------------------------
 # Tool operations
 # ---------------------------------------------------------------------------

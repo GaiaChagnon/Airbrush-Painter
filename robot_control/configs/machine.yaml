@@ -6,6 +6,8 @@
 #
 # All linear dimensions are in millimeters.
 # All feed/speed values are in mm/s (converted to mm/min at G-code boundary).
+#
+# Values validated against hardware bring-up (test_motors.py, 2026-02-12).
 
 # --- Klipper API connection ------------------------------------------------
 connection:
@@ -14,22 +16,24 @@ connection:
   reconnect_attempts: 5            # Retries if Octopus was power-cycled
   reconnect_interval_s: 2.0        # Seconds between reconnect attempts
   auto_reconnect: true             # Re-establish connection on MCU reset
+  mcu_serial: "/dev/serial/by-id/usb-Klipper_stm32h723xx_130028001051313234353230-if00"
 
 # --- Physical work area (measure your machine) -----------------------------
 # These are the ACTUAL travel limits of each axis in mm.
 # Must match position_max in printer.cfg.
+# Conservative 200x200 validated during bring-up; increase once measured.
 machine:
   work_area_mm:
-    x: 250.0                       # CHANGE to actual X travel
-    y: 350.0                       # CHANGE to actual Y travel
-    z: 40.0                        # CHANGE to actual Z travel
+    x: 200.0                       # Validated during bring-up
+    y: 200.0                       # Validated during bring-up
+    z: 80.0                        # Seesaw belt: 80 mm total, 1 mm buffer each side
 
 # --- Canvas position within work area --------------------------------------
 canvas:
-  offset_x_mm: 25.0                # Distance from X home to canvas left edge
-  offset_y_mm: 25.0                # Distance from Y home to canvas bottom edge
-  width_mm: 210.0                  # A4 width (or actual canvas)
-  height_mm: 297.0                 # A4 height (or actual canvas)
+  offset_x_mm: 10.0                # Distance from X home to canvas left edge
+  offset_y_mm: 10.0                # Distance from Y home to canvas bottom edge
+  width_mm: 180.0                  # Fits within 200mm work area with margins
+  height_mm: 180.0                 # Fits within 200mm work area with margins
 
 # --- Z-axis seesaw states --------------------------------------------------
 z_states:
@@ -61,17 +65,20 @@ tools:
 # Z may differ -- update z_rotation_distance separately when wired.
 steppers:
   motor_type: "0.9deg"              # 400 native full steps/rev
+  full_steps_per_rotation: 400      # 0.9deg motor = 400 full steps
   driver: "DM542TE"
-  driver_pulses_per_rev: 1600       # DIP-switch setting (4x for 0.9deg motor)
+  driver_pulses_per_rev: 6400       # DIP-switch setting (16x for 0.9deg motor)
   wiring: "common_anode"            # Octopus drives +, - to GND
   enable_pin_inverted: false        # common_anode -> enable is NOT inverted
   step_pulse_duration_s: 0.000005   # 5 us -- required for DM542TE via LS08
   direction_reversal_pause_s: 0.5   # 500 ms pause between rapid reversals
 
   # Klipper stepper settings (derived from motor + driver)
-  klipper_microsteps: 4             # 400 x 4 = 1600 = driver_pulses_per_rev
+  # Validation: full_steps_per_rotation * klipper_microsteps == driver_pulses_per_rev
+  #             400 * 16 = 6400
+  klipper_microsteps: 16            # 400 x 16 = 6400 = driver_pulses_per_rev
   xy_rotation_distance: 32.0        # GT2 belt (2 mm pitch) x 16T pulley
-  z_rotation_distance: null          # TBD -- fill in when Z is wired
+  z_rotation_distance: 64.0          # 2x XY -- Z motor or belt ratio differs
 
   # Belt & pulley specs (reference / calibration calculations)
   belt_type: "GT2"
@@ -80,34 +87,61 @@ steppers:
   pulley_bore_mm: 5.0
 
 # --- Axis-to-Motor mapping (Octopus Pro V1.0.1 H723) ----------------------
-# Informational -- pin assignments live in printer.cfg.
-# Exists so calibration/test code knows which slots are used.
+# Pin assignments validated during hardware bring-up (test_motors.py).
+# Used by printer.cfg generator and calibration routines.
+#
+# Klipper config mapping:
+#   [stepper_x]  = x.pins[0] (primary)
+#   [stepper_x1] = x.pins[1] (secondary, auto-synced via LookupMultiRail)
+#   [stepper_y]  = y.pins
+#   [stepper_z]  = z.pins (dummy, not physically homed)
 axes:
   y:
     octopus_slot: "Motor 0"
     motors: 1
-    endstop_pin: "DIAG0 (PG6)"
+    pins:
+      step: "PF13"
+      dir: "PF12"
+      enable: "PF14"
+    endstop_pin: "PG9"              # STOP_1
+    endstop_polarity: "^!"          # pull-up + inverted (NO switch to GND)
     endstop_type: "NO_to_GND"
-    homing_side: "min"
+    homing_side: "max"              # Endstop at positive end (position 200)
   x:
     octopus_slot: "Motor 2_1 + Motor 2_2"
     motors: 2                       # Dual motor (stepper_x + stepper_x1)
-    endstop_pin: "DIAG1 (PG9)"
+    pins:
+      - step: "PF11"
+        dir: "PG3"
+        enable: "PG5"
+      - step: "PG4"
+        dir: "!PC1"                 # Inverted -- motors face each other
+        enable: "PA0"
+    endstop_pin: "PG6"              # STOP_0
+    endstop_polarity: "^!"          # pull-up + inverted (NO switch to GND)
     endstop_type: "NO_to_GND"
-    homing_side: "min"
+    homing_side: "min"              # Endstop at 0
   z:
-    octopus_slot: "TBD"
+    octopus_slot: "Motor 1"         # DRIVER_1 slot
     motors: 1
-    endstop_pin: null
-    homing_side: null
+    pins:
+      step: "PG0"
+      dir: "PG1"
+      enable: "PF15"
+    endstop_pin: "PG10"             # DIAG2 / STOP_2 position -- physical limit switch
+    endstop_polarity: "^!"          # pull-up + inverted (NO switch to GND)
+    endstop_type: "NO_to_GND"
+    homing_side: "max"              # Endstop at position 80 (far end of seesaw belt)
 
 # --- Motion limits ----------------------------------------------------------
-# Start conservative; increase after running calibration patterns.
+# Validated during hardware bring-up speed ramp tests (2026-02-12).
 motion:
-  max_velocity_mm_s: 80.0           # ~2.5 RPS at rotation_distance=32
-  max_accel_mm_s2: 3000.0           # Conservative start
+  max_velocity_mm_s: 200.0          # Tested up to 190 mm/s smoothly
+  max_accel_mm_s2: 1500.0           # Higher causes vibration on belt gantry
+  square_corner_velocity_mm_s: 8.0  # Smooth segment transitions
+  homing_speed_mm_s: 16.0           # ~0.5 RPS, conservative for endstop approach
+  z_homing_speed_mm_s: 10.0         # Slower than XY (16) but not crawling; switch has less play
   junction_deviation_mm: 0.05
-  homing_speed_mm_s: 30.0
 
 # --- Interactive mode settings ----------------------------------------------
 interactive:

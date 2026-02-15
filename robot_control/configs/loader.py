@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +52,7 @@ class ConnectionConfig:
     reconnect_attempts: int
     reconnect_interval_s: float
     auto_reconnect: bool
+    mcu_serial: str = ""
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,7 @@ class SteppersConfig:
     """Stepper / driver / belt / pulley hardware spec."""
 
     motor_type: str
+    full_steps_per_rotation: int
     driver: str
     driver_pulses_per_rev: int
     wiring: str
@@ -116,12 +118,28 @@ class SteppersConfig:
 
 
 @dataclass(frozen=True)
+class PinConfig:
+    """Step/dir/enable pin assignment for one stepper."""
+
+    step: str
+    dir: str
+    enable: str
+
+
+@dataclass(frozen=True)
 class AxisConfig:
-    """Single-axis hardware mapping (informational)."""
+    """Single-axis hardware mapping with pin assignments.
+
+    For a dual-motor axis (e.g. X), ``pins`` is a tuple of two
+    ``PinConfig`` objects.  For a single-motor axis, it is a tuple
+    of one.
+    """
 
     octopus_slot: str
     motors: int
+    pins: tuple[PinConfig, ...]
     endstop_pin: str | None
+    endstop_polarity: str | None
     endstop_type: str | None
     homing_side: str | None
 
@@ -132,8 +150,10 @@ class MotionConfig:
 
     max_velocity_mm_s: float
     max_accel_mm_s2: float
-    junction_deviation_mm: float
+    square_corner_velocity_mm_s: float
     homing_speed_mm_s: float
+    z_homing_speed_mm_s: float
+    junction_deviation_mm: float
 
 
 @dataclass(frozen=True)
@@ -253,6 +273,7 @@ def _parse_steppers(data: dict[str, Any]) -> SteppersConfig:
     """Parse the ``steppers`` section."""
     return SteppersConfig(
         motor_type=str(data["motor_type"]),
+        full_steps_per_rotation=int(data["full_steps_per_rotation"]),
         driver=str(data["driver"]),
         driver_pulses_per_rev=int(data["driver_pulses_per_rev"]),
         wiring=str(data["wiring"]),
@@ -273,12 +294,40 @@ def _parse_steppers(data: dict[str, Any]) -> SteppersConfig:
     )
 
 
+def _parse_pins(raw: Any) -> tuple[PinConfig, ...]:
+    """Parse axis pin assignments.
+
+    Accepts a single dict (one motor) or a list of dicts (dual motor).
+    """
+    if isinstance(raw, dict):
+        return (PinConfig(
+            step=str(raw["step"]),
+            dir=str(raw["dir"]),
+            enable=str(raw["enable"]),
+        ),)
+    if isinstance(raw, list):
+        return tuple(
+            PinConfig(
+                step=str(p["step"]),
+                dir=str(p["dir"]),
+                enable=str(p["enable"]),
+            )
+            for p in raw
+        )
+    raise ConfigError(f"axis pins must be a dict or list, got {type(raw)}")
+
+
 def _parse_axis(name: str, data: dict[str, Any]) -> AxisConfig:
     """Parse a single axis entry from the ``axes`` section."""
+    raw_pins = data.get("pins")
+    if raw_pins is None:
+        raise ConfigError(f"Axis '{name}' is missing 'pins' field")
     return AxisConfig(
         octopus_slot=str(data["octopus_slot"]),
         motors=int(data["motors"]),
+        pins=_parse_pins(raw_pins),
         endstop_pin=data.get("endstop_pin"),
+        endstop_polarity=data.get("endstop_polarity"),
         endstop_type=data.get("endstop_type"),
         homing_side=data.get("homing_side"),
     )
@@ -345,12 +394,13 @@ def _validate_config(cfg: MachineConfig) -> None:
             f"jog_increments_mm {cfg.interactive.jog_increments_mm}"
         )
 
-    # -- Stepper sanity: microsteps * 400 == driver_pulses_per_rev ----------
+    # -- Stepper sanity: microsteps * full_steps == driver_pulses_per_rev ---
     s = cfg.steppers
-    expected_pulses = s.klipper_microsteps * 400
+    expected_pulses = s.klipper_microsteps * s.full_steps_per_rotation
     if expected_pulses != s.driver_pulses_per_rev:
         raise ConfigError(
-            f"klipper_microsteps ({s.klipper_microsteps}) * 400 = "
+            f"klipper_microsteps ({s.klipper_microsteps}) * "
+            f"full_steps_per_rotation ({s.full_steps_per_rotation}) = "
             f"{expected_pulses}, but driver_pulses_per_rev = "
             f"{s.driver_pulses_per_rev}. These must match."
         )
@@ -389,6 +439,14 @@ def _validate_config(cfg: MachineConfig) -> None:
         raise ConfigError(
             f"reconnect_interval_s must be >= 0, got {c.reconnect_interval_s}"
         )
+
+    # -- Axis pin counts match motor counts ---------------------------------
+    for axis_name, axis in cfg.axes.items():
+        if len(axis.pins) != axis.motors:
+            raise ConfigError(
+                f"Axis '{axis_name}' declares {axis.motors} motor(s) "
+                f"but has {len(axis.pins)} pin group(s)"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +498,7 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
             reconnect_attempts=int(conn_data["reconnect_attempts"]),
             reconnect_interval_s=float(conn_data["reconnect_interval_s"]),
             auto_reconnect=bool(conn_data.get("auto_reconnect", True)),
+            mcu_serial=str(conn_data.get("mcu_serial", "")),
         )
 
         # -- work area ------------------------------------------------------
@@ -485,8 +544,14 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
         motion = MotionConfig(
             max_velocity_mm_s=float(md["max_velocity_mm_s"]),
             max_accel_mm_s2=float(md["max_accel_mm_s2"]),
-            junction_deviation_mm=float(md["junction_deviation_mm"]),
+            square_corner_velocity_mm_s=float(
+                md["square_corner_velocity_mm_s"]
+            ),
             homing_speed_mm_s=float(md["homing_speed_mm_s"]),
+            z_homing_speed_mm_s=float(
+                md.get("z_homing_speed_mm_s", md["homing_speed_mm_s"])
+            ),
+            junction_deviation_mm=float(md["junction_deviation_mm"]),
         )
 
         # -- interactive ----------------------------------------------------

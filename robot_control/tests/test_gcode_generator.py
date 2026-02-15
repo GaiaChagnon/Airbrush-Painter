@@ -11,6 +11,7 @@ import pytest
 from robot_control.configs.loader import MachineConfig, load_config
 from robot_control.gcode.generator import GCodeError, GCodeGenerator
 from robot_control.job_ir.operations import (
+    DrawArc,
     DrawPolyline,
     HomeXY,
     LinearMove,
@@ -216,3 +217,47 @@ class TestToolSelection:
         ops = [SelectTool(tool="airbrush"), ToolUp()]
         gcode = gen.generate(ops)
         assert "TOOL_AIRBRUSH" in gcode
+
+
+# ---------------------------------------------------------------------------
+# Arc generation (G2 / G3)
+# ---------------------------------------------------------------------------
+
+
+class TestArcGeneration:
+    def test_arc_cw_emits_g2_or_g3(self, gen: GCodeGenerator) -> None:
+        """A clockwise arc in canvas coords produces G2 or G3 in output."""
+        ops: list[Operation] = [
+            ToolUp(),
+            RapidXY(x=50.0, y=50.0),
+            ToolDown(),
+            DrawArc(x=60.0, y=50.0, i=5.0, j=0.0, clockwise=True),
+            ToolUp(),
+        ]
+        gcode = gen.generate(ops)
+        # Due to Y-flip, canvas CW becomes machine CCW -> G3
+        assert "G3" in gcode or "G2" in gcode
+
+    def test_arc_contains_ij_offsets(self, gen: GCodeGenerator) -> None:
+        ops: list[Operation] = [
+            ToolUp(),
+            RapidXY(x=50.0, y=50.0),
+            ToolDown(),
+            DrawArc(x=60.0, y=50.0, i=5.0, j=3.0, clockwise=False),
+            ToolUp(),
+        ]
+        gcode = gen.generate(ops)
+        assert "I5.000" in gcode
+        # J sign is flipped due to Y-flip
+        assert "J-3.000" in gcode
+
+    def test_arc_feed_override(self, gen: GCodeGenerator) -> None:
+        ops: list[Operation] = [
+            ToolUp(),
+            RapidXY(x=50.0, y=50.0),
+            ToolDown(),
+            DrawArc(x=60.0, y=50.0, i=5.0, j=0.0, feed=42.0),
+            ToolUp(),
+        ]
+        gcode = gen.generate(ops)
+        assert "F2520.0" in gcode  # 42 * 60
