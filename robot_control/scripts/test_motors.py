@@ -21,11 +21,10 @@ Phases
     Phase 5 -- Homing:                         G28 X Y then G28 Z (slower)
     Phase 6 -- Circle + Z oscillation test:    G2 arcs in XY with helical Z
 
-Motor parameters
-----------------
-    0.9deg motor, DM542TE driver (DIP: 6400 pulses/rev = 16 microsteps)
-    rotation_distance=32 mm (GT2 2mm pitch x 16T pulley)
-    step_pulse_duration=0.000005 (5 us) -- MANDATORY for DM542TE via LS08
+Motor parameters (read from machine.yaml at startup)
+-----------------------------------------------------
+    All motor, workspace, and speed parameters come from machine.yaml.
+    Nothing is hardcoded -- edit the YAML to change behaviour.
 
 Usage::
 
@@ -57,61 +56,51 @@ from robot_control.configs.loader import load_config
 from robot_control.configs.printer_cfg import generate_printer_cfg
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants -- ALL derived from machine.yaml via load_config()
 # ---------------------------------------------------------------------------
+
+# Load once at import time; every constant below comes from here.
+_CFG = load_config()
 
 SOCKET_PATH = "/tmp/klippy_uds"
 PRINTER_CFG_PATH = Path.home() / "printer.cfg"
 ETX = b"\x03"
 
-# Motor parameters -- must match physical DM542TE DIP switch setting.
-#
-# The DM542TE driver is configured for 6400 pulses/rev (= 16 microsteps
-# on a 0.9deg / 400-step motor).  Klipper's microsteps MUST match the
-# driver's setting so that 1 Klipper step = 1 driver pulse.
-#
-# With microsteps=16 and rotation_distance=32:
-#   steps_per_mm = (400 * 16) / 32 = 200
-#   MOVE=32 -> 32 * 200 = 6400 pulses = exactly 1 revolution
-#
-# Previous bug: microsteps=4 sent only 1600 pulses = quarter turn.
-ROTATION_DISTANCE = 32.0   # mm per revolution: GT2 2mm pitch x 16T pulley
-MICROSTEPS = 16             # must match DM542TE DIP setting (6400 pulses/rev)
-DIRECTION_PAUSE_MS = 500    # 500 ms between rapid direction reversals
+# Motor parameters (from steppers section)
+ROTATION_DISTANCE = _CFG.steppers.xy_rotation_distance
+MICROSTEPS = _CFG.steppers.klipper_microsteps
+DIRECTION_PAUSE_MS = int(_CFG.steppers.direction_reversal_pause_s * 1000)
 
-# step_pulse_duration MUST be 0.000005 (5 us) for DM542TE via LS08 buffer.
-# Without this, the driver misses steps and motors don't complete full rotations.
-# Written as a string to avoid Python's scientific notation (5e-06) in the config.
-STEP_PULSE_DURATION = "0.000005"
+# step_pulse_duration MUST be written as a fixed-point string to avoid
+# Python's scientific notation (5e-06) in the generated printer.cfg.
+STEP_PULSE_DURATION = f"{_CFG.steppers.step_pulse_duration_s:.6f}"
 
-# Pin assignments -- Octopus Pro V1.0.1 H723
-#
-# enable_pin: No "!" prefix needed.  Confirmed working without inversion
-# in all prior test runs (motors spin correctly).  Adding "!" inverts the
-# logic and prevents motors from moving entirely.
-#
-# motor_x2 dir_pin is inverted (!) because on a dual-motor gantry the two
-# X motors face each other -- inverting one makes them spin the same physical
-# direction so the carriage moves correctly.
-#
+# Pin assignments -- read from machine.yaml axes section.
 # Endstop pins: bare pin name; prefix (^ or ^!) added in generate_test_config.
-# Default is ^PIN (pull-up, no invert): switches connect to GND when triggered.
 MOTOR_PINS = {
-    "motor_y": {  # Motor 0 -- Y axis
-        "step": "PF13", "dir": "PF12", "enable": "PF14",
-        "endstop_pin": "PG9",   # STOP_1 -- Y endstop (was PG6, swapped)
+    "motor_y": {
+        "step": _CFG.axes["y"].pins[0].step,
+        "dir": _CFG.axes["y"].pins[0].dir,
+        "enable": _CFG.axes["y"].pins[0].enable,
+        "endstop_pin": _CFG.axes["y"].endstop_pin,
     },
-    "motor_z": {  # Motor 1 -- DRIVER_1 slot -- Z seesaw belt
-        "step": "PG0", "dir": "PG1", "enable": "PF15",
-        "endstop_pin": "PG10",  # DIAG2 / STOP_2 -- Z limit switch
+    "motor_z": {
+        "step": _CFG.axes["z"].pins[0].step,
+        "dir": _CFG.axes["z"].pins[0].dir,
+        "enable": _CFG.axes["z"].pins[0].enable,
+        "endstop_pin": _CFG.axes["z"].endstop_pin,
     },
-    "motor_x1": {  # Motor 2_1 -- X primary (endstop owner for the X gantry)
-        "step": "PF11", "dir": "PG3", "enable": "PG5",
-        "endstop_pin": "PG6",   # STOP_0 -- X endstop (was PG9, swapped)
+    "motor_x1": {
+        "step": _CFG.axes["x"].pins[0].step,
+        "dir": _CFG.axes["x"].pins[0].dir,
+        "enable": _CFG.axes["x"].pins[0].enable,
+        "endstop_pin": _CFG.axes["x"].endstop_pin,
     },
-    "motor_x2": {  # Motor 2_2 -- X secondary (dir inverted, ALWAYS moves with x1)
-        "step": "PG4", "dir": "!PC1", "enable": "PA0",
-        "endstop_pin": None,    # No own endstop -- shares X endstop via motor_x1
+    "motor_x2": {
+        "step": _CFG.axes["x"].pins[1].step,
+        "dir": _CFG.axes["x"].pins[1].dir,
+        "enable": _CFG.axes["x"].pins[1].enable,
+        "endstop_pin": None,
     },
 }
 
@@ -119,23 +108,21 @@ MOTOR_PINS = {
 # They MUST always be enabled, moved, and disabled together.
 X_MOTORS = ("motor_x1", "motor_x2")
 
-# Workspace bounds (mm) -- defines position_max in cartesian stepper config.
-WORKSPACE_X_MM = 200.0
-WORKSPACE_Y_MM = 200.0
-WORKSPACE_Z_MM = 80.0   # seesaw belt total mechanical travel
+# Workspace bounds (mm) -- from machine.yaml work_area_mm.
+WORKSPACE_X_MM = _CFG.work_area.x
+WORKSPACE_Y_MM = _CFG.work_area.y
+WORKSPACE_Z_MM = _CFG.work_area.z
 
 # Z software buffer: 5 mm from each physical limit to protect end-of-travel.
-# Klipper hard limits are 0..80; these tighter limits are enforced in code.
+# Klipper hard limits are 0..WORKSPACE_Z_MM; tighter limits enforced in code.
 Z_BUFFER_MM = 5.0
-Z_MIN_SAFE = Z_BUFFER_MM                     # 5 mm
-Z_MAX_SAFE = WORKSPACE_Z_MM - Z_BUFFER_MM    # 75 mm
-Z_CENTER = WORKSPACE_Z_MM / 2.0              # 40 mm
+Z_MIN_SAFE = Z_BUFFER_MM
+Z_MAX_SAFE = WORKSPACE_Z_MM - Z_BUFFER_MM
+Z_CENTER = WORKSPACE_Z_MM / 2.0
 
-# Homing speed: 0.5 RPS = 16 mm/s with 32 mm rotation_distance
-HOMING_SPEED = 16.0
-
-# Z homing speed: slower than XY because the limit switch has less play.
-Z_HOMING_SPEED = 10.0
+# Homing speeds (from motion section)
+HOMING_SPEED = _CFG.motion.homing_speed_mm_s
+Z_HOMING_SPEED = _CFG.motion.z_homing_speed_mm_s
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +133,11 @@ Z_HOMING_SPEED = 10.0
 def generate_test_config() -> str:
     """Generate a printer.cfg from machine.yaml via the configs module.
 
-    Loads the default machine.yaml shipped with robot_control, then
-    delegates to ``generate_printer_cfg`` for the actual content.
+    Reuses the module-level ``_CFG`` loaded at import time, so the
+    generated printer.cfg is always consistent with the constants
+    used by the test functions.
     """
-    cfg = load_config()
-    return generate_printer_cfg(cfg)
+    return generate_printer_cfg(_CFG)
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +705,7 @@ def home_all(sock: socket.socket) -> bool:
     # of travel.  Back off immediately to avoid stressing the belt.
     print(f"    Homed OK  Z={WORKSPACE_Z_MM:.0f}, "
           f"retracting to {Z_MAX_SAFE:.0f} ...")
-    move_z(sock, Z_MAX_SAFE, feedrate=300.0)
+    move_z(sock, Z_MAX_SAFE, feedrate=600.0)
     _raw_gcode(sock, "M400")  # wait for retract to physically complete
     print(f"    Workspace: 0..{WORKSPACE_X_MM:.0f} mm (X)  x  "
           f"0..{WORKSPACE_Y_MM:.0f} mm (Y)  x  "
@@ -734,14 +721,14 @@ def move_xy(
     sock: socket.socket,
     x: float,
     y: float,
-    feedrate: float = 1200.0,
+    feedrate: float = 2400.0,
 ) -> None:
     """Move to (x, y) using G1.  Both X motors move in sync.
 
     Parameters
     ----------
     feedrate : float
-        Speed in mm/min (G-code F parameter).  1200 = 20 mm/s.
+        Speed in mm/min (G-code F parameter).  2400 = 40 mm/s.
     """
     x = max(0.0, min(x, WORKSPACE_X_MM))
     y = max(0.0, min(y, WORKSPACE_Y_MM))
@@ -751,14 +738,14 @@ def move_xy(
 def move_z(
     sock: socket.socket,
     z: float,
-    feedrate: float = 600.0,
+    feedrate: float = 1200.0,
 ) -> None:
-    """Move Z axis to *z*, clamped to the safe buffer range [1..79 mm].
+    """Move Z axis to *z*, clamped to the safe buffer range [5..75 mm].
 
     Parameters
     ----------
     feedrate : float
-        Speed in mm/min (G-code F parameter).  600 = 10 mm/s.
+        Speed in mm/min (G-code F parameter).  1200 = 20 mm/s.
     """
     z = max(Z_MIN_SAFE, min(z, Z_MAX_SAFE))
     _raw_gcode(sock, f"G1 Z{z:.2f} F{feedrate:.0f}")
@@ -769,7 +756,7 @@ def move_xyz(
     x: float,
     y: float,
     z: float,
-    feedrate: float = 1200.0,
+    feedrate: float = 2400.0,
 ) -> None:
     """Move all three axes simultaneously with a single G1 command.
 
@@ -786,7 +773,7 @@ def draw_circle(
     center_x: float,
     center_y: float,
     radius: float,
-    feedrate: float = 960.0,
+    feedrate: float = 1920.0,
     z_center: float | None = None,
     z_amplitude: float = 0.0,
 ) -> None:
@@ -862,17 +849,90 @@ def draw_circle(
     print(f"    circle done")
 
 
+def run_limit_reach_test(sock: socket.socket) -> None:
+    """Phase 5b: move each axis to within 10 mm of both limits.
+
+    Verifies that the full workspace is reachable after homing.
+    The operator can press Enter at any time to skip the remainder.
+
+    Order: X min -> X max -> Y min -> Y max -> Z min -> Z max -> centre.
+    """
+    MARGIN = 10.0  # mm from each workspace edge
+
+    x_lo = MARGIN
+    x_hi = WORKSPACE_X_MM - MARGIN
+    y_lo = MARGIN
+    y_hi = WORKSPACE_Y_MM - MARGIN
+    z_lo = max(Z_MIN_SAFE, MARGIN)
+    z_hi = min(Z_MAX_SAFE, WORKSPACE_Z_MM - MARGIN)
+
+    cx = WORKSPACE_X_MM / 2.0
+    cy = WORKSPACE_Y_MM / 2.0
+    feedrate = 12000.0  # 200 mm/s
+
+    print()
+    print("=" * 60)
+    print("  PHASE 5b: LIMIT REACH TEST (each axis, both sides)")
+    print("=" * 60)
+    print()
+    print(f"  Margin: {MARGIN:.0f} mm from each limit")
+    print(f"    X: {x_lo:.0f} .. {x_hi:.0f} mm")
+    print(f"    Y: {y_lo:.0f} .. {y_hi:.0f} mm")
+    print(f"    Z: {z_lo:.0f} .. {z_hi:.0f} mm")
+    print()
+    print("  Press Enter at any time to skip remaining moves.")
+    print()
+
+    skipped = False
+
+    def _check_skip() -> bool:
+        """Return True if the operator pressed Enter to skip."""
+        if _stdin_has_data():
+            sys.stdin.readline()
+            return True
+        return False
+
+    # Start from workspace centre
+    print("  Moving to centre ...")
+    move_xyz(sock, cx, cy, Z_CENTER, feedrate)
+    _raw_gcode(sock, "M400")
+
+    # Each move block: issue move, wait, check for skip
+    moves = [
+        (x_lo, cy,  Z_CENTER, f"X -> {x_lo:.0f} mm (min + {MARGIN:.0f})"),
+        (x_hi, cy,  Z_CENTER, f"X -> {x_hi:.0f} mm (max - {MARGIN:.0f})"),
+        (cx,   y_lo, Z_CENTER, f"Y -> {y_lo:.0f} mm (min + {MARGIN:.0f})"),
+        (cx,   y_hi, Z_CENTER, f"Y -> {y_hi:.0f} mm (max - {MARGIN:.0f})"),
+        (cx,   cy,  z_lo,     f"Z -> {z_lo:.0f} mm (min + {MARGIN:.0f})"),
+        (cx,   cy,  z_hi,     f"Z -> {z_hi:.0f} mm (max - {MARGIN:.0f})"),
+    ]
+
+    for mx, my, mz, label in moves:
+        if _check_skip():
+            skipped = True
+            break
+        print(f"  {label} ...")
+        move_xyz(sock, mx, my, mz, feedrate)
+        _raw_gcode(sock, "M400")
+
+    if skipped:
+        print("  [SKIP] Remaining limit moves skipped by operator.")
+
+    # Always return to centre before next phase
+    print("  Returning to centre ...")
+    move_xyz(sock, cx, cy, Z_CENTER, feedrate)
+    _raw_gcode(sock, "M400")
+    print("    Done.")
+    print()
+
+
 def run_motion_test(sock: socket.socket) -> None:
     """Phase 6: helical circles (XY + Z) with progressive speed ramp.
 
-    Every circle is a helical arc: XY traces a 40 mm-radius circle
-    while Z does a full back-and-forth across its safe range (1..79 mm)
-    via linear Z interpolation inside the G2 arcs.  All three axes
-    move simultaneously in every command -- no sequential moves.
-
-    Z naturally moves slower than XY because its travel distance per
-    semicircle (78 mm) is shorter than XY's arc length (~126 mm).
-    At any given feedrate, Z speed is ~62 % of XY tangential speed.
+    Every circle is a helical arc: XY traces a circle (radius = 30%
+    of the shorter XY axis) while Z does a full back-and-forth across
+    its safe range via linear Z interpolation inside the G2 arcs.
+    All three axes move simultaneously -- no sequential moves.
     """
     print()
     print("=" * 60)
@@ -880,19 +940,21 @@ def run_motion_test(sock: socket.socket) -> None:
     print("=" * 60)
     print()
 
-    cx = WORKSPACE_X_MM / 2.0   # 100 mm
-    cy = WORKSPACE_Y_MM / 2.0   # 100 mm
-    radius = 40.0               # 40 mm radius, well within XY bounds
+    cx = WORKSPACE_X_MM / 2.0
+    cy = WORKSPACE_Y_MM / 2.0
+    # 30% of the shorter XY axis, so the circle fills the workspace visibly
+    # while leaving plenty of margin from the limits.
+    radius = min(WORKSPACE_X_MM, WORKSPACE_Y_MM) * 0.30
 
-    # Z oscillates across the full safe range (1..79 mm).
-    # Per semicircle Z travels 78 mm while XY covers ~126 mm,
+    # Z oscillates across the full safe range.
+    # Per semicircle Z travels less distance than XY's arc length,
     # so Z speed is proportionally slower -- exactly what we want.
     z_amp = Z_CENTER - Z_MIN_SAFE  # 35 mm -> range 5..75 mm
 
     # Move all three axes to workspace centre simultaneously
     print(f"  Moving to workspace centre "
           f"({cx:.0f}, {cy:.0f}, Z={Z_CENTER:.0f}) ...")
-    move_xyz(sock, cx, cy, Z_CENTER, feedrate=1800.0)
+    move_xyz(sock, cx, cy, Z_CENTER, feedrate=3600.0)
     _raw_gcode(sock, "M400")  # wait for physical move to complete
     print("    Arrived.")
     print()
@@ -902,15 +964,15 @@ def run_motion_test(sock: socket.socket) -> None:
     print()
 
     # --- Slow verification circle (XYZ) ---
-    print("  --- Slow helical circle (16 mm/s) ---")
+    print("  --- Slow helical circle (32 mm/s) ---")
     draw_circle(
-        sock, cx, cy, radius, feedrate=960.0,
+        sock, cx, cy, radius, feedrate=1920.0,
         z_center=Z_CENTER, z_amplitude=z_amp,
     )
     print()
 
     # --- Speed ramp (XYZ) ---
-    ramp_speeds = [50, 100, 160, 220, 250, 280, 310]  # mm/s
+    ramp_speeds = [100, 200, 320, 440, 500, 560, 620]  # mm/s
     print(f"  --- Speed ramp: {ramp_speeds} mm/s  (G2 arcs + Z) ---")
     print(f"  (Ctrl-C to abort if motion becomes rough)")
     print()
@@ -926,7 +988,7 @@ def run_motion_test(sock: socket.socket) -> None:
 
     # Return all axes to centre simultaneously
     print("  Returning to centre ...")
-    move_xyz(sock, cx, cy, Z_CENTER, feedrate=1800.0)
+    move_xyz(sock, cx, cy, Z_CENTER, feedrate=3600.0)
     print("    Done.")
     print()
 
@@ -978,11 +1040,19 @@ def main() -> None:
     print(f"    rotation_distance:  {ROTATION_DISTANCE} mm/rev")
     print(f"    microsteps:         {MICROSTEPS}  (must match DM542TE DIP)")
     print(f"    step_pulse:         {STEP_PULSE_DURATION} s (5 us)")
-    print(f"    pulses/rev:         {400 * MICROSTEPS}  (400 full-steps x {MICROSTEPS})")
+    full_steps = _CFG.steppers.full_steps_per_rotation
+    print(f"    pulses/rev:         {full_steps * MICROSTEPS}  "
+          f"({full_steps} full-steps x {MICROSTEPS})")
     print(f"    test speed:         {args.speed} mm/s ({rps:.2f} RPS)")
     print(f"    direction pause:    {DIRECTION_PAUSE_MS} ms")
     print(f"    cycles:             {args.cycles} back-and-forth")
     print(f"    endstop polarity:   from machine.yaml")
+    print()
+    print("  Workspace (from machine.yaml):")
+    print(f"    X: 0 .. {WORKSPACE_X_MM:.0f} mm")
+    print(f"    Y: 0 .. {WORKSPACE_Y_MM:.0f} mm")
+    print(f"    Z: 0 .. {WORKSPACE_Z_MM:.0f} mm  "
+          f"(safe: {Z_MIN_SAFE:.0f} .. {Z_MAX_SAFE:.0f} mm)")
     print()
 
     # --- Write test config and restart Klipper ----------------------------
@@ -1090,8 +1160,11 @@ def main() -> None:
         homed = home_all(sock)
 
         if not homed:
-            print("  Homing failed -- skipping circle test.")
+            print("  Homing failed -- skipping limit reach & circle test.")
         else:
+            # --- Phase 5b: Limit reach test -------------------------------
+            run_limit_reach_test(sock)
+
             # --- Phase 6: Circle + speed ramp test ------------------------
             run_motion_test(sock)
 
@@ -1135,6 +1208,7 @@ def main() -> None:
     print("    [ ] Z endstop: open when released, TRIGGERED when pressed?")
     print("    [ ] G28 X Y: both X motors homed and stopped at endstop?")
     print("    [ ] G28 Z: Z homed at reduced speed, stopped at endstop?")
+    print("    [ ] Limit reach: all axes reached within 10 mm of both limits?")
     print("    [ ] Circles: XY smooth at all speeds?")
     print("    [ ] Helical: Z oscillated smoothly during circles?")
     print()

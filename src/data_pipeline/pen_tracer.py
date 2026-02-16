@@ -107,67 +107,92 @@ def extract_edges(
     img_rgb: torch.Tensor,
     cfg: validators.PenTracerV2EdgeDetection
 ) -> np.ndarray:
-    """Extract edges using LAB color space and Canny edge detection.
-    
+    """Extract edges using LAB luminance and multi-scale Canny detection.
+
+    When ``multiscale_sigmas`` is set in the config, Canny is run at each
+    sigma and the results are OR-merged, capturing both fine and coarse
+    edges.  When ``hysteresis_q`` is set, Canny thresholds are computed
+    adaptively from the gradient magnitude distribution instead of using
+    fixed ``canny_low`` / ``canny_high``.
+
     Parameters
     ----------
     img_rgb : torch.Tensor
-        Linear RGB image, shape (3, H, W), range [0, 1]
+        Linear RGB image, shape (3, H, W), range [0, 1].
     cfg : PenTracerV2EdgeDetection
-        Edge detection configuration
-    
+        Edge detection configuration.
+
     Returns
     -------
     edge_mask : np.ndarray
-        Binary edge mask, shape (H, W), dtype uint8
+        Binary edge mask, shape (H, W), dtype uint8.
     """
     if not cfg.enabled:
         H, W = img_rgb.shape[1], img_rgb.shape[2]
         return np.zeros((H, W), dtype=np.uint8)
-    
-    # Convert to LAB for perceptually uniform color-aware edge detection
+
+    # Convert to LAB for perceptually uniform colour-aware edge detection
     img_lab = color.rgb_to_lab(img_rgb)  # (3, H, W)
     L_channel = img_lab[0].detach().cpu().numpy()  # (H, W) in [0, 100]
-    
-    # Normalize L* to uint8
     L_u8 = np.clip(L_channel * 255.0 / 100.0, 0, 255).astype(np.uint8)
-    
+
     # Bilateral filter: smooths gradients while preserving sharp edges
-    # Single pass to maintain edge precision at true boundaries
     L_u8 = cv2.bilateralFilter(
         L_u8,
         d=cfg.bilateral_d,
         sigmaColor=cfg.bilateral_sigma_color,
-        sigmaSpace=cfg.bilateral_sigma_space
+        sigmaSpace=cfg.bilateral_sigma_space,
     )
-    
-    # Apply Gaussian blur
-    blurred = cv2.GaussianBlur(L_u8, (0, 0), cfg.sigma_px)
-    
-    # Canny edge detection with configurable thresholds
-    edges = cv2.Canny(blurred, cfg.canny_low, cfg.canny_high)
-    
-    # Apply morphological closing to connect nearby edge fragments
+
+    # Determine sigma list: multi-scale if configured, else single pass
+    sigmas = (
+        getattr(cfg, 'multiscale_sigmas', None) or [cfg.sigma_px]
+    )
+
+    # Accumulator (union of all scales)
+    edges = np.zeros(L_u8.shape, dtype=np.uint8)
+
+    for sigma in sigmas:
+        blurred = cv2.GaussianBlur(L_u8, (0, 0), sigma)
+
+        # Adaptive hysteresis thresholds via gradient quantiles
+        hq = getattr(cfg, 'hysteresis_q', None)
+        if hq is not None and len(hq) == 2:
+            grad_mag = cv2.Sobel(blurred, cv2.CV_64F, 1, 0) ** 2
+            grad_mag += cv2.Sobel(blurred, cv2.CV_64F, 0, 1) ** 2
+            grad_mag = np.sqrt(grad_mag)
+            lo = float(np.quantile(grad_mag[grad_mag > 0], hq[0]))
+            hi = float(np.quantile(grad_mag[grad_mag > 0], hq[1]))
+            # Floor to configured fixed thresholds if quantiles are too low
+            lo = max(lo, cfg.canny_low)
+            hi = max(hi, cfg.canny_high)
+        else:
+            lo, hi = cfg.canny_low, cfg.canny_high
+
+        edges_scale = cv2.Canny(blurred, lo, hi)
+        edges = cv2.bitwise_or(edges, edges_scale)
+
+    # Morphological closing to connect nearby edge fragments
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
-        (cfg.closing_kernel_size, cfg.closing_kernel_size)
+        (cfg.closing_kernel_size, cfg.closing_kernel_size),
     )
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
-    
+
     # Skeletonize to eliminate double lines (both sides of edges)
     from skimage.morphology import skeletonize
     edges = skeletonize(edges > 0).astype(np.uint8) * 255
-    
-    # Dilate skeleton slightly to merge nearby parallel lines (from gradient artifacts)
+
+    # Dilate skeleton slightly to merge nearby parallel lines
     merge_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
-        (cfg.merge_kernel_size, cfg.merge_kernel_size)
+        (cfg.merge_kernel_size, cfg.merge_kernel_size),
     )
     edges = cv2.dilate(edges, merge_kernel, iterations=1)
-    
+
     # Skeletonize again to get single centerline
     edges = skeletonize(edges > 0).astype(np.uint8) * 255
-    
+
     return edges
 
 
@@ -380,25 +405,27 @@ def _dedupe_parallel(
     dedupe_max_angle_deg: float
 ) -> List[np.ndarray]:
     """Collapse near-parallel double lines into single centerlines.
-    
+
+    Iterates longest-first; a shorter line is dropped when sampled points
+    lie within ``dedupe_min_sep_px`` of an already-kept longer line.
+
     Parameters
     ----------
     polys_px : List[np.ndarray]
-        List of polylines in pixel coordinates
+        List of polylines in pixel coordinates, each shape (N, 2).
     dedupe_min_sep_px : float
-        Collapse lines closer than this distance
+        Collapse lines closer than this distance.
     dedupe_max_angle_deg : float
-        Maximum angle difference for parallel detection
-    
+        Maximum angle difference for parallel detection.
+
     Returns
     -------
     out : List[np.ndarray]
-        Deduplicated polylines
+        Deduplicated polylines.
     """
-    
     if len(polys_px) == 0:
         return []
-    
+
     # Pre-compute metadata for spatial filtering
     metadata = []
     for i, p in enumerate(polys_px):
@@ -415,63 +442,88 @@ def _dedupe_parallel(
             'bbox_min': bbox_min,
             'bbox_max': bbox_max,
             'center': center,
-            'poly': p
+            'poly': p,
         })
-    
-    # Sort by length (descending) to keep longer lines
+
+    # Sort by length (descending) -- longer lines are kept first
     metadata.sort(key=lambda m: m['length'], reverse=True)
-    
-    used = set()
-    out = []
-    
-    for i, mi in enumerate(metadata):
-        if mi['idx'] in used:
-            continue
-        
-        # Mark as used
-        used.add(mi['idx'])
-        keep = True
-        
-        # Check against already kept lines (not all lines)
-        for mj in metadata[:i]:
-            if mj['idx'] in used or mj['idx'] == mi['idx']:
-                continue
-            
+
+    # kept_metas tracks only the lines we decided to KEEP
+    kept_metas: List[dict] = []
+    out: List[np.ndarray] = []
+
+    for mi in metadata:
+        dominated = False
+
+        for mj in kept_metas:
             # Quick bbox check (with padding)
             if (mi['bbox_max'][0] < mj['bbox_min'][0] - dedupe_min_sep_px or
                 mi['bbox_min'][0] > mj['bbox_max'][0] + dedupe_min_sep_px or
                 mi['bbox_max'][1] < mj['bbox_min'][1] - dedupe_min_sep_px or
                 mi['bbox_min'][1] > mj['bbox_max'][1] + dedupe_min_sep_px):
                 continue
-            
+
             # Quick angle check
             angle_diff = abs(((mi['angle'] - mj['angle'] + 180) % 360) - 180)
             if angle_diff > dedupe_max_angle_deg:
                 continue
-            
+
             # Quick center distance check
             center_dist = np.linalg.norm(mi['center'] - mj['center'])
             if center_dist > dedupe_min_sep_px * 5:
                 continue
-            
-            # Detailed distance check (sample 10 points)
+
+            # Detailed distance check (sample up to 10 points)
             pi = mi['poly']
             pj = mj['poly']
-            sample_idx = np.linspace(0, len(pi)-1, min(10, len(pi)), dtype=int)
-            dists = []
-            for idx in sample_idx:
-                dists.append(np.min(np.linalg.norm(pj - pi[idx], axis=1)))
-            
-            mean_sep = float(np.mean(dists))
-            if mean_sep <= dedupe_min_sep_px:
-                # This is a duplicate of a longer line - skip it
-                keep = False
+            sample_idx = np.linspace(0, len(pi) - 1, min(10, len(pi)), dtype=int)
+            dists = [float(np.min(np.linalg.norm(pj - pi[idx], axis=1)))
+                     for idx in sample_idx]
+
+            if float(np.mean(dists)) <= dedupe_min_sep_px:
+                dominated = True
                 break
-        
-        if keep:
+
+        if not dominated:
+            kept_metas.append(mi)
             out.append(mi['poly'])
-    
+
     return out
+
+
+def _smooth_polyline(pts: np.ndarray, iterations: int = 2) -> np.ndarray:
+    """Chaikin corner-cutting: smooths a polyline while preserving endpoints.
+
+    Each iteration replaces every interior segment (A, B) with two points
+    at 25 % and 75 % along the segment, doubling point count and rounding
+    corners.  First and last points are kept exactly.
+
+    Parameters
+    ----------
+    pts : np.ndarray
+        Polyline, shape (N, 2).
+    iterations : int
+        Number of subdivision passes.  2 gives a visually smooth result
+        without excessive point count.
+
+    Returns
+    -------
+    smoothed : np.ndarray
+        Smoothed polyline, shape (M, 2) with M > N.
+    """
+    if len(pts) < 3:
+        return pts
+
+    for _ in range(iterations):
+        new_pts = [pts[0]]
+        for i in range(len(pts) - 1):
+            q = 0.75 * pts[i] + 0.25 * pts[i + 1]
+            r = 0.25 * pts[i] + 0.75 * pts[i + 1]
+            new_pts.extend([q, r])
+        new_pts.append(pts[-1])
+        pts = np.array(new_pts, dtype=pts.dtype)
+
+    return pts
 
 
 def vectorize_edges(
@@ -594,101 +646,136 @@ def generate_hatch_pattern(
     hatch_spacing_px: float,
     hatch_angle_deg: float,
     sx_mm_per_px: float,
-    sy_mm_per_px: float
+    sy_mm_per_px: float,
 ) -> List[np.ndarray]:
-    """Generate hatching lines for a region.
-    
+    """Generate serpentine hatching paths for a region.
+
+    Sweep lines are generated at ``hatch_angle_deg``.  Adjacent segments
+    that overlap in the sweep direction are stitched into continuous
+    zigzag (serpentine) paths so the pen stays down across multiple lines,
+    dramatically reducing pen-lift count.
+
     Parameters
     ----------
     mask : np.ndarray
-        Binary mask, shape (H, W)
+        Binary mask, shape (H, W).
     hatch_spacing_px : float
-        Spacing between hatch lines
+        Spacing between hatch lines (pixels).
     hatch_angle_deg : float
-        Hatch angle in degrees
-    sx_mm_per_px : float
-        Millimeters per pixel in X direction
-    sy_mm_per_px : float
-        Millimeters per pixel in Y direction
-    
+        Hatch angle in degrees.
+    sx_mm_per_px, sy_mm_per_px : float
+        Anisotropic pixel-to-mm scale factors.
+
     Returns
     -------
-    hatch_lines_mm : List[np.ndarray]
-        List of hatch line segments, each shape (N, 2), in mm
+    hatch_paths_mm : List[np.ndarray]
+        List of (possibly long) serpentine polylines, each shape (N, 2),
+        in mm.
     """
     H, W = mask.shape
-    
-    # Rotation matrix
+
+    # Rotation matrices (image <-> rotated scan space)
     angle_rad = np.deg2rad(hatch_angle_deg)
     cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
     R = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
     R_inv = np.array([[cos_a, sin_a], [-sin_a, cos_a]])
-    
-    # Get mask points
+
+    # Mask points -> rotated bbox
     y_coords, x_coords = np.where(mask > 0)
     if len(x_coords) == 0:
         return []
-    
     pts = np.stack([x_coords, y_coords], axis=1).astype(np.float32)
-    
-    # Rotate points
     pts_rot = pts @ R.T
-    
-    # Bounding box in rotated space
     x_min, y_min = pts_rot.min(axis=0)
     x_max, y_max = pts_rot.max(axis=0)
-    
-    # Generate hatch lines
-    hatch_lines_mm = []
+
+    # -- Phase 1: sweep scan lines and collect segments per line ----------
+    sweep_lines: List[List[np.ndarray]] = []  # [line_idx] -> list of seg_mm
     y_current = y_min
-    
+    line_idx = 0
+
     while y_current <= y_max:
-        # Horizontal line in rotated space
         line_rot = np.array([[x_min, y_current], [x_max, y_current]])
-        
-        # Rotate back to image space
         line_img = line_rot @ R_inv.T
-        
-        # Sample along line
         num_samples = int(np.linalg.norm(line_img[1] - line_img[0]) * 2)
         if num_samples < 2:
             y_current += hatch_spacing_px
             continue
-        
+
         t_vals = np.linspace(0, 1, num_samples)
         samples = line_img[0] + t_vals[:, None] * (line_img[1] - line_img[0])
-        
-        # Check which samples are inside mask
-        x_int = np.clip(samples[:, 0].astype(int), 0, W-1)
-        y_int = np.clip(samples[:, 1].astype(int), 0, H-1)
+        x_int = np.clip(samples[:, 0].astype(int), 0, W - 1)
+        y_int = np.clip(samples[:, 1].astype(int), 0, H - 1)
         inside = mask[y_int, x_int] > 0
-        
-        # Find continuous segments
-        segments = []
+
+        # Extract continuous inside-mask segments
+        segs_mm: List[np.ndarray] = []
         start_idx = None
-        for i, is_inside in enumerate(inside):
-            if is_inside and start_idx is None:
+        for i, v in enumerate(inside):
+            if v and start_idx is None:
                 start_idx = i
-            elif not is_inside and start_idx is not None:
-                segments.append((start_idx, i-1))
+            elif not v and start_idx is not None:
+                if i - 1 - start_idx >= 2:
+                    seg_px = samples[start_idx:i].copy()
+                    seg_px[:, 0] = np.clip(seg_px[:, 0], 0, W - 1)
+                    seg_px[:, 1] = np.clip(seg_px[:, 1], 0, H - 1)
+                    segs_mm.append(np.stack(
+                        [seg_px[:, 0] * sx_mm_per_px,
+                         seg_px[:, 1] * sy_mm_per_px], axis=1))
                 start_idx = None
-        if start_idx is not None:
-            segments.append((start_idx, len(inside)-1))
-        
-        # Convert to mm with anisotropic scaling and clip to bounds
-        for start, end in segments:
-            if end - start >= 2:
-                seg_px = samples[start:end+1]
-                # Clip to image bounds
-                seg_px[:,0] = np.clip(seg_px[:,0], 0, W-1)
-                seg_px[:,1] = np.clip(seg_px[:,1], 0, H-1)
-                seg_mm = np.stack([seg_px[:,0] * sx_mm_per_px,
-                                  seg_px[:,1] * sy_mm_per_px], axis=1)
-                hatch_lines_mm.append(seg_mm)
-        
+        if start_idx is not None and len(inside) - 1 - start_idx >= 2:
+            seg_px = samples[start_idx:].copy()
+            seg_px[:, 0] = np.clip(seg_px[:, 0], 0, W - 1)
+            seg_px[:, 1] = np.clip(seg_px[:, 1], 0, H - 1)
+            segs_mm.append(np.stack(
+                [seg_px[:, 0] * sx_mm_per_px,
+                 seg_px[:, 1] * sy_mm_per_px], axis=1))
+
+        # Alternate direction every other line for serpentine
+        if line_idx % 2 == 1:
+            segs_mm = [s[::-1] for s in reversed(segs_mm)]
+
+        if segs_mm:
+            sweep_lines.append(segs_mm)
+            line_idx += 1
+
         y_current += hatch_spacing_px
-    
-    return hatch_lines_mm
+
+    if not sweep_lines:
+        return []
+
+    # -- Phase 2: stitch adjacent sweep-line segments into paths ----------
+    # Bridge two segments if the gap between them is short (< 3x spacing).
+    max_bridge_mm = hatch_spacing_px * max(sx_mm_per_px, sy_mm_per_px) * 3.0
+
+    hatch_paths_mm: List[np.ndarray] = []
+    # Flatten all segments, keeping sweep order
+    # Build chains by connecting tail of current segment to head of next
+    current_chain: List[np.ndarray] = []
+
+    for segs in sweep_lines:
+        for seg in segs:
+            if len(current_chain) == 0:
+                current_chain.append(seg)
+                continue
+
+            tail = current_chain[-1][-1]
+            head = seg[0]
+            gap = float(np.linalg.norm(tail - head))
+
+            if gap <= max_bridge_mm:
+                # Bridge: add the next segment (skip duplicate start if same
+                # as previous tail)
+                current_chain.append(seg)
+            else:
+                # Gap too large -- flush current chain, start new one
+                hatch_paths_mm.append(np.vstack(current_chain))
+                current_chain = [seg]
+
+    if current_chain:
+        hatch_paths_mm.append(np.vstack(current_chain))
+
+    return hatch_paths_mm
 
 
 def _path_endpoint_dist(p1: dict, p2: dict = None) -> float:
@@ -706,6 +793,182 @@ def _compute_total_distance(paths: List[dict]) -> float:
     for i in range(len(paths) - 1):
         total += _path_endpoint_dist(paths[i], paths[i+1])
     return total
+
+
+def _merge_adjacent_paths(
+    paths: list[dict],
+    merge_tol_mm: float = 0.8,
+) -> list[dict]:
+    """Merge paths whose endpoints are within *merge_tol_mm*.
+
+    Greedily chains paths end-to-start (or end-to-end / start-to-start
+    with reversal) to reduce pen lifts.  Runs before the GNN ordering
+    step so that the optimizer works on longer, fewer polylines.
+
+    Parameters
+    ----------
+    paths : list[dict]
+        Path dicts with ``points_mm`` (list of [x, y]).
+    merge_tol_mm : float
+        Maximum endpoint gap (mm) that will be bridged.
+
+    Returns
+    -------
+    list[dict]
+        Merged paths (fewer, longer polylines).
+    """
+    if len(paths) <= 1:
+        return paths
+
+    from scipy.spatial import cKDTree
+
+    n = len(paths)
+
+    # Pre-extract numpy arrays for fast access
+    starts = np.array([p['points_mm'][0] for p in paths])
+    ends = np.array([p['points_mm'][-1] for p in paths])
+
+    # Build KD-trees for start and end points
+    start_tree = cKDTree(starts)
+    end_tree = cKDTree(ends)
+
+    # For each path, track which chain it belongs to.
+    # chain_id[i] = id of chain that path i is in.
+    # chains maps chain_id -> list of (path_idx, reversed_flag).
+    chain_id = list(range(n))
+    chains: dict[int, list[tuple[int, bool]]] = {
+        i: [(i, False)] for i in range(n)
+    }
+
+    # Track which chain each path's head/tail belongs to
+    # head_of[chain_id] = first path index in chain
+    # tail_of[chain_id] = last path index in chain
+    head_of: dict[int, int] = {i: i for i in range(n)}
+    tail_of: dict[int, int] = {i: i for i in range(n)}
+
+    # Current effective start/end for each chain (updated after merges)
+    chain_start: dict[int, np.ndarray] = {i: starts[i].copy() for i in range(n)}
+    chain_end: dict[int, np.ndarray] = {i: ends[i].copy() for i in range(n)}
+
+    # Find all candidate pairs (end_i -> start_j) within tolerance
+    # end of path i close to start of path j => chain i before j
+    pairs_end_start = end_tree.query_ball_tree(start_tree, merge_tol_mm)
+    # end of path i close to end of path j => chain i before reversed j
+    pairs_end_end = end_tree.query_ball_tree(end_tree, merge_tol_mm)
+    # start of path i close to start of path j => reversed i before j
+    pairs_start_start = start_tree.query_ball_tree(start_tree, merge_tol_mm)
+
+    # Build a priority queue of candidate merges sorted by distance (shortest first)
+    import heapq
+    merge_candidates: list[tuple[float, int, int, str]] = []
+
+    for i in range(n):
+        for j in pairs_end_start[i]:
+            if i == j:
+                continue
+            d = float(np.linalg.norm(ends[i] - starts[j]))
+            heapq.heappush(merge_candidates, (d, i, j, 'end_start'))
+        for j in pairs_end_end[i]:
+            if i == j:
+                continue
+            d = float(np.linalg.norm(ends[i] - ends[j]))
+            heapq.heappush(merge_candidates, (d, i, j, 'end_end'))
+        for j in pairs_start_start[i]:
+            if i == j:
+                continue
+            d = float(np.linalg.norm(starts[i] - starts[j]))
+            heapq.heappush(merge_candidates, (d, i, j, 'start_start'))
+
+    merges_done = 0
+
+    while merge_candidates:
+        dist, i, j, kind = heapq.heappop(merge_candidates)
+
+        ci = chain_id[i]
+        cj = chain_id[j]
+        if ci == cj:
+            continue  # Already in the same chain
+
+        # Only merge if i is at the tail of its chain and j at the head of its chain
+        # (or vice versa depending on kind), so we don't break existing chains.
+        if kind == 'end_start':
+            if tail_of[ci] != i or head_of[cj] != j:
+                continue
+        elif kind == 'end_end':
+            if tail_of[ci] != i or tail_of[cj] != j:
+                continue
+        elif kind == 'start_start':
+            if head_of[ci] != i or head_of[cj] != j:
+                continue
+
+        # Merge cj into ci
+        if kind == 'end_start':
+            # ci chain ... -> i (end) ==close== j (start) -> ... cj chain
+            chains[ci].extend(chains[cj])
+        elif kind == 'end_end':
+            # ci chain ... -> i (end) ==close== j (end) <- ... cj chain (reversed)
+            chains[ci].extend([(idx, not rev) for idx, rev in reversed(chains[cj])])
+        elif kind == 'start_start':
+            # cj chain (reversed) ... -> i (start) ==close== j (start) -> ... ci chain
+            reversed_ci = [(idx, not rev) for idx, rev in reversed(chains[ci])]
+            chains[ci] = reversed_ci
+            chains[ci].extend(chains[cj])
+
+        # Update chain membership
+        for idx, _ in chains[cj]:
+            chain_id[idx] = ci
+        del chains[cj]
+
+        # Update head/tail pointers
+        first_idx = chains[ci][0][0]
+        last_idx = chains[ci][-1][0]
+        first_rev = chains[ci][0][1]
+        last_rev = chains[ci][-1][1]
+
+        head_of[ci] = first_idx
+        tail_of[ci] = last_idx
+
+        # Update effective endpoints
+        chain_start[ci] = ends[first_idx] if first_rev else starts[first_idx]
+        chain_end[ci] = starts[last_idx] if last_rev else ends[last_idx]
+
+        merges_done += 1
+
+    # Reconstruct merged paths
+    merged: list[dict] = []
+    for cid, members in chains.items():
+        # Concatenate points from all members
+        all_pts: list[list[float]] = []
+        first_path = paths[members[0][0]]
+
+        for path_idx, is_reversed in members:
+            pts = list(paths[path_idx]['points_mm'])
+            if is_reversed:
+                pts = pts[::-1]
+            if all_pts:
+                # Skip first point to avoid duplication at the junction
+                pts = pts[1:] if len(pts) > 1 else pts
+            all_pts.extend(pts)
+
+        if len(all_pts) < 2:
+            continue
+
+        merged_path = {
+            'id': first_path['id'],
+            'kind': first_path['kind'],
+            'role': first_path['role'],
+            'tip_diameter_mm': first_path['tip_diameter_mm'],
+            'z_mm': first_path['z_mm'],
+            'feed_mm_s': first_path['feed_mm_s'],
+            'points_mm': all_pts,
+        }
+        merged.append(merged_path)
+
+    logger.info(
+        f"  Path merge: {n} -> {len(merged)} paths "
+        f"({merges_done} merges, tol={merge_tol_mm:.1f}mm)"
+    )
+    return merged
 
 
 def _greedy_nearest_neighbor(paths: List[dict], start_pos: np.ndarray = None) -> Tuple[List[dict], float]:
@@ -1069,11 +1332,12 @@ def make_pen_layer(
         )
         logger.info(f"  After deduplication: {len(edge_polylines_px)}")
         
-        # Convert to mm
+        # Convert to mm and smooth
         edge_polylines_mm = []
         for pts_px in edge_polylines_px:
             pts_mm = np.stack([pts_px[:,0] * sx_mm_per_px,
                               pts_px[:,1] * sy_mm_per_px], axis=1)
+            pts_mm = _smooth_polyline(pts_mm, iterations=2)
             edge_polylines_mm.append(pts_mm)
         
         logger.info(f"  Final edge polylines: {len(edge_polylines_mm)}")
@@ -1241,6 +1505,21 @@ def make_pen_layer(
     
     logger.info(f"Generated {len(all_paths)} total paths (unordered)")
     
+    # ========================================================================
+    # PATH MERGING -- reduce pen lifts by chaining near-touching polylines
+    # ========================================================================
+    logger.info("Merging adjacent paths to reduce pen lifts...")
+
+    edge_paths_raw = [p for p in all_paths if p['role'] == 'outline']
+    hatch_paths_raw = [p for p in all_paths if p['role'] == 'hatch']
+
+    # Merge edges and hatches separately (they have different roles/speeds)
+    edge_paths_merged = _merge_adjacent_paths(edge_paths_raw, merge_tol_mm=0.8)
+    hatch_paths_merged = _merge_adjacent_paths(hatch_paths_raw, merge_tol_mm=0.8)
+
+    all_paths = edge_paths_merged + hatch_paths_merged
+    logger.info(f"After merge: {len(all_paths)} total paths")
+
     # ========================================================================
     # PATH ORDERING
     # ========================================================================

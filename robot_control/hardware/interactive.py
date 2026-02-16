@@ -117,6 +117,12 @@ class InteractiveController:
         )
         poll_thread.start()
 
+        # Auto-home on startup
+        if not self._homed:
+            self._status = "Homing on startup..."
+            self._draw(stdscr)
+            self._home()
+
         try:
             while self._running:
                 self._draw(stdscr)
@@ -152,6 +158,8 @@ class InteractiveController:
             self._running = False
         elif key == ord("h") or key == ord("H"):
             self._home()
+        elif key == ord("g") or key == ord("G"):
+            self._goto_position(stdscr)
         elif key == ord("p") or key == ord("P"):
             self._select_tool("pen")
         elif key == ord("a") or key == ord("A"):
@@ -256,6 +264,64 @@ class InteractiveController:
         self._tool_up = False
         self._status = "Tool DOWN"
 
+    def _goto_position(self, stdscr: curses.window) -> None:
+        """Prompt user for absolute X Y Z coordinates and move there."""
+        curses.echo()
+        curses.curs_set(1)
+        stdscr.nodelay(False)
+        stdscr.timeout(-1)
+
+        h, _ = stdscr.getmaxyx()
+        row = min(13, h - 2)
+        stdscr.addstr(row, 1, "Go to (e.g. x200 y150 z10): ")
+        stdscr.clrtoeol()
+        stdscr.refresh()
+
+        try:
+            raw = stdscr.getstr(row, 29, 40).decode("utf-8", errors="ignore")
+        except Exception:
+            raw = ""
+
+        curses.noecho()
+        curses.curs_set(0)
+        stdscr.timeout(int(self._cfg.interactive.position_poll_interval_ms))
+
+        if not raw.strip():
+            self._status = "Goto cancelled"
+            return
+
+        # Parse tokens like "x200", "y150.5", "z10"
+        parts = raw.lower().replace(",", " ").replace("=", "").split()
+        gcode_parts = []
+        for token in parts:
+            token = token.strip()
+            if token.startswith("x"):
+                gcode_parts.append(f"X{token[1:]}")
+            elif token.startswith("y"):
+                gcode_parts.append(f"Y{token[1:]}")
+            elif token.startswith("z"):
+                gcode_parts.append(f"Z{token[1:]}")
+            else:
+                # Try bare number as X if no prefix
+                try:
+                    float(token)
+                    gcode_parts.append(f"X{token}")
+                except ValueError:
+                    pass
+
+        if not gcode_parts:
+            self._status = "Invalid input"
+            return
+
+        tc = self._cfg.get_tool(self._tool)
+        f_val = tc.travel_feed_mm_s * 60.0
+        cmd = f"G90\nG0 {' '.join(gcode_parts)} F{f_val:.0f}\nM400"
+        try:
+            self._client.send_gcode(cmd, timeout=15.0)
+            self._status = f"Moved to {' '.join(gcode_parts)}"
+        except Exception as exc:
+            self._status = f"Goto failed: {exc}"
+
     def _goto_origin(self) -> None:
         if not self._homed:
             self._status = "Cannot go to origin -- not homed"
@@ -307,7 +373,7 @@ class InteractiveController:
             "  [Arrows] Jog XY   [PgUp/Dn] Jog Z   [+/-] Step size",
             "  [H] Home          [P] Pen       [A] Airbrush",
             "  [U] Up            [D] Down      [O] Canvas origin",
-            "  [Esc] E-STOP      [Q] Quit",
+            "  [G] Go to X Y Z   [Esc] E-STOP  [Q] Quit",
         ]
 
         for row, line in enumerate(lines):

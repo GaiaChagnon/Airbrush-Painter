@@ -37,6 +37,7 @@ robot_control/
 │   ├── test_motion.py        Homing + coordinated XY move checks
 │   ├── calibrate.py          Guided calibration entry point
 │   ├── run_job.py            Run patterns or job files
+│   ├── run_tracer.py         Trace pen vectors on the robot (A4 paper)
 │   └── interactive_control.py  Launch keyboard jog controller
 │
 └── tests/                    pytest suite (runs without hardware)
@@ -251,11 +252,11 @@ Validation (cross-field checks, soft limits, pin counts)
 | Z    | 1 (dummy) | `[stepper_z]` | PG10 (unused) | not homed |
 
 Key parameters (from `machine.yaml`):
-- **Motor**: 0.9deg (400 full steps/rev), DM542TE driver, 16 microsteps = 6400 pulses/rev
+- **Motor**: 0.9deg (400 full steps/rev), DM542TE driver, 8 microsteps = 3200 pulses/rev
 - **Belt**: GT2 2mm pitch, 16T pulley -> `rotation_distance = 32 mm`
 - **step_pulse_duration**: 5 us -- mandatory for DM542TE via LS08 buffer
-- **Workspace**: 200 x 200 mm (conservative; increase after physical measurement)
-- **Max velocity**: 200 mm/s, max accel: 1500 mm/s^2
+- **Workspace**: 480 x 380 x 80 mm (XYZ, validated during bring-up)
+- **Max velocity**: 400 mm/s, max accel: 3000 mm/s^2
 - **Endstop polarity**: `^!` (pull-up + inverted, NO switch to GND)
 
 ---
@@ -343,20 +344,129 @@ python robot_control/scripts/run_job.py --pattern speed-test --tool airbrush --f
 
 ### interactive_control.py -- Keyboard jog controller
 
-Curses TUI for manual machine control.
+Curses TUI for manual machine control.  Auto-homes on startup.  If Klipper is in shutdown state (e.g. after MCU disconnect), the script automatically issues `FIRMWARE_RESTART` and waits for recovery.
 
 ```bash
-python robot_control/scripts/interactive_control.py
+.venv/bin/python robot_control/scripts/interactive_control.py
 ```
 
 | Key | Action | Key | Action |
 |-----|--------|-----|--------|
 | Arrow keys | Jog X/Y | Page Up/Down | Jog Z |
 | +/- | Change jog step | H | Home X Y |
-| P | Select pen | A | Select airbrush |
-| U | Tool up | D | Tool down |
-| O | Canvas origin | Esc | Emergency stop |
-| Q | Quit | | |
+| G | **Go to position** (type `x200 y150 z10`) | P | Select pen |
+| A | Select airbrush | U | Tool up |
+| D | Tool down | O | Canvas origin |
+| Esc | Emergency stop | Q | Quit |
+
+The **G** key opens an input line at the bottom of the TUI.  Type any combination of `x`, `y`, `z` coordinates (e.g. `x200`, `y150 z10`, `x100 y200`).  Supports formats: `x200`, `x=200`, `X200`.
+
+### run_tracer.py -- Pen tracing on the robot
+
+Loads a `pen_vectors.yaml` produced by the pen tracer pipeline, transforms image-frame coordinates to machine-frame coordinates, and drives the robot through the complete drawing sequence.
+
+#### Pipeline overview
+
+```
+1. Image processing      run_pen_tracer_test.py
+   (edge detection,      ──────────────────────►  pen_vectors.yaml
+   hatching, path merge,                           pen_preview.png
+   GNN+2-opt ordering)                             composite.png
+
+2. Robot execution        run_tracer.py
+   (load vectors,        ──────────────────────►  G-code via Klipper UDS
+   coordinate transform,
+   pen up/down, draw)
+```
+
+**Step 1 -- Generate pen vectors** (runs on any machine, no robot needed):
+
+```bash
+# Colour mode (CMY complement, gamut-aware hatching)
+.venv/bin/python run_pen_tracer_test.py --mode color \
+  --input "data/raw_images/hard/peakpx (4) high res.png" \
+  --output outputs/pen_traces_hard
+
+# Black & white mode (standalone pen drawing, full edge + dense hatching)
+.venv/bin/python run_pen_tracer_test.py --mode bw \
+  --input "data/raw_images/hard/peakpx (4) high res.png" \
+  --output outputs/pen_traces_hard_bw
+
+# Process an entire directory
+.venv/bin/python run_pen_tracer_test.py --mode bw \
+  --input data/raw_images/hard \
+  --output outputs/pen_traces_hard_bw
+```
+
+Configs used: `configs/sim/pen_tracer_v2.yaml` (colour) or `configs/sim/pen_tracer_v2_bw.yaml` (B&W).
+
+**Step 2 -- Run on the robot:**
+
+```bash
+# List available traced images
+.venv/bin/python robot_control/scripts/run_tracer.py \
+  --traces-dir outputs/pen_traces_hard_bw --list
+
+# Dry run (stats only, no robot)
+.venv/bin/python robot_control/scripts/run_tracer.py \
+  --traces-dir outputs/pen_traces_hard_bw \
+  --image "peakpx (4) high res" \
+  --dry-run
+
+# Full robot execution
+.venv/bin/python robot_control/scripts/run_tracer.py \
+  --traces-dir outputs/pen_traces_hard_bw \
+  --image "peakpx (4) high res"
+
+# Skip corner alignment (paper already placed)
+.venv/bin/python robot_control/scripts/run_tracer.py \
+  --traces-dir outputs/pen_traces_hard_bw \
+  --image "peakpx (4) high res" \
+  --skip-corners
+```
+
+#### Execution phases
+
+| Phase | What happens |
+|-------|-------------|
+| 0 | Move to first corner, lower pen.  **Pause** -- operator inserts pen and checks depth. |
+| 1 | Draw alignment circles at 4 corners (skipped with `--skip-corners`). Pause for paper alignment. |
+| 2 | Draw border rectangle around the drawable area. |
+| 3 | Draw all image paths (edges first, then hatching).  Progress % shown live. |
+| 4 | Retract, return to centre, disable steppers. |
+
+#### CLI arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--image NAME` | -- | Subdirectory name in traces dir |
+| `--vectors PATH` | -- | Direct path to `pen_vectors.yaml` (overrides `--image`) |
+| `--traces-dir DIR` | `outputs/pen_traces_hard` | Where to look for traced images |
+| `--list` | -- | List available images and exit |
+| `--dry-run` | -- | Compute stats, no G-code |
+| `--skip-corners` | -- | Skip alignment circles |
+| **Z-axis** | | |
+| `--z-contact` | 70.0 | Z position where pen touches paper (mm, higher = closer to bed) |
+| `--z-retract` | 1.5 | Retract distance above contact (mm) |
+| **Speeds** | | |
+| `--draw-speed` | 30.0 | Drawing speed (mm/s) |
+| `--travel-speed` | 100.0 | Travel speed (mm/s) |
+| `--z-plunge-speed` | 20.0 | Pen down speed (mm/s) |
+| `--z-retract-speed` | 50.0 | Pen up speed (mm/s) |
+| `--accel` | 500.0 | XY acceleration (mm/s^2) |
+| **Paper** | | |
+| `--paper-origin X Y` | 25 25 | Offset from limit switches: X from X-min, Y from Y-max (mm) |
+| `--margin` | 10.0 | Margin from paper edge (mm) |
+| `--corner-radius` | 3.0 | Alignment circle radius (mm) |
+| `--no-config-write` | -- | Don't regenerate printer.cfg |
+
+#### Coordinate system
+
+The paper is positioned using `--paper-origin X Y` which specifies offsets from the machine's limit switches:
+- **X**: distance from the X endstop (X = 0)
+- **Y**: distance from the Y endstop (Y = max)
+
+With `--paper-origin 25 25`, the paper's top-left corner sits at machine position (25, 305) -- 25 mm from each endstop.  The image is scaled to fit the drawable area (A4 minus margins) with correct aspect ratio.
 
 ---
 
@@ -417,6 +527,6 @@ This writes `~/printer.cfg`, restarts Klipper, homes, and runs the circle test.
 | Motors don't move | Enable pin polarity wrong | Check `enable_pin_inverted` in machine.yaml |
 | Only 1 X motor moves | Missing `[stepper_x1]` in printer.cfg | Re-run `test_motors.py` (without `--no-config-write`) |
 | Endstops always TRIGGERED | Polarity inverted | Toggle `endstop_polarity` between `^!` and `^` in machine.yaml |
-| Vibrations at high speed | Acceleration too high | Lower `max_accel_mm_s2` (tested safe: 1500) |
+| Vibrations at high speed | Acceleration too high | Lower `max_accel_mm_s2` (tested safe: 3000) |
 | Audible speed changes in circles | G1 segments instead of G2 arcs | Use `DrawArc` operations or G2/G3 commands |
 | Y homes to wrong end | `homing_side` wrong | Set `homing_side: "max"` for Y in machine.yaml |

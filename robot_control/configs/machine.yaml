@@ -24,8 +24,8 @@ connection:
 # Conservative 200x200 validated during bring-up; increase once measured.
 machine:
   work_area_mm:
-    x: 200.0                       # Validated during bring-up
-    y: 200.0                       # Validated during bring-up
+    x: 450.0                       # Validated during bring-up
+    y: 320.0                       # Validated during bring-up
     z: 80.0                        # Seesaw belt: 80 mm total, 1 mm buffer each side
 
 # --- Canvas position within work area --------------------------------------
@@ -46,15 +46,15 @@ z_states:
 tools:
   pen:
     xy_offset_mm: [0.0, 0.0]       # Calibrate with crosshair test
-    feed_mm_s: 25.0                 # Drawing speed
-    travel_feed_mm_s: 80.0          # Rapid speed
-    plunge_feed_mm_s: 5.0           # Z lowering speed
+    feed_mm_s: 50.0                 # Drawing speed
+    travel_feed_mm_s: 160.0         # Rapid speed
+    plunge_feed_mm_s: 10.0          # Z lowering speed
 
   airbrush:
     xy_offset_mm: [0.0, 0.0]
-    feed_mm_s: 50.0
-    travel_feed_mm_s: 80.0
-    plunge_feed_mm_s: 5.0
+    feed_mm_s: 100.0
+    travel_feed_mm_s: 160.0
+    plunge_feed_mm_s: 10.0
     spray_height_mm: 3.0            # Height above canvas when spraying
 
 # --- Stepper / driver hardware ---------------------------------------------
@@ -67,7 +67,7 @@ steppers:
   motor_type: "0.9deg"              # 400 native full steps/rev
   full_steps_per_rotation: 400      # 0.9deg motor = 400 full steps
   driver: "DM542TE"
-  driver_pulses_per_rev: 6400       # DIP-switch setting (16x for 0.9deg motor)
+  driver_pulses_per_rev: 3200       # DIP-switch setting (8x for 0.9deg motor)
   wiring: "common_anode"            # Octopus drives +, - to GND
   enable_pin_inverted: false        # common_anode -> enable is NOT inverted
   step_pulse_duration_s: 0.000005   # 5 us -- required for DM542TE via LS08
@@ -75,10 +75,10 @@ steppers:
 
   # Klipper stepper settings (derived from motor + driver)
   # Validation: full_steps_per_rotation * klipper_microsteps == driver_pulses_per_rev
-  #             400 * 16 = 6400
-  klipper_microsteps: 16            # 400 x 16 = 6400 = driver_pulses_per_rev
+  #             400 * 8 = 3200
+  klipper_microsteps: 8             # 400 x 8 = 3200 = driver_pulses_per_rev
   xy_rotation_distance: 32.0        # GT2 belt (2 mm pitch) x 16T pulley
-  z_rotation_distance: 64.0          # 2x XY -- Z motor or belt ratio differs
+  z_rotation_distance: 32.0         # Same belt/pulley as XY
 
   # Belt & pulley specs (reference / calibration calculations)
   belt_type: "GT2"
@@ -136,11 +136,11 @@ axes:
 # --- Motion limits ----------------------------------------------------------
 # Validated during hardware bring-up speed ramp tests (2026-02-12).
 motion:
-  max_velocity_mm_s: 200.0          # Tested up to 190 mm/s smoothly
-  max_accel_mm_s2: 1500.0           # Higher causes vibration on belt gantry
-  square_corner_velocity_mm_s: 8.0  # Smooth segment transitions
-  homing_speed_mm_s: 16.0           # ~0.5 RPS, conservative for endstop approach
-  z_homing_speed_mm_s: 10.0         # Slower than XY (16) but not crawling; switch has less play
+  max_velocity_mm_s: 400.0          # 2x previous; DM542TE at 8 microsteps allows higher speeds
+  max_accel_mm_s2: 3000.0           # 2x previous
+  square_corner_velocity_mm_s: 16.0 # 2x previous
+  homing_speed_mm_s: 32.0           # ~1 RPS with 32 mm rotation_distance
+  z_homing_speed_mm_s: 20.0         # 2x previous; still slower than XY due to less endstop play
   junction_deviation_mm: 0.05
 
 # --- Interactive mode settings ----------------------------------------------

@@ -1,0 +1,137 @@
+# Pen Tracer V2 Configuration -- BLACK & WHITE (standalone pen drawing)
+# ============================================================================
+# Optimised for B&W source images drawn with a fineliner pen.
+# Unlike the colour mode (pen_tracer_v2.yaml) which complements CMY airbrush,
+# this config produces a complete standalone drawing:
+#   - Captures ALL visible edges (not just strong contrasts)
+#   - Hatches ALL dark/gray regions (no gamut filter)
+#   - Denser hatching with cross-hatch for deep shadows
+# ============================================================================
+
+schema: pen_tracer.v2
+
+# ============================================================================
+# OUTPUT RESOLUTION -- higher than colour mode to resolve fine B&W lines
+# At low res, anti-aliased B&W boundaries appear as gray pixels that blur
+# away.  600 DPI (~7016 px height) captures them crisply.
+# ============================================================================
+output:
+  target_height_px: 7016   # A4 at 600 DPI
+  min_px: 512
+  max_px: 8192
+
+# ============================================================================
+# EDGE DETECTION -- aggressive, captures fine B&W boundaries
+# ============================================================================
+edge_detection:
+  enabled: true
+
+  # Bilateral: minimal -- B&W images have sharp transitions that must not
+  # be softened.  d=5 is the schema minimum; low sigmas preserve thin lines.
+  bilateral_d: 5
+  bilateral_sigma_color: 50
+  bilateral_sigma_space: 50
+
+  # Canny: very sensitive to catch all B&W transitions
+  # canny_high minimum is 50 per schema; hysteresis_q overrides these anyway
+  canny_low: 10.0
+  canny_high: 50.0
+  sigma_px: 0.5
+
+  # Morphology: minimal -- keep fine detail, don't merge nearby lines
+  closing_kernel_size: 3
+  merge_kernel_size: 1
+
+  # Filtering: keep short lines (fine detail matters in B&W)
+  min_length_px: 15
+  simplify_tol_px: 0.5
+
+  # Skeleton: multi-scale, sensitive hysteresis
+  multiscale_sigmas: [0.6, 1.2, 2.0]
+  hysteresis_q: [0.65, 0.88]
+  skeletonize: true
+
+  # Gap linking: aggressive to reduce fragmentation
+  link_gap_px: 5
+  link_angle_deg: 30
+
+  # Length/simplification in mm
+  min_len_mm: 1.0
+  rdp_tol_mm: 0.2
+
+  # Deduplication
+  dedupe_min_sep_px: 2
+  dedupe_max_angle_deg: 10
+
+# ============================================================================
+# SHADOW HATCHING -- full-range, standalone pen shading
+# ============================================================================
+shadow_hatching:
+  enabled: true
+
+  # NOT gamut-aware: hatch everything dark, this is a standalone pen drawing
+  gamut_aware: false
+
+  # CMY gamut definition (unused when gamut_aware=false, kept for schema)
+  cmy_gamut:
+    min_luminance: 15.0
+    max_chroma: 80.0
+    hue_ranges:
+      - [0, 360]
+
+  # Darkness levels: 5 tiers from pure black to light gray
+  # Cross-hatch darkest regions for depth; single-pass for lighter tones
+  darkness_levels:
+    # LEVEL 1: Pure black (L* 0-20) -- dense cross-hatch
+    - l_min: 0.0
+      l_max: 20.0
+      passes: 2
+      hatch_angles: [45, 135]
+
+    # LEVEL 2: Very dark (L* 20-40) -- cross-hatch
+    - l_min: 20.0
+      l_max: 40.0
+      passes: 2
+      hatch_angles: [45, 135]
+
+    # LEVEL 3: Dark gray (L* 40-55) -- single dense hatch
+    - l_min: 40.0
+      l_max: 55.0
+      passes: 1
+      hatch_angles: [45]
+
+    # LEVEL 4: Medium gray (L* 55-70) -- single sparse hatch
+    - l_min: 55.0
+      l_max: 70.0
+      passes: 1
+      hatch_angles: [135]
+
+    # LEVEL 5: Light gray (L* 70-85) -- very sparse hatch
+    - l_min: 70.0
+      l_max: 85.0
+      passes: 1
+      hatch_angles: [45]
+
+  # Morphology & filtering
+  min_area_px: 100          # Keep small dark regions (buildings on a map)
+  spacing_scale: 1.8        # Dense: pen_width * 1.8
+  min_line_spacing_mm: 0.3  # Allow tight line spacing
+  close_gaps_px: 8          # Connect nearby dark regions
+  min_segment_length_mm: 1.0  # Keep short hatch segments
+  max_hatch_coverage: 1.0   # Full coverage allowed (schema max)
+
+# ============================================================================
+# CALIBRATION (not used in BW mode, kept for schema compatibility)
+# ============================================================================
+calibration:
+  calibration_file: null
+  margin: 0.05
+
+# ============================================================================
+# DEBUG OUTPUT
+# ============================================================================
+debug:
+  save_intermediates: true
+  save_gamut_mask: true
+  save_edge_mask: true
+  save_shadow_masks: true
