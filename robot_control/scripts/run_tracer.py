@@ -6,10 +6,11 @@ transforms image-frame coordinates (top-left, +Y down) to machine-frame
 coordinates (bottom-left, +Y up), and sends G-code commands via the
 Klipper UDS API.
 
-A4 paper in landscape orientation (297 mm on X, 210 mm on Y) is placed
-near the endstops.  A configurable margin (default 10 mm) is applied
-on all sides, and a border rectangle is drawn at the margin boundary
-before the image.
+A4 paper in **landscape** orientation (297 mm on X, 210 mm on Y) is
+placed with the top-left corner near the endstops (X=0, Y=max).
+Portrait images are automatically rotated 90 degrees to fill the paper.
+A configurable margin (default 10 mm) is applied on all sides, and a
+border rectangle is drawn at the margin boundary before the image.
 
 Alignment workflow:
     1. Home all axes (runs in parallel with YAML loading).
@@ -74,8 +75,8 @@ Z_MIN_SAFE = Z_BUFFER_MM
 Z_MAX_SAFE = WORKSPACE_Z_MM - Z_BUFFER_MM
 
 # A4 paper dimensions (mm) -- landscape: long side on X, short side on Y.
-A4_LONG = 297.0
-A4_SHORT = 210.0
+A4_W = 297.0   # long side along X
+A4_H = 210.0   # short side along Y
 
 # Default pen traces output directory
 DEFAULT_TRACES_DIR = Path(_PROJECT_ROOT) / "outputs" / "pen_traces_hard"
@@ -248,7 +249,7 @@ class PaperTransform:
         Machine workspace dimensions (mm).
     paper_w, paper_h : float
         Physical paper dimensions as placed on the bed (mm).
-        Landscape A4: paper_w=297, paper_h=210.
+        Landscape A4 (default): paper_w=297, paper_h=210.
     margin : float
         Inset from paper edge on all sides (mm).
     image_w, image_h : float
@@ -360,7 +361,8 @@ class PaperTransform:
 
     def report(self) -> None:
         """Print a human-readable summary of the transform."""
-        print(f"  Paper: {self.paper_w:.0f} x {self.paper_h:.0f} mm (A4 landscape)")
+        orient = "portrait" if self.paper_h > self.paper_w else "landscape"
+        print(f"  Paper: {self.paper_w:.0f} x {self.paper_h:.0f} mm (A4 {orient})")
         print(f"  Paper bottom-left corner: ({self.paper_left:.1f}, "
               f"{self.paper_bottom:.1f}) mm")
         paper_top_right = (self.paper_left + self.paper_w,
@@ -523,7 +525,10 @@ def trace_image(
     z_up_feedrate = z_retract_speed_mm_s * 60.0
 
     paths = pen_vectors.get("paths", [])
-    corners = transform.get_border_corners()
+    corners_raw = transform.get_margin_corners()
+    # get_margin_corners returns: BL, BR, TR, TL (CCW from bottom-left).
+    # Reorder so corners[0] is nearest home (X=0, Y=YMAX) = top-left.
+    corners = [corners_raw[3], corners_raw[2], corners_raw[1], corners_raw[0]]
 
     # Compute total drawing distance
     total_draw_mm = 0.0
@@ -645,7 +650,7 @@ def trace_image(
 
     # Apply acceleration limit
     _raw_gcode(sock, f"SET_VELOCITY_LIMIT ACCEL={accel_mm_s2:.0f}")
-    _raw_gcode(sock, "SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=5")
+    _raw_gcode(sock, "SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=3")
 
     # ======================================================================
     # PHASE 0: Pen placement check at first corner
@@ -685,7 +690,7 @@ def trace_image(
         print()
 
         for i, (cx, cy) in enumerate(corners):
-            label = ["bottom-left", "bottom-right", "top-right", "top-left"][i]
+            label = ["top-left", "top-right", "bottom-right", "bottom-left"][i]
             print(f"  Corner {i + 1}/4 ({label}): ({cx:.1f}, {cy:.1f}) mm")
             draw_circle_at(
                 sock, cx, cy, corner_circle_radius,
@@ -1015,23 +1020,45 @@ def main() -> None:
     print(f"    Edges: {n_edges}  |  Hatching: {n_hatch}")
     print()
 
+    # --- Rotate portrait image to landscape if needed -----------------------
+    # Pen vectors are generated in A4 portrait (210 x 297 mm).  The paper
+    # is placed landscape (297 on X, 210 on Y).  Rotate the image 90 deg CW
+    # so it fills the landscape paper instead of being letter-boxed.
+    img_w, img_h = work_area[0], work_area[1]
+    if img_h > img_w:
+        print("  Rotating image 90\u00b0 CW to match landscape paper")
+        for path in paths:
+            pts = path["points_mm"]
+            path["points_mm"] = [[pt[1], img_w - pt[0]] for pt in pts]
+        work_area = [img_h, img_w]  # now [297, 210]
+        print(f"  Rotated work area: {work_area[0]:.0f} x {work_area[1]:.0f} mm")
+
     # --- Build transform ---------------------------------------------------
-    # Paper is placed in LANDSCAPE: long side (297mm) along X, short (210mm)
-    # along Y.  --paper-origin gives the offset from each endstop:
-    #   X endstop is at X=0   -> paper_left   = ox
-    #   Y endstop is at Y=max -> paper_top    = workspace_y - oy
+    # Paper is placed in LANDSCAPE: long side (297 mm) along X, short
+    # (210 mm) along Y.  --paper-origin gives the offset from endstops:
+    #   X endstop is at X=0        -> paper_left = ox
+    #   Y endstop is at Y=Y_MAX   -> paper_top  = workspace_y - oy
     #   Paper extends right and downward from that corner.
     ox, oy = args.paper_origin
     paper_left = ox
     paper_top = WORKSPACE_Y_MM - oy
-    paper_bottom = paper_top - A4_SHORT  # 210 mm (short side on Y)
+    paper_bottom = paper_top - A4_H  # 210 mm (short side on Y)
+
+    # Auto-clamp: if paper extends below Y=0, shift it up
+    if paper_bottom < 0:
+        paper_bottom = 0.0
+        paper_top = A4_H
+        effective_oy = WORKSPACE_Y_MM - paper_top
+        print(f"  NOTE: Y offset auto-adjusted to {effective_oy:.0f} mm "
+              f"(requested {oy:.0f} exceeds workspace for {A4_H:.0f} mm paper)")
+
     paper_origin = (paper_left, paper_bottom)
 
     xform = PaperTransform(
         workspace_x=WORKSPACE_X_MM,
         workspace_y=WORKSPACE_Y_MM,
-        paper_w=A4_LONG,        # 297 mm on X
-        paper_h=A4_SHORT,       # 210 mm on Y
+        paper_w=A4_W,           # 297 mm on X (long side)
+        paper_h=A4_H,           # 210 mm on Y (short side)
         margin=args.margin,
         image_w=work_area[0],
         image_h=work_area[1],

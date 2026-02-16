@@ -744,33 +744,42 @@ def generate_hatch_pattern(
     if not sweep_lines:
         return []
 
-    # -- Phase 2: stitch adjacent sweep-line segments into paths ----------
-    # Bridge two segments if the gap between them is short (< 3x spacing).
-    max_bridge_mm = hatch_spacing_px * max(sx_mm_per_px, sy_mm_per_px) * 3.0
+    # -- Phase 2: stitch consecutive sweep lines into serpentine chains ---
+    # Only bridge between the END of one sweep line and the START of the
+    # next.  Never bridge between multiple segments on the SAME sweep line
+    # (those gaps represent holes in the mask where the pen must lift).
+    # This prevents diagonal crossing artifacts that occur when the bridge
+    # cuts across the hatching direction.
+    max_bridge_mm = hatch_spacing_px * max(sx_mm_per_px, sy_mm_per_px) * 1.5
 
     hatch_paths_mm: List[np.ndarray] = []
-    # Flatten all segments, keeping sweep order
-    # Build chains by connecting tail of current segment to head of next
     current_chain: List[np.ndarray] = []
 
     for segs in sweep_lines:
-        for seg in segs:
-            if len(current_chain) == 0:
-                current_chain.append(seg)
-                continue
+        if not segs:
+            continue
 
+        # --- First segment: try to bridge from previous chain -----------
+        first_seg = segs[0]
+        if current_chain:
             tail = current_chain[-1][-1]
-            head = seg[0]
+            head = first_seg[0]
             gap = float(np.linalg.norm(tail - head))
 
             if gap <= max_bridge_mm:
-                # Bridge: add the next segment (skip duplicate start if same
-                # as previous tail)
-                current_chain.append(seg)
+                current_chain.append(first_seg)
             else:
-                # Gap too large -- flush current chain, start new one
                 hatch_paths_mm.append(np.vstack(current_chain))
-                current_chain = [seg]
+                current_chain = [first_seg]
+        else:
+            current_chain = [first_seg]
+
+        # --- Remaining segments on the same sweep line: separate paths --
+        # Each extra segment is separated by a gap in the mask; bridging
+        # them would draw across empty (white) areas.
+        for seg in segs[1:]:
+            hatch_paths_mm.append(np.vstack(current_chain))
+            current_chain = [seg]
 
     if current_chain:
         hatch_paths_mm.append(np.vstack(current_chain))
@@ -1513,9 +1522,14 @@ def make_pen_layer(
     edge_paths_raw = [p for p in all_paths if p['role'] == 'outline']
     hatch_paths_raw = [p for p in all_paths if p['role'] == 'hatch']
 
-    # Merge edges and hatches separately (they have different roles/speeds)
+    # Merge edges (fragmented outline segments benefit from chaining).
     edge_paths_merged = _merge_adjacent_paths(edge_paths_raw, merge_tol_mm=0.8)
-    hatch_paths_merged = _merge_adjacent_paths(hatch_paths_raw, merge_tol_mm=0.8)
+
+    # Do NOT merge hatch paths.  The serpentine generator already produces
+    # continuous chains where possible, and aggressive merge connects
+    # parallel hatch lines end-to-end creating back-and-forth artifacts
+    # where the pen repeatedly traces the same bridge line.
+    hatch_paths_merged = hatch_paths_raw
 
     all_paths = edge_paths_merged + hatch_paths_merged
     logger.info(f"After merge: {len(all_paths)} total paths")

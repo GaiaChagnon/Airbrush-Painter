@@ -11,7 +11,7 @@ Usage::
 Controls::
 
     Arrow keys   Jog X/Y          Page Up/Down   Jog Z
-    +/-          Change jog step   H              Home X Y
+    +/-          Change jog step   H              Home X Y Z
     G            Go to position    P              Select pen
     A            Select airbrush   U              Tool up
     D            Tool down         O              Canvas origin
@@ -123,7 +123,18 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     except Exception as exc:
-        print(f"Error: {exc}")
+        msg = str(exc)
+        # Provide actionable advice for common Klipper errors
+        if "Must home axis first" in msg:
+            print("Error: Klipper requires homing before movement.")
+            print("  The interactive controller homes automatically on start.")
+            print("  This error may indicate a firmware or config issue.")
+            print("  Try: FIRMWARE_RESTART from another terminal, then relaunch.")
+        elif "Move out of range" in msg:
+            print(f"Error: {msg}")
+            print("  Check that machine.yaml work_area matches printer.cfg limits.")
+        else:
+            print(f"Error: {msg}")
         sys.exit(1)
     finally:
         client.disconnect()

@@ -9,7 +9,7 @@ Key map (configurable increments via ``machine.yaml``):
     Arrow keys   -- jog X / Y
     Page Up/Down -- jog Z up / down
     +/-          -- cycle jog increment
-    H            -- home X and Y
+    H            -- home X, Y, and Z
     P            -- select pen tool
     A            -- select airbrush tool
     U            -- tool up (raise)
@@ -226,14 +226,22 @@ class InteractiveController:
         self._status = f"Jog Z{dz:+.1f}"
 
     def _home(self) -> None:
+        """Home X, Y, and Z axes sequentially."""
         self._status = "Homing X Y..."
         try:
             self._client.send_gcode("G28 X Y\nM400", timeout=30.0)
+        except Exception as exc:  # noqa: BLE001
+            self._status = f"Home XY failed: {exc}"
+            return
+
+        self._status = "Homing Z..."
+        try:
+            self._client.send_gcode("G28 Z\nM400", timeout=30.0)
             self._homed = True
             self._tool_up = True
-            self._status = "Homed"
+            self._status = "Homed (X Y Z)"
         except Exception as exc:  # noqa: BLE001
-            self._status = f"Home failed: {exc}"
+            self._status = f"Home Z failed: {exc}"
 
     def _select_tool(self, tool: Literal["pen", "airbrush"]) -> None:
         self._tool = tool
@@ -371,7 +379,7 @@ class InteractiveController:
             f"  State:     {self._status}",
             "-" * cw,
             "  [Arrows] Jog XY   [PgUp/Dn] Jog Z   [+/-] Step size",
-            "  [H] Home          [P] Pen       [A] Airbrush",
+            "  [H] Home XYZ      [P] Pen       [A] Airbrush",
             "  [U] Up            [D] Down      [O] Canvas origin",
             "  [G] Go to X Y Z   [Esc] E-STOP  [Q] Quit",
         ]

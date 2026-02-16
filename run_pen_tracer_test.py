@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Batch pen tracer -- process images with optional multithreading."""
+"""Batch pen tracer -- process images with optional multiprocessing."""
 
 import sys
 import argparse
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -69,8 +69,8 @@ def main() -> None:
                         help="Tracing mode: 'color' (CMY complement) or 'bw' (standalone B&W)")
     parser.add_argument("--cmy-canvas", type=str, default=None,
                         help="Optional CMY canvas image path")
-    parser.add_argument("--threads", "-t", type=int, default=10,
-                        help="Max parallel threads for batch processing (default: 10)")
+    parser.add_argument("--workers", "-w", type=int, default=10,
+                        help="Max parallel worker processes for batch processing (default: 10)")
 
     args = parser.parse_args()
 
@@ -103,12 +103,12 @@ def main() -> None:
     cmy_canvas_path = args.cmy_canvas
 
     mode_label = "B&W standalone" if args.mode == "bw" else "CMY complement (colour)"
-    n_threads = min(args.threads, len(image_paths))
+    n_workers = min(args.workers, len(image_paths))
 
     print("=" * 80)
     print(f"PEN TRACER TEST - A4 Print Quality [{mode_label}]")
     print("=" * 80)
-    print(f"\nProcessing {len(image_paths)} image(s) with {n_threads} thread(s)")
+    print(f"\nProcessing {len(image_paths)} image(s) with {n_workers} worker(s)")
     print(f"Output directory: {args.output}")
     print(f"Config: {pen_tracer_cfg_path}")
     print(f"\nMode: {mode_label}")
@@ -126,7 +126,7 @@ def main() -> None:
     errors: list[dict] = []
     t_start = time.monotonic()
 
-    if n_threads <= 1:
+    if n_workers <= 1:
         # Sequential processing
         for idx, image_path in enumerate(image_paths, 1):
             print(f"\n[{idx}/{len(image_paths)}] Processing: {image_path.name}")
@@ -144,9 +144,10 @@ def main() -> None:
                 errors.append({"image": image_path.name, "error": str(e)})
                 print(f"  ERROR: {image_path.name} -- {type(e).__name__}: {e}")
     else:
-        # Parallel processing
+        # Parallel processing with separate processes (bypasses GIL for
+        # CPU-bound numpy/OpenCV work -- true parallelism).
         futures = {}
-        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
             for image_path in image_paths:
                 out_dir = Path(args.output) / image_path.stem
                 fut = pool.submit(
