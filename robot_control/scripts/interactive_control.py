@@ -21,7 +21,9 @@ Controls::
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import socket
 import sys
 import time
 from pathlib import Path
@@ -29,11 +31,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from robot_control.configs.loader import load_config
+from robot_control.configs.printer_cfg import generate_printer_cfg
 from robot_control.hardware.interactive import InteractiveController
 from robot_control.hardware.klipper_client import (
     KlipperClient,
     KlipperShutdown,
 )
+
+PRINTER_CFG_PATH = Path.home() / "printer.cfg"
+SOCKET_PATH = "/tmp/klippy_uds"
+ETX = b"\x03"
 
 # Keep logging quiet so the curses TUI is clean
 logging.basicConfig(
@@ -91,6 +98,61 @@ def _recover_from_shutdown(client: KlipperClient) -> None:
     )
 
 
+def _restart_klipper_raw() -> None:
+    """Send RESTART via raw socket and wait for Klipper to come back."""
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        sock.connect(SOCKET_PATH)
+        payload = json.dumps({
+            "id": 1, "method": "gcode/script",
+            "params": {"script": "RESTART"},
+        }).encode() + ETX
+        sock.sendall(payload)
+        sock.close()
+    except OSError:
+        pass
+    time.sleep(3.0)
+
+
+def _wait_for_klipper_ready(timeout: float = 30.0) -> None:
+    """Poll Klipper until state is 'ready' or timeout."""
+    deadline = time.monotonic() + timeout
+    restart_attempted = False
+
+    while time.monotonic() < deadline:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect(SOCKET_PATH)
+            payload = json.dumps({"id": 1, "method": "info", "params": {}}).encode() + ETX
+            sock.sendall(payload)
+            buf = b""
+            while ETX not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            sock.close()
+            if ETX in buf:
+                frame = buf[:buf.index(ETX)]
+                msg = json.loads(frame.decode())
+                result = msg.get("result", {})
+                state = result.get("state", "unknown")
+                if state == "ready":
+                    return
+                if state in ("error", "shutdown") and not restart_attempted:
+                    restart_attempted = True
+                    print(f"  Klipper state: {state}, attempting FIRMWARE_RESTART...")
+                    _restart_klipper_raw()
+                    continue
+        except OSError:
+            pass
+        time.sleep(1.0)
+
+    raise RuntimeError(f"Klipper did not become ready within {timeout}s")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Interactive robot control",
@@ -99,10 +161,27 @@ def main() -> None:
     )
     parser.add_argument("--socket", "-s", type=str, help="Socket path")
     parser.add_argument("--config", "-c", type=str, help="Config path")
+    parser.add_argument(
+        "--no-config-write", action="store_true",
+        help="Don't regenerate printer.cfg (assume it's already correct)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
     socket_path = args.socket or config.connection.socket_path
+
+    # Regenerate printer.cfg to ensure Klipper has correct axis limits
+    if not args.no_config_write:
+        if PRINTER_CFG_PATH.exists():
+            backup = PRINTER_CFG_PATH.with_suffix(".cfg.bak")
+            PRINTER_CFG_PATH.rename(backup)
+        config_text = generate_printer_cfg(config)
+        PRINTER_CFG_PATH.write_text(config_text)
+        print(f"  Wrote printer.cfg to {PRINTER_CFG_PATH}")
+        print("  Restarting Klipper...")
+        _restart_klipper_raw()
+        _wait_for_klipper_ready(timeout=30.0)
+        print("  Klipper ready.")
 
     client = KlipperClient(
         socket_path=socket_path,

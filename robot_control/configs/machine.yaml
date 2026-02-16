@@ -106,7 +106,7 @@ axes:
     endstop_pin: "PG9"              # STOP_1
     endstop_polarity: "^!"          # pull-up + inverted (NO switch to GND)
     endstop_type: "NO_to_GND"
-    homing_side: "max"              # Endstop at positive end (position 200)
+    homing_side: "min"              # Endstop at Y=0 end (near limit switch)
   x:
     octopus_slot: "Motor 2_1 + Motor 2_2"
     motors: 2                       # Dual motor (stepper_x + stepper_x1)

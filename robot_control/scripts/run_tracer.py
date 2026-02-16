@@ -7,7 +7,7 @@ coordinates (bottom-left, +Y up), and sends G-code commands via the
 Klipper UDS API.
 
 A4 paper in **landscape** orientation (297 mm on X, 210 mm on Y) is
-placed with the top-left corner near the endstops (X=0, Y=max).
+placed with its bottom-left corner near the endstops (X=0, Y=0).
 Portrait images are automatically rotated 90 degrees to fill the paper.
 A configurable margin (default 10 mm) is applied on all sides, and a
 border rectangle is drawn at the margin boundary before the image.
@@ -347,6 +347,18 @@ class PaperTransform:
         ]
         return [self.image_to_machine(x, y) for x, y in corners_img]
 
+    def get_paper_corners(self) -> list[tuple[float, float]]:
+        """Return the 4 corners of the physical paper in machine coords.
+
+        Order: bottom-left, bottom-right, top-right, top-left (CCW).
+        """
+        return [
+            (self.paper_left, self.paper_bottom),
+            (self.paper_left + self.paper_w, self.paper_bottom),
+            (self.paper_left + self.paper_w, self.paper_bottom + self.paper_h),
+            (self.paper_left, self.paper_bottom + self.paper_h),
+        ]
+
     def get_margin_corners(self) -> list[tuple[float, float]]:
         """Return the 4 corners of the margin rectangle on the paper.
 
@@ -525,10 +537,12 @@ def trace_image(
     z_up_feedrate = z_retract_speed_mm_s * 60.0
 
     paths = pen_vectors.get("paths", [])
-    corners_raw = transform.get_margin_corners()
-    # get_margin_corners returns: BL, BR, TR, TL (CCW from bottom-left).
-    # Reorder so corners[0] is nearest home (X=0, Y=YMAX) = top-left.
-    corners = [corners_raw[3], corners_raw[2], corners_raw[1], corners_raw[0]]
+
+    # Margin corners for alignment circles (Phase 1) and border (Phase 2).
+    # get_margin_corners / get_paper_corners return: BL, BR, TR, TL (CCW).
+    # Home is at (0, 0), so BL is nearest -> keep default ordering.
+    margin_corners = transform.get_margin_corners()
+    paper_corners = transform.get_paper_corners()
 
     # Compute total drawing distance
     total_draw_mm = 0.0
@@ -660,8 +674,9 @@ def trace_image(
     print("=" * 60)
     print()
 
-    first_cx, first_cy = corners[0]
-    print(f"  Moving to first corner: ({first_cx:.1f}, {first_cy:.1f}) mm")
+    # Phase 0 uses the actual paper edge corner (not margin)
+    first_cx, first_cy = paper_corners[0]  # BL = nearest to home (0,0)
+    print(f"  Moving to paper edge corner: ({first_cx:.1f}, {first_cy:.1f}) mm")
 
     pen_up(sock, z_travel, z_up_feedrate)
     travel_to(sock, first_cx, first_cy, travel_feedrate)
@@ -689,8 +704,8 @@ def trace_image(
         print("=" * 60)
         print()
 
-        for i, (cx, cy) in enumerate(corners):
-            label = ["top-left", "top-right", "bottom-right", "bottom-left"][i]
+        for i, (cx, cy) in enumerate(margin_corners):
+            label = ["bottom-left", "bottom-right", "top-right", "top-left"][i]
             print(f"  Corner {i + 1}/4 ({label}): ({cx:.1f}, {cy:.1f}) mm")
             draw_circle_at(
                 sock, cx, cy, corner_circle_radius,
@@ -718,7 +733,7 @@ def trace_image(
     print()
 
     draw_rectangle(
-        sock, corners,
+        sock, margin_corners,
         z_contact, z_travel, z_down_feedrate, z_up_feedrate,
         draw_feedrate, travel_feedrate,
     )
@@ -861,7 +876,7 @@ def main() -> None:
     paper_group.add_argument(
         "--paper-origin", type=float, nargs=2, default=[25.0, 25.0],
         metavar=("X", "Y"),
-        help="Offset from limit switches (X from X_min, Y from Y_max), mm (default: 25 25)",
+        help="Paper bottom-left corner offset from endstops (X=0, Y=0), mm (default: 25 25)",
     )
     paper_group.add_argument(
         "--margin", type=float, default=10.0,
@@ -981,7 +996,7 @@ def main() -> None:
             print("  ERROR: XY homing failed!")
             sock.close()
             sys.exit(1)
-        print(f"    Homed OK  X=0  Y={WORKSPACE_Y_MM:.0f}")
+        print("    Homed OK  X=0  Y=0")
 
         print("  Homing Z...")
         ok_z = _raw_gcode(sock, "G28 Z", timeout=60.0)
@@ -1034,23 +1049,23 @@ def main() -> None:
         print(f"  Rotated work area: {work_area[0]:.0f} x {work_area[1]:.0f} mm")
 
     # --- Build transform ---------------------------------------------------
-    # Paper is placed in LANDSCAPE: long side (297 mm) along X, short
-    # (210 mm) along Y.  --paper-origin gives the offset from endstops:
-    #   X endstop is at X=0        -> paper_left = ox
-    #   Y endstop is at Y=Y_MAX   -> paper_top  = workspace_y - oy
-    #   Paper extends right and downward from that corner.
+    # Both endstops are at 0 (X homes to 0, Y homes to 0).
+    # --paper-origin [ox, oy] gives the offset from each endstop.
+    # Paper bottom-left corner is placed at (ox, oy), and extends
+    # rightward (+X) and upward (+Y).
     ox, oy = args.paper_origin
-    paper_left = ox
-    paper_top = WORKSPACE_Y_MM - oy
-    paper_bottom = paper_top - A4_H  # 210 mm (short side on Y)
+    paper_left = ox                 # offset from X=0
+    paper_bottom = oy               # offset from Y=0
+    paper_top = paper_bottom + A4_H
+    paper_right = paper_left + A4_W
 
-    # Auto-clamp: if paper extends below Y=0, shift it up
-    if paper_bottom < 0:
-        paper_bottom = 0.0
-        paper_top = A4_H
-        effective_oy = WORKSPACE_Y_MM - paper_top
-        print(f"  NOTE: Y offset auto-adjusted to {effective_oy:.0f} mm "
-              f"(requested {oy:.0f} exceeds workspace for {A4_H:.0f} mm paper)")
+    # Bounds check
+    if paper_right > WORKSPACE_X_MM:
+        print(f"  WARNING: paper right edge ({paper_right:.0f}) exceeds "
+              f"X workspace ({WORKSPACE_X_MM:.0f})")
+    if paper_top > WORKSPACE_Y_MM:
+        print(f"  WARNING: paper top edge ({paper_top:.0f}) exceeds "
+              f"Y workspace ({WORKSPACE_Y_MM:.0f})")
 
     paper_origin = (paper_left, paper_bottom)
 
