@@ -1309,16 +1309,19 @@ def main() -> None:
     paper_is_landscape = paper_w > paper_h
     if img_is_portrait and paper_is_landscape:
         print("  Rotating image 90\u00b0 CW to match landscape paper")
+        # 90° CCW in image-space (Y-down) + Y-flip in image_to_machine
+        # = net 90° CW on paper, with no mirroring.
+        # Formula: new_x = img_h - old_y,  new_y = old_x
         for path in paths:
             pts = path["points_mm"]
-            path["points_mm"] = [[pt[1], img_w - pt[0]] for pt in pts]
+            path["points_mm"] = [[img_h - pt[1], pt[0]] for pt in pts]
         work_area = [img_h, img_w]
         print(f"  Rotated work area: {work_area[0]:.0f} x {work_area[1]:.0f} mm")
     elif not img_is_portrait and not paper_is_landscape:
         print("  Rotating image 90\u00b0 CW to match portrait paper")
         for path in paths:
             pts = path["points_mm"]
-            path["points_mm"] = [[pt[1], img_w - pt[0]] for pt in pts]
+            path["points_mm"] = [[img_h - pt[1], pt[0]] for pt in pts]
         work_area = [img_h, img_w]
         print(f"  Rotated work area: {work_area[0]:.0f} x {work_area[1]:.0f} mm")
 
