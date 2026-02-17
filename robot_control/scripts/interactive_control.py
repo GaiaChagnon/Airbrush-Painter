@@ -115,10 +115,16 @@ def _restart_klipper_raw() -> None:
     time.sleep(3.0)
 
 
-def _wait_for_klipper_ready(timeout: float = 30.0) -> None:
-    """Poll Klipper until state is 'ready' or timeout."""
+def _wait_for_klipper_ready(timeout: float = 60.0) -> None:
+    """Poll Klipper until state is 'ready' or timeout.
+
+    Will attempt FIRMWARE_RESTART up to 3 times if Klipper is stuck in
+    error/shutdown state.  Never raises -- prints a warning on timeout
+    so the caller can decide whether to proceed.
+    """
     deadline = time.monotonic() + timeout
-    restart_attempted = False
+    restart_count = 0
+    max_restarts = 3
 
     while time.monotonic() < deadline:
         try:
@@ -141,16 +147,19 @@ def _wait_for_klipper_ready(timeout: float = 30.0) -> None:
                 state = result.get("state", "unknown")
                 if state == "ready":
                     return
-                if state in ("error", "shutdown") and not restart_attempted:
-                    restart_attempted = True
-                    print(f"  Klipper state: {state}, attempting FIRMWARE_RESTART...")
+                if state in ("error", "shutdown") and restart_count < max_restarts:
+                    restart_count += 1
+                    print(f"  Klipper state: {state}, "
+                          f"attempting FIRMWARE_RESTART ({restart_count}/{max_restarts})...")
                     _restart_klipper_raw()
                     continue
         except OSError:
             pass
         time.sleep(1.0)
 
-    raise RuntimeError(f"Klipper did not become ready within {timeout}s")
+    print(f"  WARNING: Klipper did not become ready within {timeout}s.")
+    print("  The interactive controller will start, but homing may fail.")
+    print("  Try pressing H to re-home once Klipper recovers.")
 
 
 def main() -> None:
@@ -180,7 +189,7 @@ def main() -> None:
         print(f"  Wrote printer.cfg to {PRINTER_CFG_PATH}")
         print("  Restarting Klipper...")
         _restart_klipper_raw()
-        _wait_for_klipper_ready(timeout=30.0)
+        _wait_for_klipper_ready(timeout=60.0)
         print("  Klipper ready.")
 
     client = KlipperClient(

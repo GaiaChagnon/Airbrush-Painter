@@ -22,16 +22,16 @@ pen_tracer:
   travel_speed_mm_s: 400.0           # Pen-up rapid move speed
 
   # Z speeds (pen up/down)
-  z_plunge_speed_mm_s: 20.0          # Pen lowering speed (slow for precision)
+  z_plunge_speed_mm_s: 15.0          # Pen lowering speed (slow for precision)
   z_retract_speed_mm_s: 40.0         # Pen raising speed (fast, no precision needed)
 
   # Acceleration and cornering
   accel_mm_s2: 2000.0                # XY acceleration limit during drawing
-  square_corner_velocity_mm_s: 3.0   # Max speed through sharp corners (lower = less vibration)
+  square_corner_velocity_mm_s: 8.0   # Max speed through corners (Klipper junction limit; machine max=16)
 
   # Z positions
-  z_contact_mm: 70.0                 # Z where pen touches paper (near endstop at 80)
-  z_retract_mm: 1.5                  # Distance to retract above contact position
+  z_contact_mm: 80.0                 # Z where pen touches paper (near endstop at 80)
+  z_retract_mm: 10                  # Distance to retract above contact position
 
   # Alignment
   corner_circle_radius_mm: 3.0       # Radius of alignment circles at paper corners

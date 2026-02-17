@@ -593,6 +593,58 @@ def trace_image(
         mpts = [transform.image_to_machine(pt[0], pt[1]) for pt in pts_mm]
         machine_paths.append(mpts)
 
+    # ------------------------------------------------------------------
+    # Reorder: draw the longest 1% of paths first (with GNN among them),
+    # then draw the remaining 99% in their original optimised order.
+    # ------------------------------------------------------------------
+    if len(machine_paths) > 10:
+        path_lengths = []
+        for idx, mpts in enumerate(machine_paths):
+            plen = 0.0
+            for i in range(1, len(mpts)):
+                dx = mpts[i][0] - mpts[i - 1][0]
+                dy = mpts[i][1] - mpts[i - 1][1]
+                plen += math.sqrt(dx * dx + dy * dy)
+            path_lengths.append((plen, idx))
+
+        path_lengths.sort(reverse=True)
+        n_top = max(1, len(machine_paths) // 100)  # top 1%
+        top_indices = {pl[1] for pl in path_lengths[:n_top]}
+
+        # Greedy nearest-neighbor among the top paths
+        top_pool = [(pl[1], machine_paths[pl[1]]) for pl in path_lengths[:n_top]]
+        top_ordered: list[list[tuple[float, float]]] = []
+        pos = (0.0, 0.0)  # start near home
+        remaining = {idx: mpts for idx, mpts in top_pool}
+        while remaining:
+            best_idx = -1
+            best_dist = float("inf")
+            for idx, mpts in remaining.items():
+                d_start = math.hypot(mpts[0][0] - pos[0], mpts[0][1] - pos[1])
+                d_end = math.hypot(mpts[-1][0] - pos[0], mpts[-1][1] - pos[1])
+                d = min(d_start, d_end)
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = idx
+                    if d_end < d_start:
+                        remaining[idx] = list(reversed(mpts))
+            chosen = remaining.pop(best_idx)
+            top_ordered.append(chosen)
+            pos = chosen[-1]
+
+        # Rest in original order (preserves existing GNN optimisation)
+        rest_ordered = [
+            machine_paths[i]
+            for i in range(len(machine_paths))
+            if i not in top_indices
+        ]
+
+        machine_paths = top_ordered + rest_ordered
+        top_total = sum(pl[0] for pl in path_lengths[:n_top])
+        print(f"  Priority: {n_top} longest paths ({top_total:.0f} mm) drawn first")
+
+    # Compute drawing distance
+    for mpts in machine_paths:
         for i in range(1, len(mpts)):
             dx = mpts[i][0] - mpts[i - 1][0]
             dy = mpts[i][1] - mpts[i - 1][1]
