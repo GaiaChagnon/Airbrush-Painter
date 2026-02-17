@@ -12,7 +12,7 @@
 # --- Klipper API connection ------------------------------------------------
 connection:
   socket_path: "/tmp/klippy_uds"
-  timeout_s: 5.0
+  timeout_s: 10.0                    # Must cover slow Z homing; bump if timeouts occur
   reconnect_attempts: 5            # Retries if Octopus was power-cycled
   reconnect_interval_s: 2.0        # Seconds between reconnect attempts
   auto_reconnect: true             # Re-establish connection on MCU reset
@@ -28,7 +28,9 @@ machine:
     y: 320.0                       # Validated during bring-up
     z: 80.0                        # Seesaw belt: 80 mm total, 1 mm buffer each side
 
-# --- Canvas position within work area --------------------------------------
+# --- Canvas position within work area (airbrush system) --------------------
+# Used by the airbrush gcode generator and interactive controller origin.
+# Pen tracer uses paper placement from jobs.yaml instead.
 canvas:
   offset_x_mm: 10.0                # Distance from X home to canvas left edge
   offset_y_mm: 10.0                # Distance from Y home to canvas bottom edge
@@ -46,8 +48,8 @@ z_states:
 tools:
   pen:
     xy_offset_mm: [0.0, 0.0]       # Calibrate with crosshair test
-    feed_mm_s: 50.0                 # Drawing speed
-    travel_feed_mm_s: 160.0         # Rapid speed
+    feed_mm_s: 150.0                 # Drawing speed
+    travel_feed_mm_s: 300.0         # Rapid speed
     plunge_feed_mm_s: 10.0          # Z lowering speed
 
   airbrush:
@@ -136,7 +138,7 @@ axes:
 # --- Motion limits ----------------------------------------------------------
 # Validated during hardware bring-up speed ramp tests (2026-02-12).
 motion:
-  max_velocity_mm_s: 400.0          # 2x previous; DM542TE at 8 microsteps allows higher speeds
+  max_velocity_mm_s: 500.0          # 2x previous; DM542TE at 8 microsteps allows higher speeds
   max_accel_mm_s2: 3000.0           # 2x previous
   square_corner_velocity_mm_s: 16.0 # 2x previous
   homing_speed_mm_s: 32.0           # ~1 RPS with 32 mm rotation_distance

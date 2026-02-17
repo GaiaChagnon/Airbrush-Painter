@@ -191,6 +191,22 @@ class InteractiveController:
     # Actions
     # ------------------------------------------------------------------
 
+    def _safe_gcode(self, cmd: str, timeout: float = 15.0) -> bool:
+        """Send G-code, catching errors and displaying them as status.
+
+        Returns True on success, False on error (never raises).
+        """
+        try:
+            self._client.send_gcode(cmd, timeout=timeout)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            # Trim long error messages for the status bar
+            if len(msg) > 80:
+                msg = msg[:77] + "..."
+            self._status = f"ERR: {msg}"
+            return False
+
     def _jog(self, dx: float, dy: float) -> None:
         """Relative XY jog with soft-limit check."""
         if self._position is None:
@@ -204,10 +220,10 @@ class InteractiveController:
             return
         tc = self._cfg.get_tool(self._tool)
         f_val = tc.travel_feed_mm_s * 60.0
-        self._client.send_gcode(
+        if self._safe_gcode(
             f"G91\nG0 X{dx:.3f} Y{dy:.3f} F{f_val:.1f}\nG90\nM400",
-        )
-        self._status = f"Jog X{dx:+.1f} Y{dy:+.1f}"
+        ):
+            self._status = f"Jog X{dx:+.1f} Y{dy:+.1f}"
 
     def _jog_z(self, dz: float) -> None:
         """Relative Z jog with soft-limit check."""
@@ -220,46 +236,40 @@ class InteractiveController:
             return
         tc = self._cfg.get_tool(self._tool)
         f_val = tc.plunge_feed_mm_s * 60.0
-        self._client.send_gcode(
+        if self._safe_gcode(
             f"G91\nG0 Z{dz:.3f} F{f_val:.1f}\nG90\nM400",
-        )
-        self._status = f"Jog Z{dz:+.1f}"
+        ):
+            self._status = f"Jog Z{dz:+.1f}"
 
     def _home(self) -> None:
-        """Home X, Y, and Z axes sequentially."""
+        """Home X, Y, and Z axes sequentially.
+
+        Uses 60 s timeout per axis to allow slow Z seesaw homing.
+        """
         self._status = "Homing X Y..."
-        try:
-            self._client.send_gcode("G28 X Y\nM400", timeout=30.0)
-        except Exception as exc:  # noqa: BLE001
-            self._status = f"Home XY failed: {exc}"
+        if not self._safe_gcode("G28 X Y\nM400", timeout=60.0):
             return
 
         self._status = "Homing Z..."
-        try:
-            self._client.send_gcode("G28 Z\nM400", timeout=30.0)
+        if self._safe_gcode("G28 Z\nM400", timeout=60.0):
             self._homed = True
             self._tool_up = True
             self._status = "Homed (X Y Z)"
-        except Exception as exc:  # noqa: BLE001
-            self._status = f"Home Z failed: {exc}"
 
     def _select_tool(self, tool: Literal["pen", "airbrush"]) -> None:
         self._tool = tool
         macro = f"TOOL_{tool.upper()}"
-        try:
-            self._client.send_gcode(f"{macro}\nM400")
+        if self._safe_gcode(f"{macro}\nM400"):
             self._tool_up = True
             self._status = f"Tool: {tool}"
-        except Exception as exc:  # noqa: BLE001
-            self._status = f"Tool select failed: {exc}"
 
     def _tool_up_cmd(self) -> None:
         z = self._cfg.get_z_for_tool(self._tool, "travel")
         tc = self._cfg.get_tool(self._tool)
         f_val = tc.plunge_feed_mm_s * 60.0
-        self._client.send_gcode(f"G0 Z{z:.3f} F{f_val:.1f}\nM400")
-        self._tool_up = True
-        self._status = "Tool UP"
+        if self._safe_gcode(f"G0 Z{z:.3f} F{f_val:.1f}\nM400"):
+            self._tool_up = True
+            self._status = "Tool UP"
 
     def _tool_down_cmd(self) -> None:
         if not self._homed:
@@ -268,12 +278,15 @@ class InteractiveController:
         z = self._cfg.get_z_for_tool(self._tool, "work")
         tc = self._cfg.get_tool(self._tool)
         f_val = tc.plunge_feed_mm_s * 60.0
-        self._client.send_gcode(f"G1 Z{z:.3f} F{f_val:.1f}\nM400")
-        self._tool_up = False
-        self._status = "Tool DOWN"
+        if self._safe_gcode(f"G1 Z{z:.3f} F{f_val:.1f}\nM400"):
+            self._tool_up = False
+            self._status = "Tool DOWN"
 
     def _goto_position(self, stdscr: curses.window) -> None:
-        """Prompt user for absolute X Y Z coordinates and move there."""
+        """Prompt user for absolute X Y Z coordinates and move there.
+
+        Validates coordinates against work_area limits before sending.
+        """
         curses.echo()
         curses.curs_set(1)
         stdscr.nodelay(False)
@@ -299,23 +312,39 @@ class InteractiveController:
             return
 
         # Parse tokens like "x200", "y150.5", "z10"
+        wa = self._cfg.work_area
         parts = raw.lower().replace(",", " ").replace("=", "").split()
         gcode_parts = []
         for token in parts:
             token = token.strip()
+            axis = ""
+            val_str = ""
             if token.startswith("x"):
-                gcode_parts.append(f"X{token[1:]}")
+                axis, val_str = "X", token[1:]
             elif token.startswith("y"):
-                gcode_parts.append(f"Y{token[1:]}")
+                axis, val_str = "Y", token[1:]
             elif token.startswith("z"):
-                gcode_parts.append(f"Z{token[1:]}")
+                axis, val_str = "Z", token[1:]
             else:
-                # Try bare number as X if no prefix
                 try:
                     float(token)
-                    gcode_parts.append(f"X{token}")
+                    axis, val_str = "X", token
                 except ValueError:
-                    pass
+                    continue
+
+            try:
+                val = float(val_str)
+            except ValueError:
+                self._status = f"Bad value: {token}"
+                return
+
+            # Bounds check
+            limit = {"X": wa.x, "Y": wa.y, "Z": wa.z}.get(axis, 0)
+            if val < 0 or val > limit:
+                self._status = f"Out of range: {axis}={val:.1f} (0..{limit:.0f})"
+                return
+
+            gcode_parts.append(f"{axis}{val:.3f}")
 
         if not gcode_parts:
             self._status = "Invalid input"
@@ -324,11 +353,8 @@ class InteractiveController:
         tc = self._cfg.get_tool(self._tool)
         f_val = tc.travel_feed_mm_s * 60.0
         cmd = f"G90\nG0 {' '.join(gcode_parts)} F{f_val:.0f}\nM400"
-        try:
-            self._client.send_gcode(cmd, timeout=15.0)
+        if self._safe_gcode(cmd, timeout=15.0):
             self._status = f"Moved to {' '.join(gcode_parts)}"
-        except Exception as exc:
-            self._status = f"Goto failed: {exc}"
 
     def _goto_origin(self) -> None:
         if not self._homed:
@@ -338,10 +364,10 @@ class InteractiveController:
         oy = self._cfg.canvas.offset_y_mm
         tc = self._cfg.get_tool(self._tool)
         f_val = tc.travel_feed_mm_s * 60.0
-        self._client.send_gcode(
+        if self._safe_gcode(
             f"G0 X{ox:.3f} Y{oy:.3f} F{f_val:.1f}\nM400",
-        )
-        self._status = f"At canvas origin ({ox:.1f}, {oy:.1f})"
+        ):
+            self._status = f"At canvas origin ({ox:.1f}, {oy:.1f})"
 
     def _cycle_increment(self, direction: int) -> None:
         self._inc_idx = (self._inc_idx + direction) % len(self._increments)

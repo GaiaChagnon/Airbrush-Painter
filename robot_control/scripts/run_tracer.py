@@ -74,12 +74,30 @@ Z_BUFFER_MM = 5.0
 Z_MIN_SAFE = Z_BUFFER_MM
 Z_MAX_SAFE = WORKSPACE_Z_MM - Z_BUFFER_MM
 
-# A4 paper dimensions (mm) -- landscape: long side on X, short side on Y.
-A4_W = 297.0   # long side along X
-A4_H = 210.0   # short side along Y
-
 # Default pen traces output directory
 DEFAULT_TRACES_DIR = Path(_PROJECT_ROOT) / "outputs" / "pen_traces_hard"
+
+# ---------------------------------------------------------------------------
+# Job config (jobs.yaml) -- operational parameters for pen tracing
+# ---------------------------------------------------------------------------
+
+_JOBS_YAML = Path(__file__).resolve().parent.parent / "configs" / "jobs.yaml"
+
+
+def _load_jobs_config() -> dict:
+    """Load jobs.yaml and return the raw dict."""
+    import yaml
+    try:
+        from yaml import CSafeLoader as Loader
+    except ImportError:
+        from yaml import SafeLoader as Loader
+    with open(_JOBS_YAML, "r") as f:
+        return yaml.load(f, Loader=Loader)
+
+
+_JOBS = _load_jobs_config()
+_PAPER = _JOBS.get("paper", {})
+_PEN = _JOBS.get("pen_tracer", {})
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +537,7 @@ def trace_image(
     z_plunge_speed_mm_s: float,
     z_retract_speed_mm_s: float,
     accel_mm_s2: float,
+    square_corner_velocity_mm_s: float,
     corner_circle_radius: float,
     dry_run: bool = False,
     skip_corners: bool = False,
@@ -562,6 +581,7 @@ def trace_image(
     print(f"  Z plunge speed: {z_plunge_speed_mm_s:.0f} mm/s (down)")
     print(f"  Z retract speed: {z_retract_speed_mm_s:.0f} mm/s (up)")
     print(f"  Acceleration:  {accel_mm_s2:.0f} mm/s^2")
+    print(f"  Corner velocity: {square_corner_velocity_mm_s:.1f} mm/s")
     print()
 
     # Pre-compute all machine-frame paths and stats
@@ -664,7 +684,8 @@ def trace_image(
 
     # Apply acceleration limit
     _raw_gcode(sock, f"SET_VELOCITY_LIMIT ACCEL={accel_mm_s2:.0f}")
-    _raw_gcode(sock, "SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=3")
+    scv = square_corner_velocity_mm_s
+    _raw_gcode(sock, f"SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY={scv:.1f}")
 
     # ======================================================================
     # PHASE 0: Pen placement check at first corner
@@ -837,54 +858,77 @@ def main() -> None:
         help="List available traced images and exit",
     )
 
-    # Z-axis parameters
+    # Z-axis parameters (defaults from jobs.yaml pen_tracer section)
     z_group = parser.add_argument_group("Z-axis parameters")
     z_group.add_argument(
-        "--z-contact", type=float, default=70.0,
-        help="Z position where pen touches paper, mm (default: 70.0, near endstop at 80)",
+        "--z-contact", type=float,
+        default=_PEN.get("z_contact_mm", 70.0),
+        help="Z position where pen touches paper, mm",
     )
     z_group.add_argument(
-        "--z-retract", type=float, default=1.5,
-        help="How far to retract pen above contact, mm (default: 1.5)",
+        "--z-retract", type=float,
+        default=_PEN.get("z_retract_mm", 1.5),
+        help="How far to retract pen above contact, mm",
     )
 
-    # Speed parameters
+    # Speed parameters (defaults from jobs.yaml pen_tracer section)
     speed_group = parser.add_argument_group("Speed parameters")
     speed_group.add_argument(
-        "--draw-speed", type=float, default=150.0,
-        help="Drawing speed, mm/s (default: 150)",
+        "--draw-speed", type=float,
+        default=_PEN.get("draw_speed_mm_s", 150.0),
+        help="Drawing speed, mm/s",
     )
     speed_group.add_argument(
-        "--travel-speed", type=float, default=400.0,
-        help="Travel (non-drawing) speed, mm/s (default: 400)",
+        "--travel-speed", type=float,
+        default=_PEN.get("travel_speed_mm_s", 400.0),
+        help="Travel (non-drawing) speed, mm/s",
     )
     speed_group.add_argument(
-        "--z-plunge-speed", type=float, default=20.0,
-        help="Z plunge (pen down) speed, mm/s (default: 20)",
+        "--z-plunge-speed", type=float,
+        default=_PEN.get("z_plunge_speed_mm_s", 20.0),
+        help="Z plunge (pen down) speed, mm/s",
     )
     speed_group.add_argument(
-        "--z-retract-speed", type=float, default=50.0,
-        help="Z retract (pen up) speed, mm/s (default: 50)",
+        "--z-retract-speed", type=float,
+        default=_PEN.get("z_retract_speed_mm_s", 40.0),
+        help="Z retract (pen up) speed, mm/s",
     )
     speed_group.add_argument(
-        "--accel", type=float, default=2000.0,
-        help="XY acceleration limit, mm/s^2 (default: 2000)",
+        "--accel", type=float,
+        default=_PEN.get("accel_mm_s2", 2000.0),
+        help="XY acceleration limit, mm/s^2",
+    )
+    speed_group.add_argument(
+        "--square-corner-velocity", type=float,
+        default=_PEN.get("square_corner_velocity_mm_s", 3.0),
+        help="Max speed through sharp corners, mm/s (lower = less vibration)",
     )
 
-    # Paper and alignment
+    # Paper and alignment (defaults from jobs.yaml paper section)
+    _paper_size = _PAPER.get("size_mm", [297.0, 210.0])
+    _paper_origin = _PAPER.get("origin_mm", [25.0, 25.0])
     paper_group = parser.add_argument_group("Paper and alignment")
     paper_group.add_argument(
-        "--paper-origin", type=float, nargs=2, default=[25.0, 25.0],
+        "--paper-size", type=float, nargs=2,
+        default=_paper_size,
+        metavar=("W", "H"),
+        help="Paper size [X, Y] in mm (default from jobs.yaml)",
+    )
+    paper_group.add_argument(
+        "--paper-origin", type=float, nargs=2,
+        default=_paper_origin,
         metavar=("X", "Y"),
-        help="Paper bottom-left corner offset from endstops (X=0, Y=0), mm (default: 25 25)",
+        help="Paper bottom-left corner offset from endstops (X=0, Y=0), mm",
     )
     paper_group.add_argument(
-        "--margin", type=float, default=10.0,
-        help="Margin from paper edge on all sides, mm (default: 10.0)",
+        "--margin", type=float,
+        default=_PAPER.get("margin_mm", 10.0),
+        help="Margin from paper edge on all sides, mm",
     )
     paper_group.add_argument(
-        "--corner-radius", type=float, default=3.0,
-        help="Radius of corner alignment circles, mm (default: 3.0)",
+        "--corner-radius", type=float,
+        default=_PEN.get("corner_circle_radius_mm", 3.0),
+        help="Radius of corner alignment circles, mm",
     )
 
     # Operational flags
@@ -1035,17 +1079,29 @@ def main() -> None:
     print(f"    Edges: {n_edges}  |  Hatching: {n_hatch}")
     print()
 
-    # --- Rotate portrait image to landscape if needed -----------------------
-    # Pen vectors are generated in A4 portrait (210 x 297 mm).  The paper
-    # is placed landscape (297 on X, 210 on Y).  Rotate the image 90 deg CW
-    # so it fills the landscape paper instead of being letter-boxed.
+    # --- Paper dimensions from jobs.yaml (or CLI override) -------------------
+    paper_w, paper_h = args.paper_size
+
+    # --- Rotate image if it doesn't match paper orientation -----------------
+    # If image is taller than wide (portrait) and paper is wider than tall
+    # (landscape), or vice versa, rotate the image 90 deg CW so it fills
+    # the paper without letter-boxing.
     img_w, img_h = work_area[0], work_area[1]
-    if img_h > img_w:
+    img_is_portrait = img_h > img_w
+    paper_is_landscape = paper_w > paper_h
+    if img_is_portrait and paper_is_landscape:
         print("  Rotating image 90\u00b0 CW to match landscape paper")
         for path in paths:
             pts = path["points_mm"]
             path["points_mm"] = [[pt[1], img_w - pt[0]] for pt in pts]
-        work_area = [img_h, img_w]  # now [297, 210]
+        work_area = [img_h, img_w]
+        print(f"  Rotated work area: {work_area[0]:.0f} x {work_area[1]:.0f} mm")
+    elif not img_is_portrait and not paper_is_landscape:
+        print("  Rotating image 90\u00b0 CW to match portrait paper")
+        for path in paths:
+            pts = path["points_mm"]
+            path["points_mm"] = [[pt[1], img_w - pt[0]] for pt in pts]
+        work_area = [img_h, img_w]
         print(f"  Rotated work area: {work_area[0]:.0f} x {work_area[1]:.0f} mm")
 
     # --- Build transform ---------------------------------------------------
@@ -1054,10 +1110,10 @@ def main() -> None:
     # Paper bottom-left corner is placed at (ox, oy), and extends
     # rightward (+X) and upward (+Y).
     ox, oy = args.paper_origin
-    paper_left = ox                 # offset from X=0
-    paper_bottom = oy               # offset from Y=0
-    paper_top = paper_bottom + A4_H
-    paper_right = paper_left + A4_W
+    paper_left = ox
+    paper_bottom = oy
+    paper_top = paper_bottom + paper_h
+    paper_right = paper_left + paper_w
 
     # Bounds check
     if paper_right > WORKSPACE_X_MM:
@@ -1072,8 +1128,8 @@ def main() -> None:
     xform = PaperTransform(
         workspace_x=WORKSPACE_X_MM,
         workspace_y=WORKSPACE_Y_MM,
-        paper_w=A4_W,           # 297 mm on X (long side)
-        paper_h=A4_H,           # 210 mm on Y (short side)
+        paper_w=paper_w,
+        paper_h=paper_h,
         margin=args.margin,
         image_w=work_area[0],
         image_h=work_area[1],
@@ -1116,6 +1172,7 @@ def main() -> None:
             z_plunge_speed_mm_s=args.z_plunge_speed,
             z_retract_speed_mm_s=args.z_retract_speed,
             accel_mm_s2=args.accel,
+            square_corner_velocity_mm_s=args.square_corner_velocity,
             corner_circle_radius=args.corner_radius,
             dry_run=True,
             skip_corners=args.skip_corners,
@@ -1137,6 +1194,7 @@ def main() -> None:
             z_plunge_speed_mm_s=args.z_plunge_speed,
             z_retract_speed_mm_s=args.z_retract_speed,
             accel_mm_s2=args.accel,
+            square_corner_velocity_mm_s=args.square_corner_velocity,
             corner_circle_radius=args.corner_radius,
             dry_run=False,
             skip_corners=args.skip_corners,
