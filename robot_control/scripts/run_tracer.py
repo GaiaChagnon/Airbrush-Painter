@@ -594,6 +594,78 @@ def trace_image(
         machine_paths.append(mpts)
 
     # ------------------------------------------------------------------
+    # Deduplicate near-identical paths (fixes repeated tracing bug).
+    # Two paths are "duplicate" if their start/end points match within
+    # 0.15 mm and their total lengths match within 5%.
+    # ------------------------------------------------------------------
+    dedup_before = len(machine_paths)
+
+    def _path_key(mpts: list[tuple[float, float]]) -> tuple[int, int, int, int]:
+        """Quantise start/end to 0.15 mm grid for bucket dedup."""
+        q = 0.15
+        return (
+            int(mpts[0][0] / q), int(mpts[0][1] / q),
+            int(mpts[-1][0] / q), int(mpts[-1][1] / q),
+        )
+
+    def _path_length(mpts: list[tuple[float, float]]) -> float:
+        return sum(
+            math.hypot(mpts[i][0] - mpts[i - 1][0], mpts[i][1] - mpts[i - 1][1])
+            for i in range(1, len(mpts))
+        )
+
+    seen_buckets: dict[tuple[int, int, int, int], list[float]] = {}
+    unique_paths: list[list[tuple[float, float]]] = []
+    for mpts in machine_paths:
+        key = _path_key(mpts)
+        plen = _path_length(mpts)
+        # Also check with reversed path (same line traced backwards)
+        key_rev = _path_key(list(reversed(mpts)))
+        is_dup = False
+        for k in (key, key_rev):
+            if k in seen_buckets:
+                for existing_len in seen_buckets[k]:
+                    if existing_len > 0 and abs(plen - existing_len) / existing_len < 0.05:
+                        is_dup = True
+                        break
+            if is_dup:
+                break
+        if not is_dup:
+            unique_paths.append(mpts)
+            seen_buckets.setdefault(key, []).append(plen)
+    machine_paths = unique_paths
+
+    dedup_removed = dedup_before - len(machine_paths)
+    if dedup_removed > 0:
+        print(f"  Deduplicated: removed {dedup_removed} near-identical paths")
+
+    # ------------------------------------------------------------------
+    # Collapse within-path backtracking: if three consecutive points are
+    # nearly collinear and the middle is a reversal, drop the extra point.
+    # ------------------------------------------------------------------
+    for pi in range(len(machine_paths)):
+        mpts = machine_paths[pi]
+        if len(mpts) < 3:
+            continue
+        cleaned: list[tuple[float, float]] = [mpts[0]]
+        for i in range(1, len(mpts) - 1):
+            ax, ay = cleaned[-1]
+            bx, by = mpts[i]
+            cx, cy = mpts[i + 1]
+            ab = math.hypot(bx - ax, by - ay)
+            bc = math.hypot(cx - bx, cy - by)
+            ac = math.hypot(cx - ax, cy - ay)
+            # If a→b + b→c ≈ a→c the points are collinear (no reversal)
+            # If a→c ≈ 0, the path came back to its start (reversal)
+            # Detect reversal: the middle point extends then retracts
+            if ab > 0.1 and bc > 0.1 and ac < 0.3 * (ab + bc):
+                continue  # skip b: it's a turnaround point
+            cleaned.append((bx, by))
+        cleaned.append(mpts[-1])
+        if len(cleaned) >= 2:
+            machine_paths[pi] = cleaned
+
+    # ------------------------------------------------------------------
     # Reorder: draw the longest 1% of paths first (with GNN among them),
     # then draw the remaining 99% in their original optimised order.
     # ------------------------------------------------------------------
@@ -661,10 +733,10 @@ def trace_image(
         total_pen_lifts += 1
 
     # ------------------------------------------------------------------
-    # Time estimates using trapezoidal motion profile
+    # Time estimates using per-segment trapezoidal motion profile
     # ------------------------------------------------------------------
     def _trapezoidal_time(dist_mm: float, v_max: float, accel: float) -> float:
-        """Time for a move under trapezoidal velocity profile."""
+        """Time for a single move starting and ending at rest."""
         if dist_mm <= 0 or v_max <= 0:
             return 0.0
         d_ramp = v_max * v_max / accel
@@ -672,18 +744,99 @@ def trace_image(
             return dist_mm / v_max + v_max / accel
         return 2.0 * math.sqrt(dist_mm / accel)
 
-    # Per-path drawing time: Klipper look-ahead maintains speed across
-    # consecutive G1 junctions, so model each path as one continuous move.
+    def _segment_time(
+        dist_mm: float, v_max: float, accel: float, v_junction: float,
+    ) -> float:
+        """Time for a G1 segment entering and exiting at v_junction.
+
+        Klipper's look-ahead limits junction speed to SCV at direction
+        changes.  For each segment the velocity profile is:
+        accel from v_junction → peak → decel to v_junction.
+        """
+        if dist_mm <= 0 or v_max <= 0:
+            return 0.0
+        vj = min(v_junction, v_max)
+        # Distance needed to accel from vj to v_max and back to vj
+        d_ramp = (v_max * v_max - vj * vj) / accel
+        if dist_mm >= d_ramp:
+            # Full trapezoid with cruise phase
+            t_ramp = 2.0 * (v_max - vj) / accel
+            t_cruise = (dist_mm - d_ramp) / v_max
+            return t_ramp + t_cruise
+        # Triangle: can't reach v_max
+        v_peak = math.sqrt(vj * vj + accel * dist_mm)
+        return 2.0 * (v_peak - vj) / accel
+
+    scv = square_corner_velocity_mm_s
+    total_segments = 0
+
+    # Pre-compute constants for the junction velocity formula
+    _SQRT2_M1 = math.sqrt(2.0) - 1.0  # ≈ 0.4142
+    _SCV2 = scv * scv
+    _V_MAX = draw_speed_mm_s
+    _V_MAX2 = _V_MAX * _V_MAX
+    _A = accel_mm_s2
+    _sqrt = math.sqrt  # local ref avoids global lookup in hot loop
+
+    # Per-SEGMENT drawing time with angle-aware junction velocities.
+    # Uses Klipper's junction_deviation formula:
+    #   jd = SCV^2 * (sqrt(2)-1) / accel
+    #   v_junction = sqrt(jd * accel * sin(θ/2) / (1 - sin(θ/2)))
+    # Reduces to SCV at exactly 90 degrees.
     draw_time_s = 0.0
     for mpts in machine_paths:
-        path_len = 0.0
-        for i in range(1, len(mpts)):
-            dx = mpts[i][0] - mpts[i - 1][0]
-            dy = mpts[i][1] - mpts[i - 1][1]
-            path_len += math.sqrt(dx * dx + dy * dy)
-        draw_time_s += _trapezoidal_time(path_len, draw_speed_mm_s, accel_mm_s2)
+        n = len(mpts)
+        if n < 2:
+            continue
 
-    # Travel time between paths
+        # Pre-compute segment deltas and lengths for this path
+        dxs = [mpts[i][0] - mpts[i - 1][0] for i in range(1, n)]
+        dys = [mpts[i][1] - mpts[i - 1][1] for i in range(1, n)]
+        lens = [_sqrt(dxs[j] * dxs[j] + dys[j] * dys[j]) for j in range(n - 1)]
+
+        # Pre-compute junction velocities between consecutive segments
+        # jv[j] = junction speed between segment j and j+1
+        jvs: list[float] = []
+        for j in range(len(dxs) - 1):
+            l1 = lens[j]
+            l2 = lens[j + 1]
+            if l1 < 1e-6 or l2 < 1e-6:
+                jvs.append(0.0)
+                continue
+            cos_t = (dxs[j] * dxs[j + 1] + dys[j] * dys[j + 1]) / (l1 * l2)
+            if cos_t > 0.9999:
+                jvs.append(_V_MAX)
+            elif cos_t < -0.9999:
+                jvs.append(0.0)
+            else:
+                sin_hd = _sqrt(0.5 * (1.0 - cos_t))
+                factor = _SQRT2_M1 * sin_hd / (1.0 - sin_hd)
+                vj = scv * _sqrt(factor) if factor > 0.0 else 0.0
+                jvs.append(min(vj, _V_MAX))
+
+        for j in range(len(dxs)):
+            seg_len = lens[j]
+            if seg_len < 1e-6:
+                continue
+            # Entry velocity (0 for first segment, else junction speed)
+            v_entry = jvs[j - 1] if j > 0 else 0.0
+            # Exit velocity (0 for last segment, else junction speed)
+            v_exit = jvs[j] if j < len(jvs) else 0.0
+            vj = min(v_entry, v_exit)
+
+            # Inline _segment_time for speed
+            if vj >= _V_MAX:
+                draw_time_s += seg_len / _V_MAX
+            else:
+                d_ramp = (_V_MAX2 - vj * vj) / _A
+                if seg_len >= d_ramp:
+                    draw_time_s += 2.0 * (_V_MAX - vj) / _A + (seg_len - d_ramp) / _V_MAX
+                else:
+                    v_peak = _sqrt(vj * vj + _A * seg_len)
+                    draw_time_s += 2.0 * (v_peak - vj) / _A
+            total_segments += 1
+
+    # Travel time between paths (single move, starts/ends at rest)
     travel_time_s = 0.0
     prev_end_est: Optional[tuple[float, float]] = None
     for mpts in machine_paths:
@@ -694,30 +847,31 @@ def trace_image(
             travel_time_s += _trapezoidal_time(seg_len, travel_speed_mm_s, accel_mm_s2)
         prev_end_est = mpts[-1]
 
-    # Pen up/down
+    # Pen up/down (individual Z moves, start/end at rest)
     plunge_time_s = total_pen_lifts * (
         _trapezoidal_time(z_retract, z_plunge_speed_mm_s, accel_mm_s2)
         + _trapezoidal_time(z_retract, z_retract_speed_mm_s, accel_mm_s2)
     )
 
-    # Communication overhead: draw segments batched in groups of 64
+    # Communication overhead: 1 batched send per path transition
+    # (pen_up + travel + pen_down combined), plus draw batches
     batch_size = 64
     total_sends = sum(
-        3 + max(1, math.ceil(max(len(mp) - 1, 1) / batch_size))
+        1 + max(1, math.ceil(max(len(mp) - 1, 1) / batch_size))
         for mp in machine_paths
     )
-    comm_overhead_s = total_sends * 0.002
+    comm_overhead_s = total_sends * 0.005  # ~5ms per socket round-trip
 
     total_time_s = draw_time_s + travel_time_s + plunge_time_s + comm_overhead_s
 
     print(f"  Drawing distance:  {total_draw_mm:.0f} mm "
-          f"({draw_time_s / 60.0:.1f} min)")
+          f"({draw_time_s / 60.0:.1f} min, {total_segments} segments)")
     print(f"  Travel distance:   {total_travel_mm:.0f} mm "
           f"({travel_time_s / 60.0:.1f} min)")
     print(f"  Pen lifts:         {total_pen_lifts}")
     print(f"  Plunge time:       {plunge_time_s / 60.0:.1f} min")
     print(f"  Comms overhead:    {comm_overhead_s / 60.0:.1f} min "
-          f"({total_sends} socket sends)")
+          f"({total_sends} sends)")
     print(f"  Estimated total:   {total_time_s / 60.0:.1f} min "
           f"({total_time_s / 3600.0:.1f} hours)")
     print()
@@ -828,22 +982,35 @@ def trace_image(
     # Batch size: send multiple G1 commands per socket message
     DRAW_BATCH = 64
 
+    # Pre-compute clamped Z values once
+    z_travel_clamped = max(Z_MIN_SAFE, min(z_travel, Z_MAX_SAFE))
+    z_contact_clamped = max(Z_MIN_SAFE, min(z_contact, Z_MAX_SAFE))
+
     for path_idx, mpts in enumerate(machine_paths):
         pct = int(100.0 * (path_idx + 1) / len(machine_paths))
         if pct >= prev_pct + 5 or path_idx == len(machine_paths) - 1:
             elapsed = time.monotonic() - t_start
+            frac = (path_idx + 1) / len(machine_paths)
+            eta_s = (elapsed / frac - elapsed) if frac > 0.01 else 0.0
             sys.stdout.write(
                 f"\r  Path {path_idx + 1}/{len(machine_paths)} "
-                f"({pct}%)  elapsed: {elapsed / 60.0:.1f} min    "
+                f"({pct}%)  elapsed: {elapsed / 60.0:.1f} min  "
+                f"ETA: {eta_s / 60.0:.1f} min    "
             )
             sys.stdout.flush()
             prev_pct = pct
 
-        # Travel to start
-        travel_to(sock, mpts[0][0], mpts[0][1], travel_feedrate)
-
-        # Pen down
-        pen_down(sock, z_contact, z_down_feedrate)
+        # Batch pen_up + travel + pen_down into ONE socket send.
+        # This cuts 3 round-trips per path down to 1, reducing
+        # communication overhead significantly.
+        x0 = max(0.0, min(mpts[0][0], WORKSPACE_X_MM))
+        y0 = max(0.0, min(mpts[0][1], WORKSPACE_Y_MM))
+        transition_gcode = (
+            f"G1 Z{z_travel_clamped:.2f} F{z_up_feedrate:.0f}\n"
+            f"G1 X{x0:.2f} Y{y0:.2f} F{travel_feedrate:.0f}\n"
+            f"G1 Z{z_contact_clamped:.2f} F{z_down_feedrate:.0f}"
+        )
+        _raw_gcode(sock, transition_gcode)
 
         # Draw polyline in batches
         draw_pts = mpts[1:]
@@ -856,9 +1023,8 @@ def trace_image(
                 lines.append(f"G1 X{xc:.2f} Y{yc:.2f} F{draw_feedrate:.0f}")
             _raw_gcode(sock, "\n".join(lines))
 
-        # Pen up
-        pen_up(sock, z_travel, z_up_feedrate)
-
+    # Final pen up after last path
+    pen_up(sock, z_travel, z_up_feedrate)
     _raw_gcode(sock, "M400")
 
     elapsed = time.monotonic() - t_start
