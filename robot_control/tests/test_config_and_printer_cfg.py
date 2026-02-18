@@ -113,8 +113,8 @@ class TestLoaderStructure:
         assert config.axes["x"].endstop_pin == "PG6"
         assert config.axes["z"].endstop_pin == "PG10"
 
-    def test_y_homing_side_max(self, config: MachineConfig) -> None:
-        assert config.axes["y"].homing_side == "max"
+    def test_y_homing_side_min(self, config: MachineConfig) -> None:
+        assert config.axes["y"].homing_side == "min"
 
     def test_x_homing_side_min(self, config: MachineConfig) -> None:
         assert config.axes["x"].homing_side == "min"
@@ -232,11 +232,11 @@ class TestPrinterCfgGeneration:
         assert f"max_accel: {m.max_accel_mm_s2:.0f}" in printer_cfg
         assert f"square_corner_velocity: {m.square_corner_velocity_mm_s}" in printer_cfg
 
-    def test_y_position_endstop_equals_work_area(
+    def test_y_position_endstop_at_zero(
         self, config: MachineConfig, printer_cfg: str,
     ) -> None:
-        """Y homes to max, so position_endstop == work_area.y."""
-        assert f"position_endstop: {config.work_area.y:.0f}" in printer_cfg
+        """Y homes to min, so position_endstop == 0."""
+        assert "position_endstop: 0" in printer_cfg
 
     def test_z_position_endstop_equals_work_area(
         self, config: MachineConfig, printer_cfg: str,

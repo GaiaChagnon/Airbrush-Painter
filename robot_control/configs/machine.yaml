@@ -20,37 +20,47 @@ connection:
 
 # --- Physical work area (measure your machine) -----------------------------
 # These are the ACTUAL travel limits of each axis in mm.
-# Must match position_max in printer.cfg.
-# Conservative 200x200 validated during bring-up; increase once measured.
+# Must match position_min/position_max in printer.cfg.
 machine:
   work_area_mm:
     x: 450.0                       # Validated during bring-up
     y: 320.0                       # Validated during bring-up
-    z: 80.0                        # Seesaw belt: 80 mm total, 1 mm buffer each side
+    z: 80.0                        # Seesaw belt: 80 mm total travel
+
+  # Soft limits: scripts clamp all commanded positions to this range.
+  # Set these inside the physical travel to protect endstops / mechanics.
+  # Units: mm.  z_min/z_max must be within [0, work_area_mm.z].
+  soft_limits:
+    z_min: 2.0                     # 2 mm above Z=0 endstop
+    z_max: 80.0                    # Full travel allowed (endstop at 80)
 
 # --- Canvas position within work area (airbrush system) --------------------
-# Used by the airbrush gcode generator and interactive controller origin.
+# Used by the airbrush G-code generator and interactive controller origin.
 # Pen tracer uses paper placement from jobs.yaml instead.
 canvas:
   offset_x_mm: 10.0                # Distance from X home to canvas left edge
   offset_y_mm: 10.0                # Distance from Y home to canvas bottom edge
-  width_mm: 180.0                  # Fits within 200mm work area with margins
-  height_mm: 180.0                 # Fits within 200mm work area with margins
+  width_mm: 430.0                  # Full usable X width (450 - 2×10)
+  height_mm: 300.0                 # Full usable Y height (320 - 2×10)
 
 # --- Z-axis seesaw states --------------------------------------------------
+# Reference positions for the seesaw mechanism (Z=0 at one end, Z=80 at other).
+# Higher Z = pen closer to paper.  Lower Z = airbrush closer to paper.
 z_states:
-  travel_mm: 10.0                  # Both tools clear of paper
-  pen_work_mm: 20.0                # Pen contacts paper
-  airbrush_work_mm: 0.0            # Airbrush at spray height
+  travel_mm: 40.0                  # Mid-range: both tools clear of paper
+  pen_work_mm: 80.0                # Pen contacts paper (near Z-max endstop)
+  airbrush_work_mm: 0.0            # Airbrush at spray height (near Z-min)
 
 # --- Tool definitions -------------------------------------------------------
 # All feed rates in mm/s.
+# NOTE: For pen tracing jobs, operational speeds come from jobs.yaml.
+#       These values are defaults for interactive mode and airbrush jobs.
 tools:
   pen:
     xy_offset_mm: [0.0, 0.0]       # Calibrate with crosshair test
-    feed_mm_s: 150.0                 # Drawing speed
-    travel_feed_mm_s: 300.0         # Rapid speed
-    plunge_feed_mm_s: 10.0          # Z lowering speed
+    feed_mm_s: 150.0                # Default drawing speed (interactive)
+    travel_feed_mm_s: 400.0         # Default rapid speed (interactive)
+    plunge_feed_mm_s: 20.0          # Default Z lowering speed (interactive)
 
   airbrush:
     xy_offset_mm: [0.0, 0.0]

@@ -56,12 +56,21 @@ class ConnectionConfig:
 
 
 @dataclass(frozen=True)
+class SoftLimitsConfig:
+    """Z-axis soft limits in mm.  Scripts clamp commands to this range."""
+
+    z_min: float
+    z_max: float
+
+
+@dataclass(frozen=True)
 class WorkAreaConfig:
-    """Machine work-area dimensions in mm."""
+    """Machine work-area dimensions and soft limits in mm."""
 
     x: float
     y: float
     z: float
+    soft_limits: SoftLimitsConfig
 
 
 @dataclass(frozen=True)
@@ -503,8 +512,14 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
 
         # -- work area ------------------------------------------------------
         wa = data["machine"]["work_area_mm"]
+        sl_data = data["machine"].get("soft_limits", {})
+        soft_limits = SoftLimitsConfig(
+            z_min=float(sl_data.get("z_min", 2.0)),
+            z_max=float(sl_data.get("z_max", wa["z"])),
+        )
         work_area = WorkAreaConfig(
             x=float(wa["x"]), y=float(wa["y"]), z=float(wa["z"]),
+            soft_limits=soft_limits,
         )
 
         # -- canvas ---------------------------------------------------------
