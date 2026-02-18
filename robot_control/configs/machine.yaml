@@ -48,7 +48,7 @@ canvas:
 # Higher Z = pen closer to paper.  Lower Z = airbrush closer to paper.
 z_states:
   travel_mm: 40.0                  # Mid-range: both tools clear of paper
-  pen_work_mm: 80.0                # Pen contacts paper (near Z-max endstop)
+  pen_work_mm: 80                # Pen contacts paper (near Z-max endstop)
   airbrush_work_mm: 0.0            # Airbrush at spray height (near Z-min)
 
 # --- Tool definitions -------------------------------------------------------

@@ -584,14 +584,17 @@ def trace_image(
     print(f"  Corner velocity: {square_corner_velocity_mm_s:.1f} mm/s")
     print()
 
-    # Pre-compute all machine-frame paths and stats
+    # Pre-compute all machine-frame paths and stats.
+    # Track role so the reorder step never mixes edges and hatches.
     machine_paths: list[list[tuple[float, float]]] = []
+    path_roles: list[str] = []
     for path in paths:
         pts_mm = path.get("points_mm", [])
         if len(pts_mm) < 2:
             continue
         mpts = [transform.image_to_machine(pt[0], pt[1]) for pt in pts_mm]
         machine_paths.append(mpts)
+        path_roles.append(path.get("role", "outline"))
 
     # ------------------------------------------------------------------
     # Deduplicate near-identical paths (fixes repeated tracing bug).
@@ -616,10 +619,10 @@ def trace_image(
 
     seen_buckets: dict[tuple[int, int, int, int], list[float]] = {}
     unique_paths: list[list[tuple[float, float]]] = []
-    for mpts in machine_paths:
+    unique_roles: list[str] = []
+    for pi, mpts in enumerate(machine_paths):
         key = _path_key(mpts)
         plen = _path_length(mpts)
-        # Also check with reversed path (same line traced backwards)
         key_rev = _path_key(list(reversed(mpts)))
         is_dup = False
         for k in (key, key_rev):
@@ -632,8 +635,10 @@ def trace_image(
                 break
         if not is_dup:
             unique_paths.append(mpts)
+            unique_roles.append(path_roles[pi])
             seen_buckets.setdefault(key, []).append(plen)
     machine_paths = unique_paths
+    path_roles = unique_roles
 
     dedup_removed = dedup_before - len(machine_paths)
     if dedup_removed > 0:
@@ -668,52 +673,80 @@ def trace_image(
     # ------------------------------------------------------------------
     # Reorder: draw the longest 1% of paths first (with GNN among them),
     # then draw the remaining 99% in their original optimised order.
+    # Important: apply reorder separately to edges and hatches so the
+    # execution order stays edge-first / hatch-second.
     # ------------------------------------------------------------------
     if len(machine_paths) > 10:
-        path_lengths = []
-        for idx, mpts in enumerate(machine_paths):
-            plen = 0.0
-            for i in range(1, len(mpts)):
-                dx = mpts[i][0] - mpts[i - 1][0]
-                dy = mpts[i][1] - mpts[i - 1][1]
-                plen += math.sqrt(dx * dx + dy * dy)
-            path_lengths.append((plen, idx))
+        # Split into edge and hatch groups (preserving index mapping)
+        edge_indices = [i for i, r in enumerate(path_roles) if r == "outline"]
+        hatch_indices = [i for i, r in enumerate(path_roles) if r != "outline"]
 
-        path_lengths.sort(reverse=True)
-        n_top = max(1, len(machine_paths) // 100)  # top 1%
-        top_indices = {pl[1] for pl in path_lengths[:n_top]}
+        def _reorder_group(
+            indices: list[int],
+            start_pos: tuple[float, float],
+        ) -> tuple[list[list[tuple[float, float]]], list[str], float]:
+            """Reorder a group: top 1% GNN-first, rest in original order."""
+            if not indices:
+                return [], [], 0.0
+            grp_lengths = []
+            for idx in indices:
+                mpts = machine_paths[idx]
+                plen = sum(
+                    math.hypot(mpts[i][0] - mpts[i - 1][0],
+                               mpts[i][1] - mpts[i - 1][1])
+                    for i in range(1, len(mpts))
+                )
+                grp_lengths.append((plen, idx))
+            grp_lengths.sort(reverse=True)
+            n_top = max(1, len(grp_lengths) // 100)
+            top_idx_set = {gl[1] for gl in grp_lengths[:n_top]}
 
-        # Greedy nearest-neighbor among the top paths
-        top_pool = [(pl[1], machine_paths[pl[1]]) for pl in path_lengths[:n_top]]
-        top_ordered: list[list[tuple[float, float]]] = []
-        pos = (0.0, 0.0)  # start near home
-        remaining = {idx: mpts for idx, mpts in top_pool}
-        while remaining:
-            best_idx = -1
-            best_dist = float("inf")
-            for idx, mpts in remaining.items():
-                d_start = math.hypot(mpts[0][0] - pos[0], mpts[0][1] - pos[1])
-                d_end = math.hypot(mpts[-1][0] - pos[0], mpts[-1][1] - pos[1])
-                d = min(d_start, d_end)
-                if d < best_dist:
-                    best_dist = d
-                    best_idx = idx
-                    if d_end < d_start:
-                        remaining[idx] = list(reversed(mpts))
-            chosen = remaining.pop(best_idx)
-            top_ordered.append(chosen)
-            pos = chosen[-1]
+            # GNN among top paths
+            pool = {gl[1]: machine_paths[gl[1]] for gl in grp_lengths[:n_top]}
+            ordered_pts: list[list[tuple[float, float]]] = []
+            ordered_roles: list[str] = []
+            pos = start_pos
+            while pool:
+                best_i = -1
+                best_d = float("inf")
+                for idx, mpts in pool.items():
+                    d_s = math.hypot(mpts[0][0] - pos[0], mpts[0][1] - pos[1])
+                    d_e = math.hypot(mpts[-1][0] - pos[0], mpts[-1][1] - pos[1])
+                    d = min(d_s, d_e)
+                    if d < best_d:
+                        best_d = d
+                        best_i = idx
+                        if d_e < d_s:
+                            pool[idx] = list(reversed(mpts))
+                chosen = pool.pop(best_i)
+                ordered_pts.append(chosen)
+                ordered_roles.append(path_roles[best_i])
+                pos = chosen[-1]
 
-        # Rest in original order (preserves existing GNN optimisation)
-        rest_ordered = [
-            machine_paths[i]
-            for i in range(len(machine_paths))
-            if i not in top_indices
-        ]
+            # Rest in original index order
+            for idx in indices:
+                if idx not in top_idx_set:
+                    ordered_pts.append(machine_paths[idx])
+                    ordered_roles.append(path_roles[idx])
+                    pos = machine_paths[idx][-1]
 
-        machine_paths = top_ordered + rest_ordered
-        top_total = sum(pl[0] for pl in path_lengths[:n_top])
-        print(f"  Priority: {n_top} longest paths ({top_total:.0f} mm) drawn first")
+            top_mm = sum(gl[0] for gl in grp_lengths[:n_top])
+            return ordered_pts, ordered_roles, top_mm
+
+        edge_pts, edge_r, edge_top_mm = _reorder_group(
+            edge_indices, (0.0, 0.0),
+        )
+        hatch_start = edge_pts[-1][-1] if edge_pts else (0.0, 0.0)
+        hatch_pts, hatch_r, hatch_top_mm = _reorder_group(
+            hatch_indices, hatch_start,
+        )
+
+        machine_paths = edge_pts + hatch_pts
+        path_roles = edge_r + hatch_r
+        n_top_e = max(1, len(edge_indices) // 100) if edge_indices else 0
+        n_top_h = max(1, len(hatch_indices) // 100) if hatch_indices else 0
+        print(f"  Priority: {n_top_e} edge + {n_top_h} hatch longest "
+              f"({edge_top_mm + hatch_top_mm:.0f} mm) drawn first in group")
 
     # Compute drawing distance
     for mpts in machine_paths:

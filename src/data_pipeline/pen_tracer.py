@@ -573,8 +573,9 @@ def _remove_spikes(
         if l_in < 1e-9 or l_out < 1e-9:
             continue
         cos_a = np.dot(v_in, v_out) / (l_in * l_out)
-        # cos_a ≈ -1 means straight; cos_a ≈ +1 means full reversal
-        if cos_a > cos_thresh and min(l_in, l_out) < max_spike_len:
+        # cos_a = +1 → same direction (straight); cos_a = -1 → full reversal
+        # A spike is a near-reversal: cos_a < cos(150°) ≈ -0.866
+        if cos_a < cos_thresh and min(l_in, l_out) < max_spike_len:
             keep[i] = False
 
     cleaned = pts[keep]
@@ -812,44 +813,66 @@ def generate_hatch_pattern(
         return []
 
     # -- Phase 2: stitch consecutive sweep lines into serpentine chains ---
-    # Only bridge between the END of one sweep line and the START of the
-    # next.  Never bridge between multiple segments on the SAME sweep line
-    # (those gaps represent holes in the mask where the pen must lift).
-    # This prevents diagonal crossing artifacts that occur when the bridge
-    # cuts across the hatching direction.
+    # For each sweep line pick the segment whose start is closest to the
+    # current chain's tail.  Bridge to it if the gap is small enough.
+    # All OTHER segments on the same sweep line are saved separately
+    # WITHOUT breaking the main chain.  This keeps the main serpentine
+    # long (one per contiguous region) and avoids the old bug where every
+    # multi-segment sweep line would fragment the chain into 2-line stubs
+    # that all clustered near the edge.
     max_bridge_mm = hatch_spacing_px * max(sx_mm_per_px, sy_mm_per_px) * 1.5
 
     hatch_paths_mm: List[np.ndarray] = []
+    overflow_segs: List[np.ndarray] = []
     current_chain: List[np.ndarray] = []
 
     for segs in sweep_lines:
         if not segs:
             continue
 
-        # --- First segment: try to bridge from previous chain -----------
-        first_seg = segs[0]
         if current_chain:
             tail = current_chain[-1][-1]
-            head = first_seg[0]
-            gap = float(np.linalg.norm(tail - head))
+            best_k = 0
+            best_d = float(np.linalg.norm(tail - segs[0][0]))
+            for k in range(1, len(segs)):
+                d = float(np.linalg.norm(tail - segs[k][0]))
+                if d < best_d:
+                    best_d = d
+                    best_k = k
 
-            if gap <= max_bridge_mm:
-                current_chain.append(first_seg)
+            if best_d <= max_bridge_mm:
+                current_chain.append(segs[best_k])
             else:
                 hatch_paths_mm.append(np.vstack(current_chain))
-                current_chain = [first_seg]
-        else:
-            current_chain = [first_seg]
+                current_chain = [segs[best_k]]
 
-        # --- Remaining segments on the same sweep line: separate paths --
-        # Each extra segment is separated by a gap in the mask; bridging
-        # them would draw across empty (white) areas.
-        for seg in segs[1:]:
-            hatch_paths_mm.append(np.vstack(current_chain))
-            current_chain = [seg]
+            for k in range(len(segs)):
+                if k != best_k:
+                    overflow_segs.append(segs[k])
+        else:
+            current_chain = [segs[0]]
+            for seg in segs[1:]:
+                overflow_segs.append(seg)
 
     if current_chain:
         hatch_paths_mm.append(np.vstack(current_chain))
+
+    # Build additional serpentines from the overflow segments.
+    # Sort by first-point position along the sweep axis so adjacent
+    # segments in the same sub-region are consecutive, then stitch.
+    if overflow_segs:
+        overflow_segs.sort(key=lambda s: (s[0][0], s[0][1]))
+        chain: List[np.ndarray] = [overflow_segs[0]]
+        for seg in overflow_segs[1:]:
+            tail = chain[-1][-1]
+            head = seg[0]
+            if float(np.linalg.norm(tail - head)) <= max_bridge_mm:
+                chain.append(seg)
+            else:
+                hatch_paths_mm.append(np.vstack(chain))
+                chain = [seg]
+        if chain:
+            hatch_paths_mm.append(np.vstack(chain))
 
     return hatch_paths_mm
 
@@ -873,7 +896,8 @@ def _compute_total_distance(paths: List[dict]) -> float:
 
 def _merge_adjacent_paths(
     paths: list[dict],
-    merge_tol_mm: float = 0.8,
+    merge_tol_mm: float = 0.4,
+    max_angle_deg: float = 45.0,
 ) -> list[dict]:
     """Merge paths whose endpoints are within *merge_tol_mm*.
 
@@ -881,12 +905,22 @@ def _merge_adjacent_paths(
     with reversal) to reduce pen lifts.  Runs before the GNN ordering
     step so that the optimizer works on longer, fewer polylines.
 
+    A direction-continuity check prevents merging paths at T-junctions
+    where the bridge line would create a visible diagonal artifact.
+    The bridge direction must be within ±max_angle_deg of both the
+    exit direction (of the first path) and the entry direction (of the
+    second path).
+
     Parameters
     ----------
     paths : list[dict]
         Path dicts with ``points_mm`` (list of [x, y]).
     merge_tol_mm : float
         Maximum endpoint gap (mm) that will be bridged.
+    max_angle_deg : float
+        Maximum angle (degrees) between the bridge direction and
+        each path's endpoint tangent.  Rejects merges that would
+        create a sharp visible kink.
 
     Returns
     -------
@@ -897,63 +931,91 @@ def _merge_adjacent_paths(
         return paths
 
     from scipy.spatial import cKDTree
+    import heapq
 
     n = len(paths)
+    cos_min = np.cos(np.radians(max_angle_deg))
 
-    # Pre-extract numpy arrays for fast access
     starts = np.array([p['points_mm'][0] for p in paths])
     ends = np.array([p['points_mm'][-1] for p in paths])
 
-    # Build KD-trees for start and end points
+    # Direction at each endpoint (tangent vector).  Use a longer baseline
+    # (up to 3 points back) to get a stable direction on noisy curves.
+    end_dirs = np.zeros((n, 2))
+    start_dirs = np.zeros((n, 2))
+    for i, p in enumerate(paths):
+        pts = p['points_mm']
+        k = min(3, len(pts) - 1)
+        end_dirs[i] = np.array(pts[-1]) - np.array(pts[-1 - k])
+        start_dirs[i] = np.array(pts[k]) - np.array(pts[0])
+
+    def _dirs_compatible(exit_dir: np.ndarray,
+                         bridge: np.ndarray,
+                         entry_dir: np.ndarray) -> bool:
+        """Check bridge direction aligns with exit and entry tangents."""
+        bn = np.linalg.norm(bridge)
+        if bn < 1e-6:
+            return True  # zero-length bridge always OK
+        b_hat = bridge / bn
+
+        en = np.linalg.norm(exit_dir)
+        if en > 1e-6:
+            if np.dot(exit_dir / en, b_hat) < cos_min:
+                return False
+
+        inn = np.linalg.norm(entry_dir)
+        if inn > 1e-6:
+            if np.dot(b_hat, entry_dir / inn) < cos_min:
+                return False
+        return True
+
     start_tree = cKDTree(starts)
     end_tree = cKDTree(ends)
 
-    # For each path, track which chain it belongs to.
-    # chain_id[i] = id of chain that path i is in.
-    # chains maps chain_id -> list of (path_idx, reversed_flag).
-    chain_id = list(range(n))
-    chains: dict[int, list[tuple[int, bool]]] = {
-        i: [(i, False)] for i in range(n)
-    }
-
-    # Track which chain each path's head/tail belongs to
-    # head_of[chain_id] = first path index in chain
-    # tail_of[chain_id] = last path index in chain
-    head_of: dict[int, int] = {i: i for i in range(n)}
-    tail_of: dict[int, int] = {i: i for i in range(n)}
-
-    # Current effective start/end for each chain (updated after merges)
-    chain_start: dict[int, np.ndarray] = {i: starts[i].copy() for i in range(n)}
-    chain_end: dict[int, np.ndarray] = {i: ends[i].copy() for i in range(n)}
-
-    # Find all candidate pairs (end_i -> start_j) within tolerance
-    # end of path i close to start of path j => chain i before j
     pairs_end_start = end_tree.query_ball_tree(start_tree, merge_tol_mm)
-    # end of path i close to end of path j => chain i before reversed j
     pairs_end_end = end_tree.query_ball_tree(end_tree, merge_tol_mm)
-    # start of path i close to start of path j => reversed i before j
     pairs_start_start = start_tree.query_ball_tree(start_tree, merge_tol_mm)
 
-    # Build a priority queue of candidate merges sorted by distance (shortest first)
-    import heapq
     merge_candidates: list[tuple[float, int, int, str]] = []
+    rejected_angle = 0
 
     for i in range(n):
         for j in pairs_end_start[i]:
             if i == j:
                 continue
-            d = float(np.linalg.norm(ends[i] - starts[j]))
+            bridge = starts[j] - ends[i]
+            if not _dirs_compatible(end_dirs[i], bridge, start_dirs[j]):
+                rejected_angle += 1
+                continue
+            d = float(np.linalg.norm(bridge))
             heapq.heappush(merge_candidates, (d, i, j, 'end_start'))
         for j in pairs_end_end[i]:
             if i == j:
                 continue
-            d = float(np.linalg.norm(ends[i] - ends[j]))
+            bridge = ends[j] - ends[i]
+            # j will be reversed → its entry direction = -end_dirs[j]
+            if not _dirs_compatible(end_dirs[i], bridge, -end_dirs[j]):
+                rejected_angle += 1
+                continue
+            d = float(np.linalg.norm(bridge))
             heapq.heappush(merge_candidates, (d, i, j, 'end_end'))
         for j in pairs_start_start[i]:
             if i == j:
                 continue
-            d = float(np.linalg.norm(starts[i] - starts[j]))
+            bridge = starts[j] - starts[i]
+            # i will be reversed → its exit direction = -start_dirs[i]
+            if not _dirs_compatible(-start_dirs[i], bridge, start_dirs[j]):
+                rejected_angle += 1
+                continue
+            d = float(np.linalg.norm(bridge))
             heapq.heappush(merge_candidates, (d, i, j, 'start_start'))
+
+    chain_id = list(range(n))
+    chains: dict[int, list[tuple[int, bool]]] = {
+        i: [(i, False)] for i in range(n)
+    }
+    head_of: dict[int, int] = {i: i for i in range(n)}
+    tail_of: dict[int, int] = {i: i for i in range(n)}
 
     merges_done = 0
 
@@ -963,10 +1025,8 @@ def _merge_adjacent_paths(
         ci = chain_id[i]
         cj = chain_id[j]
         if ci == cj:
-            continue  # Already in the same chain
+            continue
 
-        # Only merge if i is at the tail of its chain and j at the head of its chain
-        # (or vice versa depending on kind), so we don't break existing chains.
         if kind == 'end_start':
             if tail_of[ci] != i or head_of[cj] != j:
                 continue
@@ -977,25 +1037,19 @@ def _merge_adjacent_paths(
             if head_of[ci] != i or head_of[cj] != j:
                 continue
 
-        # Merge cj into ci
         if kind == 'end_start':
-            # ci chain ... -> i (end) ==close== j (start) -> ... cj chain
             chains[ci].extend(chains[cj])
         elif kind == 'end_end':
-            # ci chain ... -> i (end) ==close== j (end) <- ... cj chain (reversed)
             chains[ci].extend([(idx, not rev) for idx, rev in reversed(chains[cj])])
         elif kind == 'start_start':
-            # cj chain (reversed) ... -> i (start) ==close== j (start) -> ... ci chain
             reversed_ci = [(idx, not rev) for idx, rev in reversed(chains[ci])]
             chains[ci] = reversed_ci
             chains[ci].extend(chains[cj])
 
-        # Update chain membership
         for idx, _ in chains[cj]:
             chain_id[idx] = ci
         del chains[cj]
 
-        # Update head/tail pointers
         first_idx = chains[ci][0][0]
         last_idx = chains[ci][-1][0]
         first_rev = chains[ci][0][1]
@@ -1004,16 +1058,10 @@ def _merge_adjacent_paths(
         head_of[ci] = first_idx
         tail_of[ci] = last_idx
 
-        # Update effective endpoints
-        chain_start[ci] = ends[first_idx] if first_rev else starts[first_idx]
-        chain_end[ci] = starts[last_idx] if last_rev else ends[last_idx]
-
         merges_done += 1
 
-    # Reconstruct merged paths
     merged: list[dict] = []
     for cid, members in chains.items():
-        # Concatenate points from all members
         all_pts: list[list[float]] = []
         first_path = paths[members[0][0]]
 
@@ -1022,7 +1070,6 @@ def _merge_adjacent_paths(
             if is_reversed:
                 pts = pts[::-1]
             if all_pts:
-                # Skip first point to avoid duplication at the junction
                 pts = pts[1:] if len(pts) > 1 else pts
             all_pts.extend(pts)
 
@@ -1042,7 +1089,8 @@ def _merge_adjacent_paths(
 
     logger.info(
         f"  Path merge: {n} -> {len(merged)} paths "
-        f"({merges_done} merges, tol={merge_tol_mm:.1f}mm)"
+        f"({merges_done} merges, {rejected_angle} rejected by angle, "
+        f"tol={merge_tol_mm:.1f}mm, max_angle={max_angle_deg:.0f}°)"
     )
     return merged
 
@@ -1288,21 +1336,31 @@ def make_pen_layer(
     from PIL import Image
     img_pil = Image.open(target_rgb_path).convert('RGB')
     
-    # Determine target resolution
+    # Determine target resolution (preserving aspect ratio strictly)
     orig_w, orig_h = img_pil.size
     if pen_tracer_cfg.output.target_height_px is not None:
-        target_h = pen_tracer_cfg.output.target_height_px
-        # Clamp to min/max
-        target_h = max(pen_tracer_cfg.output.min_px, min(target_h, pen_tracer_cfg.output.max_px))
-        
-        # Maintain aspect ratio
+        lo = pen_tracer_cfg.output.min_px
+        hi = pen_tracer_cfg.output.max_px
         aspect = orig_w / orig_h
+
+        # Start from the configured target height and compute the
+        # matching width.  If either dimension exceeds the pixel
+        # bounds, scale both down together so the aspect ratio is
+        # never broken.
+        target_h = max(lo, min(pen_tracer_cfg.output.target_height_px, hi))
         target_w = int(target_h * aspect)
-        
-        # Clamp width too
-        target_w = max(pen_tracer_cfg.output.min_px, min(target_w, pen_tracer_cfg.output.max_px))
-        
-        logger.info(f"Upscaling from {orig_w}x{orig_h} to {target_w}x{target_h} (aspect ratio: {aspect:.2f})")
+
+        if target_w > hi:
+            target_w = hi
+            target_h = int(target_w / aspect)
+        if target_w < lo:
+            target_w = lo
+            target_h = int(target_w / aspect)
+        target_h = max(lo, min(target_h, hi))
+
+        logger.info(f"Upscaling from {orig_w}x{orig_h} to {target_w}x{target_h} "
+                     f"(aspect ratio: {aspect:.2f}, preserved: "
+                     f"{abs(target_w / target_h - aspect) < 0.01})")
         img_pil = img_pil.resize((target_w, target_h), Image.Resampling.LANCZOS)
     else:
         target_w, target_h = orig_w, orig_h
@@ -1603,7 +1661,9 @@ def make_pen_layer(
     hatch_paths_raw = [p for p in all_paths if p['role'] == 'hatch']
 
     # Merge edges (fragmented outline segments benefit from chaining).
-    edge_paths_merged = _merge_adjacent_paths(edge_paths_raw, merge_tol_mm=0.8)
+    edge_paths_merged = _merge_adjacent_paths(
+        edge_paths_raw, merge_tol_mm=0.4, max_angle_deg=45.0,
+    )
 
     # Do NOT merge hatch paths.  The serpentine generator already produces
     # continuous chains where possible, and aggressive merge connects
