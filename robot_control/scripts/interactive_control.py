@@ -39,7 +39,8 @@ from robot_control.hardware.klipper_client import (
 )
 
 PRINTER_CFG_PATH = Path.home() / "printer.cfg"
-SOCKET_PATH = "/tmp/klippy_uds"
+_CFG = load_config()
+SOCKET_PATH = _CFG.connection.socket_path
 ETX = b"\x03"
 
 # Keep logging quiet so the curses TUI is clean

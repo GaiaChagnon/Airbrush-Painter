@@ -62,7 +62,7 @@ from robot_control.configs.printer_cfg import generate_printer_cfg
 
 _CFG = load_config()
 
-SOCKET_PATH = "/tmp/klippy_uds"
+SOCKET_PATH = _CFG.connection.socket_path
 PRINTER_CFG_PATH = Path.home() / "printer.cfg"
 ETX = b"\x03"
 

@@ -526,6 +526,61 @@ def _smooth_polyline(pts: np.ndarray, iterations: int = 2) -> np.ndarray:
     return pts
 
 
+def _remove_spikes(
+    pts: np.ndarray,
+    angle_threshold_deg: float = 30.0,
+    length_ratio: float = 0.15,
+) -> np.ndarray:
+    """Remove sharp spikes from a polyline.
+
+    A spike is a vertex where the path makes a sharp turn (> 180 - threshold)
+    and the detour is short relative to the direct distance.  This eliminates
+    the triangular artifacts that appear at T-junctions in schematics.
+
+    Parameters
+    ----------
+    pts : np.ndarray
+        Polyline, shape (N, 2).
+    angle_threshold_deg : float
+        A junction is a spike candidate if the angle between the incoming
+        and outgoing segments is less than this value (i.e., nearly a
+        reversal).  Default 30 deg means angles < 30 deg (nearly 180 deg
+        turn) are checked.
+    length_ratio : float
+        The spike arm must be shorter than this fraction of the total
+        path length to be removed.
+
+    Returns
+    -------
+    cleaned : np.ndarray
+        Polyline with spikes removed, shape (M, 2) with M <= N.
+    """
+    if len(pts) < 3:
+        return pts
+
+    total_len = np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1))
+    if total_len < 1e-6:
+        return pts
+    max_spike_len = total_len * length_ratio
+    cos_thresh = np.cos(np.radians(180.0 - angle_threshold_deg))
+
+    keep = np.ones(len(pts), dtype=bool)
+    for i in range(1, len(pts) - 1):
+        v_in = pts[i] - pts[i - 1]
+        v_out = pts[i + 1] - pts[i]
+        l_in = np.linalg.norm(v_in)
+        l_out = np.linalg.norm(v_out)
+        if l_in < 1e-9 or l_out < 1e-9:
+            continue
+        cos_a = np.dot(v_in, v_out) / (l_in * l_out)
+        # cos_a ≈ -1 means straight; cos_a ≈ +1 means full reversal
+        if cos_a > cos_thresh and min(l_in, l_out) < max_spike_len:
+            keep[i] = False
+
+    cleaned = pts[keep]
+    return cleaned if len(cleaned) >= 2 else pts
+
+
 def vectorize_edges(
     edge_mask: np.ndarray,
     simplify_tol_px: float,
@@ -588,13 +643,15 @@ def extract_gamut_aware_shadows(
     img_lab: torch.Tensor,
     gamut_mask: np.ndarray,
     darkness_levels: List[validators.PenTracerV2DarknessLevel],
-    min_area_px: int
+    min_area_px: int,
+    mm_per_px: float = 0.0,
+    min_dimension_mm: float = 0.5,
 ) -> Dict[Tuple[int, int], np.ndarray]:
     """Extract shadow regions outside CMY gamut at different darkness levels.
-    
+
     Each level is EXCLUSIVE (only includes pixels in that specific range).
     This prevents overlapping/double-tracing.
-    
+
     Parameters
     ----------
     img_lab : torch.Tensor
@@ -604,8 +661,15 @@ def extract_gamut_aware_shadows(
     darkness_levels : List[PenTracerV2DarknessLevel]
         Darkness thresholds and pass counts
     min_area_px : int
-        Minimum region area
-    
+        Minimum region area in pixels
+    mm_per_px : float
+        Uniform mm-per-pixel scale.  When > 0, regions whose bounding
+        box is smaller than ``min_dimension_mm`` in both width and height
+        are discarded.
+    min_dimension_mm : float
+        Minimum bounding-box dimension in mm (both W and H must exceed
+        this or the region is dropped).  Default 0.5 mm.
+
     Returns
     -------
     shadow_masks : Dict[Tuple[int, int], np.ndarray]
@@ -613,26 +677,29 @@ def extract_gamut_aware_shadows(
     """
     L_channel = img_lab[0].numpy()
     shadow_masks = {}
-    
+
     for level_idx, level in enumerate(darkness_levels):
-        # EXCLUSIVE range: l_min <= L* < l_max
-        # This ensures no overlap between levels
         in_range = (L_channel >= level.l_min) & (L_channel < level.l_max)
         dark_mask = in_range.astype(np.uint8) * 255
-        
-        # Intersect with out-of-gamut mask
-        # Only hatch regions that are BOTH in-range AND out-of-gamut
+
         combined_mask = cv2.bitwise_and(dark_mask, gamut_mask)
-        
-        # Remove small regions
-        if min_area_px > 0:
+
+        # Remove small regions (pixel area + mm bounding-box filter)
+        if min_area_px > 0 or mm_per_px > 0:
             num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
                 combined_mask, connectivity=8
             )
             filtered = np.zeros_like(combined_mask)
             for i in range(1, num_labels):
-                if stats[i, cv2.CC_STAT_AREA] >= min_area_px:
-                    filtered[labels == i] = 255
+                area = stats[i, cv2.CC_STAT_AREA]
+                if area < min_area_px:
+                    continue
+                if mm_per_px > 0:
+                    w_mm = stats[i, cv2.CC_STAT_WIDTH] * mm_per_px
+                    h_mm = stats[i, cv2.CC_STAT_HEIGHT] * mm_per_px
+                    if w_mm < min_dimension_mm and h_mm < min_dimension_mm:
+                        continue
+                filtered[labels == i] = 255
             combined_mask = filtered
         
         if combined_mask.sum() > 0:
@@ -1250,11 +1317,21 @@ def make_pen_layer(
     H, W = target_h, target_w
     render_px = [W, H]
     
-    # Anisotropic scaling: separate X and Y scales for correct aspect ratio
-    sx_mm_per_px = work_area_mm[0] / W
-    sy_mm_per_px = work_area_mm[1] / H
-    
-    logger.info(f"  Resolution: {W}x{H} px, sx={sx_mm_per_px:.4f} mm/px, sy={sy_mm_per_px:.4f} mm/px")
+    # Uniform (isotropic) mm/px scaling -- preserves aspect ratio, never
+    # stretches.  The work_area_mm from the env config is used as a
+    # *reference size*: we pick the scale that fits the image into that
+    # bounding box without distortion, then set the output work_area_mm
+    # to the image's actual dimensions in mm.  Cropping / fitting to a
+    # specific paper size is the responsibility of robot_control.
+    s_mm_per_px = min(work_area_mm[0] / W, work_area_mm[1] / H)
+    sx_mm_per_px = s_mm_per_px
+    sy_mm_per_px = s_mm_per_px
+
+    # Override work_area_mm to the image's actual scaled dimensions
+    work_area_mm = [W * s_mm_per_px, H * s_mm_per_px]
+
+    logger.info(f"  Resolution: {W}x{H} px, scale={s_mm_per_px:.4f} mm/px (uniform)")
+    logger.info(f"  Output work_area_mm: {work_area_mm[0]:.1f} x {work_area_mm[1]:.1f} mm")
     
     # Initialize paths
     all_paths = []
@@ -1341,11 +1418,12 @@ def make_pen_layer(
         )
         logger.info(f"  After deduplication: {len(edge_polylines_px)}")
         
-        # Convert to mm and smooth
+        # Convert to mm, remove spikes, then smooth
         edge_polylines_mm = []
         for pts_px in edge_polylines_px:
             pts_mm = np.stack([pts_px[:,0] * sx_mm_per_px,
                               pts_px[:,1] * sy_mm_per_px], axis=1)
+            pts_mm = _remove_spikes(pts_mm, angle_threshold_deg=30.0)
             pts_mm = _smooth_polyline(pts_mm, iterations=2)
             edge_polylines_mm.append(pts_mm)
         
@@ -1375,7 +1453,9 @@ def make_pen_layer(
             img_lab,
             gamut_mask,
             pen_tracer_cfg.shadow_hatching.darkness_levels,
-            pen_tracer_cfg.shadow_hatching.min_area_px
+            pen_tracer_cfg.shadow_hatching.min_area_px,
+            mm_per_px=s_mm_per_px,
+            min_dimension_mm=0.5,
         )
         
         logger.info(f"  Extracted {len(shadow_masks)} shadow levels:")

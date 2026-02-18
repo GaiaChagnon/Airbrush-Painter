@@ -43,8 +43,8 @@ edge_detection:
   merge_kernel_size: 1
 
   # Filtering: keep short lines (fine detail matters in B&W)
-  min_length_px: 15
-  simplify_tol_px: 0.5
+  min_length_px: 10
+  simplify_tol_px: 0.4
 
   # Skeleton: multi-scale, sensitive hysteresis
   multiscale_sigmas: [0.6, 1.2, 2.0]
@@ -52,12 +52,12 @@ edge_detection:
   skeletonize: true
 
   # Gap linking: aggressive to reduce fragmentation
-  link_gap_px: 5
-  link_angle_deg: 30
+  link_gap_px: 6
+  link_angle_deg: 35
 
-  # Length/simplification in mm
-  min_len_mm: 1.0
-  rdp_tol_mm: 0.2
+  # Length/simplification in mm -- lower thresholds preserve text strokes
+  min_len_mm: 0.5
+  rdp_tol_mm: 0.15
 
   # Deduplication
   dedupe_min_sep_px: 2

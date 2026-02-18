@@ -31,9 +31,19 @@ from robot_control.job_ir.operations import (
     ToolUp,
 )
 
-# Default canvas centre for A4 (210 x 297 mm) -- used when no origin given
-_A4_CX = 105.0
-_A4_CY = 148.5
+# Canvas centre defaults -- loaded from machine.yaml if available,
+# else fall back to A4 (210x297).
+try:
+    from robot_control.configs.loader import load_config as _load_config
+    _cfg = _load_config()
+    _CANVAS_W = _cfg.canvas.width_mm
+    _CANVAS_H = _cfg.canvas.height_mm
+except Exception:
+    _CANVAS_W = 210.0
+    _CANVAS_H = 297.0
+
+_A4_CX = _CANVAS_W / 2.0
+_A4_CY = _CANVAS_H / 2.0
 
 
 # ---------------------------------------------------------------------------
