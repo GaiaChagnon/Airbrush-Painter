@@ -56,7 +56,10 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional
 
-from src.data_pipeline import pen_tracer
+try:
+    from src.data_pipeline import pen_tracer
+except ImportError:
+    pen_tracer = None  # type: ignore[assignment]
 from src.utils import validators, fs, gcode_generator
 
 logger = logging.getLogger(__name__)
@@ -156,10 +159,17 @@ def paint_main(
     composite_path = None
     
     if enable_pen_layer:
+        if pen_tracer is None:
+            logger.warning(
+                "pen_tracer module removed; pen layer generation disabled. "
+                "Use robot_control/scripts/run_lineart_tracer.py instead."
+            )
+            enable_pen_layer = False
+        
+    if enable_pen_layer:
         logger.info("Generating pen layer...")
         
         try:
-            # Generate pen layer from target image
             pen_result = pen_tracer.make_pen_layer(
                 target_rgb_path=target_image_path,
                 env_cfg_path=env_cfg_path,
