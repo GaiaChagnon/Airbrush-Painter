@@ -58,12 +58,13 @@ robot_control/
 
 ## Line-art tracer (`run_lineart_tracer.py`)
 
-Standalone single-file script that vectorizes images and draws them on the robot.  Three operating modes:
+Standalone single-file script that vectorizes images and draws them on the robot.  Four operating modes:
 
 | Mode | Purpose | Engine |
 |------|---------|--------|
 | `line_tracing` | B&W outlines for schematics, text, line drawings | Potrace + vpype |
-| `hatched` | Density-based hatch fill with gradient support | hatched library + vpype |
+| `hatched` | Colour hatching -- density-based fill good for photos | hatched library + vpype |
+| `hatching` | Zone-bounded cross-hatching with auto-detected gray levels | Custom scanline engine + vpype |
 | `flow_imager` | Flow-field streamlines for artistic rendering | vpype-flow-imager |
 
 ### Quick start
@@ -98,6 +99,21 @@ cp "data/raw_images/hard/Syringe Pump Drawing v1.png" robot_control/images/
 .venv/bin/python robot_control/scripts/run_lineart_tracer.py \
   --mode hatched --image-path "data/raw_images/hard/peakpx.jpg" \
   --no-outlines --dry-run --save-preview
+
+# Hatching mode -- zone-bounded cross-hatching (maps, diagrams)
+.venv/bin/python robot_control/scripts/run_lineart_tracer.py \
+  --mode hatching --image-path "robot_control/images/peakpx (4).jpg" \
+  --hatching-angles 45 -45 --dry-run
+
+# Hatching with 5 zones and single-direction hatching
+.venv/bin/python robot_control/scripts/run_lineart_tracer.py \
+  --mode hatching --image-path "robot_control/images/peakpx (4).jpg" \
+  --n-zones 5 --hatching-angles 45 --dry-run
+
+# Triple cross-hatching (0, 60, 120 degrees)
+.venv/bin/python robot_control/scripts/run_lineart_tracer.py \
+  --mode hatching --image-path "robot_control/images/peakpx (4).jpg" \
+  --hatching-angles 0 60 120 --dry-run
 
 # Flow-imager (artistic streamlines)
 .venv/bin/python robot_control/scripts/run_lineart_tracer.py \
@@ -140,7 +156,7 @@ CLI arguments override config values.  `lineart.yaml` is the primary config for 
 | `--image-path PATH` | -- | Direct path to any image (overrides `--image`) |
 | `--list` | -- | List available images and exit |
 | **Mode** | | |
-| `--mode` | `line_tracing` | `line_tracing`, `hatched`, or `flow_imager` |
+| `--mode` | `line_tracing` | `line_tracing`, `hatched`, `hatching`, or `flow_imager` |
 | **Line-tracing params** | | |
 | `--merge-tolerance` | 5.0 | Max pixel distance for vpype endpoint merging |
 | `--turdsize` | 10 | Potrace speckle filter (discard contours < N px^2) |
@@ -156,6 +172,13 @@ CLI arguments override config values.  `lineart.yaml` is the primary config for 
 | `--circular` | off | Concentric circles instead of diagonals |
 | `--invert` | off | Invert image before processing |
 | `--no-outlines` | off | Disable potrace outline overlay |
+| **Hatching params** | | |
+| `--n-zones` | 4 | Number of gray zones (incl. white).  Auto-detected from histogram |
+| `--hatching-angles N...` | 45 | Hatch angles (deg).  Multiple = cross-hatch (e.g., `45 -45`) |
+| `--hatching-blur` | 5 | Gaussian blur before zone detection |
+| `--hatching-scale` | 1.0 | Image scale factor (reduce for speed) |
+| `--hatching-no-outlines` | off | Disable potrace outline overlay |
+| `--connect-gap` | 5.0 | Max pixel gap for zigzag line connection |
 | **Flow-imager params** | | |
 | `--noise-coeff` | 0.001 | Simplex noise frequency (smaller = smoother) |
 | `--n-fields` | 1 | Rotated field copies (1=smooth, 6=hexagonal) |

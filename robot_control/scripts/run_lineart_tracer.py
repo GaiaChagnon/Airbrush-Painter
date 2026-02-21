@@ -131,6 +131,7 @@ def _load_lineart_config() -> dict:
 _LINEART = _load_lineart_config()
 _LINEART_LT = _LINEART.get("line_tracing", {})
 _LINEART_HATCH = _LINEART.get("hatched", {})
+_LINEART_HTNG = _LINEART.get("hatching", {})
 _LINEART_FLOW = _LINEART.get("flow_imager", {})
 _LINE_WIDTH_MM = float(_LINEART.get("line_width_mm", 0.3))
 
@@ -695,6 +696,408 @@ def save_vectors_yaml(
 
 
 # ===========================================================================
+# Zone-bounded hatching pipeline
+# ===========================================================================
+
+
+def _hatch_mask_at_angle(
+    mask: np.ndarray, pitch_px: float, angle_deg: float,
+) -> list[np.ndarray]:
+    """Generate hatching lines inside *mask* at a given angle and pitch.
+
+    Rotates the mask so that hatch lines become horizontal scanlines,
+    extracts runs of True pixels per row, then rotates the resulting
+    segments back.  Fully vectorized -- no per-pixel Python loops.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Boolean mask, shape ``(H, W)``.
+    pitch_px : float
+        Perpendicular spacing between hatch lines (px).
+    angle_deg : float
+        Hatch angle in degrees (0 = horizontal, 45 = diagonal).
+
+    Returns
+    -------
+    list[np.ndarray]
+        Polylines in original image coordinates, shape ``(N, 2)`` each.
+    """
+    H, W = mask.shape
+    cx, cy = W / 2.0, H / 2.0
+    theta = -math.radians(angle_deg)
+
+    # Rotate mask so hatch lines become horizontal rows
+    rot_mat = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
+    diag = int(math.ceil(math.sqrt(H * H + W * W)))
+    # Shift center so rotated image fits
+    rot_mat[0, 2] += (diag - W) / 2.0
+    rot_mat[1, 2] += (diag - H) / 2.0
+    rot_mask = cv2.warpAffine(
+        mask.astype(np.uint8), rot_mat, (diag, diag),
+        flags=cv2.INTER_NEAREST, borderValue=0,
+    )
+
+    # Inverse rotation matrix (to map rotated coords back to original)
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    shift_x = (diag - W) / 2.0
+    shift_y = (diag - H) / 2.0
+
+    # Process horizontal scanlines at pitch_px spacing.
+    # Alternate left-right / right-left per row for zigzag connectivity.
+    segments: list[np.ndarray] = []
+    step = max(int(round(pitch_px)), 1)
+    row_idx = 0
+    for row in range(0, diag, step):
+        line = rot_mask[row, :]
+        if not line.any():
+            row_idx += 1
+            continue
+
+        padded = np.concatenate([[0], line, [0]])
+        d = np.diff(padded.astype(np.int8))
+        starts = np.where(d == 1)[0]
+        ends = np.where(d == -1)[0]
+
+        row_segs: list[np.ndarray] = []
+        for s, e in zip(starts, ends):
+            if e - s < 2:
+                continue
+            xs_rot = np.arange(s, e, dtype=np.float64)
+            ys_rot = np.full_like(xs_rot, row, dtype=np.float64)
+            xs_shifted = xs_rot - shift_x - cx
+            ys_shifted = ys_rot - shift_y - cy
+            xs_orig = cos_t * xs_shifted - sin_t * ys_shifted + cx
+            ys_orig = sin_t * xs_shifted + cos_t * ys_shifted + cy
+            row_segs.append(np.column_stack((xs_orig, ys_orig)))
+
+        # Reverse segment order and each segment for odd rows (zigzag)
+        if row_idx % 2 == 1:
+            row_segs = [seg[::-1] for seg in reversed(row_segs)]
+
+        segments.extend(row_segs)
+        row_idx += 1
+
+    return segments
+
+
+def _zigzag_connect(
+    segments: list[np.ndarray], max_gap_px: float = 5.0,
+) -> list[np.ndarray]:
+    """Connect nearby line segments into continuous zigzag paths.
+
+    Segments from adjacent scanlines whose endpoints are within
+    *max_gap_px* are concatenated to reduce pen lifts.
+
+    Parameters
+    ----------
+    segments : list[np.ndarray]
+        Input polylines, shape ``(N, 2)`` each.
+    max_gap_px : float
+        Maximum pixel gap to bridge between segment endpoints.
+
+    Returns
+    -------
+    list[np.ndarray]
+        Connected polylines.
+    """
+    if not segments:
+        return []
+
+    chains: list[list[np.ndarray]] = [[segments[0]]]
+    for seg in segments[1:]:
+        last_chain = chains[-1]
+        last_end = last_chain[-1][-1]
+        seg_start = seg[0]
+        seg_end = seg[-1]
+
+        dist_fwd = np.linalg.norm(seg_start - last_end)
+        dist_rev = np.linalg.norm(seg_end - last_end)
+
+        if dist_fwd <= max_gap_px:
+            last_chain.append(seg)
+        elif dist_rev <= max_gap_px:
+            last_chain.append(seg[::-1])
+        else:
+            chains.append([seg])
+
+    result: list[np.ndarray] = []
+    for chain in chains:
+        combined = np.concatenate(chain, axis=0)
+        if len(combined) >= 2:
+            result.append(combined)
+    return result
+
+
+def _auto_thresholds(gray: np.ndarray, n_zones: int) -> list[int]:
+    """Compute *n_zones - 1* thresholds that split the histogram into zones.
+
+    Uses percentiles of the non-white pixel distribution so that each
+    zone contains a roughly equal number of dark pixels.  The lightest
+    zone (above the last threshold) receives no hatching.
+
+    Parameters
+    ----------
+    gray : np.ndarray
+        Grayscale image, dtype uint8, shape ``(H, W)``.
+    n_zones : int
+        Number of distinct darkness zones (including the white/no-hatch zone).
+
+    Returns
+    -------
+    list[int]
+        Sorted thresholds (ascending), length ``n_zones - 1``.
+    """
+    pixels = gray[gray < 245].astype(np.float64)
+    if len(pixels) == 0:
+        return list(np.linspace(64, 200, n_zones - 1).astype(int))
+
+    pcts = np.linspace(0, 100, n_zones + 1)[1:-1]
+    thresholds = np.percentile(pixels, pcts).astype(int).tolist()
+    return sorted(set(max(1, min(254, t)) for t in thresholds))
+
+
+def _process_hatching(
+    image_path: Path,
+    paper_w: float,
+    paper_h: float,
+    margin: float,
+    *,
+    n_zones: int = 4,
+    pen_width_mm: float = 0.3,
+    angles: list[float] | None = None,
+    blur_radius: int = 5,
+    image_scale: float = 1.0,
+    include_outlines: bool = True,
+    outline_turdsize: int = 10,
+    merge_tolerance_px: float = 5.0,
+    simplify_tol_mm: float = 0.05,
+    min_path_mm: float = 0.3,
+    connect_gap_px: float = 5.0,
+    t0: float = 0.0,
+) -> tuple[list[np.ndarray], list[np.ndarray], float, float, float, int, int]:
+    """Zone-bounded hatching with auto-level detection and cross-hatching.
+
+    Unlike the ``hatched`` mode (which uses the ``hatched`` library and
+    can bleed across zone boundaries), this mode:
+
+    1. Auto-detects *n_zones* gray levels from the image histogram.
+    2. Creates a binary mask for each zone.
+    3. Generates parallel scanlines clipped to each zone's mask.
+    4. Connects adjacent scanlines with zigzag patterns for continuity.
+    5. Supports cross-hatching (multiple angles per zone).
+
+    The darkest zone gets the densest fill (pitch = pen_width, effectively
+    solid).  Lighter zones get progressively sparser hatching.  The lightest
+    zone (white) receives no hatching at all.
+
+    Parameters
+    ----------
+    n_zones : int
+        Number of gray zones (including white).  4 = 3 hatched zones + white.
+    pen_width_mm : float
+        Physical pen trace width (mm).  Densest zone uses this as pitch.
+    angles : list[float] or None
+        Hatching angles in degrees.  ``[45]`` = single direction,
+        ``[45, -45]`` = cross-hatch, ``[0, 60, 120]`` = triple cross.
+        If None, defaults to ``[45]``.
+    blur_radius : int
+        Gaussian blur before zone detection; smooths transitions.
+    image_scale : float
+        Scale image before processing (reduce for speed).
+    include_outlines : bool
+        If True, also trace potrace outlines on top.
+    connect_gap_px : float
+        Max pixel gap for zigzag connection within zones.
+
+    Returns
+    -------
+    Same 7-tuple as ``process_image``.
+    """
+    if angles is None:
+        angles = [45.0]
+
+    print("  [1/6] Loading and preprocessing image...")
+    pil_img = Image.open(str(image_path)).convert("L")
+    orig_w, orig_h = pil_img.size
+
+    if image_scale != 1.0:
+        pil_img = pil_img.resize(
+            (int(orig_w * image_scale), int(orig_h * image_scale)),
+            Image.LANCZOS,
+        )
+
+    gray = np.array(pil_img, dtype=np.uint8)
+    H, W = gray.shape
+
+    if blur_radius > 0:
+        ksize = blur_radius * 2 + 1
+        gray = cv2.GaussianBlur(gray, (ksize, ksize), 0)
+
+    # Compute drawable area and scaling
+    drawable_w = paper_w - 2.0 * margin
+    drawable_h = paper_h - 2.0 * margin
+    mm_per_px = min(drawable_w / W, drawable_h / H)
+    image_w_mm = W * mm_per_px
+    image_h_mm = H * mm_per_px
+    pen_width_px = pen_width_mm / mm_per_px
+
+    print(f"        Image: {W} x {H} px -> {image_w_mm:.1f} x {image_h_mm:.1f} mm")
+    print(f"        Pen width: {pen_width_mm:.2f} mm = {pen_width_px:.1f} px")
+    print(f"        Zones: {n_zones}, angles: {angles}")
+
+    # [2/6] Auto-detect zone thresholds
+    print("  [2/6] Auto-detecting gray level thresholds...")
+    thresholds = _auto_thresholds(gray, n_zones)
+    print(f"        Thresholds: {thresholds}")
+
+    # Build individual zone masks.
+    # zone 0 = darkest (below first threshold) -- gets densest fill.
+    # zone n-2 = lightest hatched -- gets sparsest fill.
+    # zone n-1 (above last threshold) = white -- no hatching.
+    n_hatched_zones = len(thresholds)
+    zone_masks: list[np.ndarray] = []
+    for i in range(n_hatched_zones):
+        upper = thresholds[i]
+        if i == 0:
+            mask = gray < upper
+        else:
+            lower = thresholds[i - 1]
+            mask = (gray >= lower) & (gray < upper)
+        zone_masks.append(mask)
+
+    # Erode masks slightly to prevent hatching from bleeding at edges
+    erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    for i in range(len(zone_masks)):
+        zone_masks[i] = cv2.erode(
+            zone_masks[i].astype(np.uint8), erode_kernel, iterations=1,
+        ).astype(bool)
+
+    zone_pixels = [int(m.sum()) for m in zone_masks]
+    print(f"        Zone pixels: {zone_pixels}")
+
+    # [3/6] Generate hatching for each zone
+    print("  [3/6] Generating zone-bounded hatching lines...")
+    all_hatch_segments: list[np.ndarray] = []
+
+    for zone_idx in range(n_hatched_zones):
+        # Pitch: zone 0 (darkest) = pen_width  (solid fill).
+        #        zone n-1 (lightest hatched) = pen_width * n.
+        density_factor = zone_idx + 1
+        pitch_px = pen_width_px * density_factor
+
+        if pitch_px < 1.0:
+            pitch_px = 1.0
+
+        mask = zone_masks[zone_idx]
+        if not mask.any():
+            continue
+
+        # Adjacent diagonal scanlines are up to pitch * sqrt(2) apart;
+        # use that as the minimum connect gap.
+        effective_gap = max(connect_gap_px, pitch_px * 1.5)
+
+        zone_segments: list[np.ndarray] = []
+        for angle in angles:
+            clipped = _hatch_mask_at_angle(mask, pitch_px, angle)
+            connected = _zigzag_connect(clipped, max_gap_px=effective_gap)
+            zone_segments.extend(connected)
+
+        n_segs = len(zone_segments)
+        total_pts = sum(len(s) for s in zone_segments)
+        print(f"        Zone {zone_idx} (thr<{thresholds[zone_idx]}): "
+              f"pitch={pitch_px:.1f}px, "
+              f"{n_segs} paths, {total_pts} pts")
+        all_hatch_segments.extend(zone_segments)
+
+    print(f"        Total: {len(all_hatch_segments)} hatch paths")
+
+    # [4/6] Optionally add potrace outlines
+    outline_paths: list[np.ndarray] = []
+    if include_outlines:
+        print("  [4/6] Tracing outlines (potrace)...")
+        binary = (gray < thresholds[0]).astype(np.uint8)
+        bmp = potrace.Bitmap(binary)
+        traced = bmp.trace(turdsize=outline_turdsize, alphamax=1.0,
+                           opticurve=True)
+        for curve in traced.curves:
+            pts: list[np.ndarray] = [np.array(curve.start_point)]
+            for seg in curve.segments:
+                if seg.is_corner:
+                    pts.append(np.array(seg.c))
+                    pts.append(np.array(seg.end_point))
+                else:
+                    p0 = pts[-1]
+                    p1 = np.array(seg.c1)
+                    p2 = np.array(seg.c2)
+                    p3 = np.array(seg.end_point)
+                    pts.extend(_flatten_bezier(p0, p1, p2, p3, tol=0.5))
+            pts.append(np.array(curve.start_point))
+            outline_paths.append(np.array(pts, dtype=np.float64))
+        print(f"        {len(outline_paths)} outline contours")
+    else:
+        print("  [4/6] Outlines disabled, skipping.")
+
+    all_paths_px = all_hatch_segments + outline_paths
+
+    if not all_paths_px:
+        return [], [], image_w_mm, image_h_mm, mm_per_px, H, W
+
+    # [5/6] vpype merge + sort
+    print(f"  [5/6] Merging & sorting ({len(all_paths_px)} paths)...")
+    lc = vpype.LineCollection()
+    for arr in all_paths_px:
+        cline = arr[:, 0] + 1j * arr[:, 1]
+        lc.append(cline)
+
+    lc.merge(tolerance=merge_tolerance_px, flip=True)
+    print(f"        {len(lc)} paths after merge")
+
+    li = vpype.LineIndex(lc.lines, reverse=True)
+    sorted_lines: list[np.ndarray] = []
+    if len(li) > 0:
+        first = li.pop_front()
+        sorted_lines.append(first)
+        while len(li) > 0:
+            last_pt = sorted_lines[-1][-1]
+            idx, rev = li.find_nearest(last_pt)
+            path = li.pop(idx)
+            if path is None:
+                break
+            if rev:
+                path = path[::-1]
+            sorted_lines.append(path)
+
+    # Convert complex -> (N,2) in pixel coords, scale to mm, filter
+    paths_px: list[np.ndarray] = []
+    paths_mm: list[np.ndarray] = []
+    for cline in sorted_lines:
+        arr = np.column_stack((cline.real, cline.imag)).astype(np.float64)
+        if len(arr) < 2:
+            continue
+        p_mm = arr * mm_per_px
+        length = float(np.sum(np.hypot(*np.diff(p_mm, axis=0).T)))
+        if length >= min_path_mm:
+            paths_px.append(arr)
+            paths_mm.append(p_mm)
+
+    paths_mm = simplify_paths(paths_mm, simplify_tol_mm)
+    paths_px = [p / mm_per_px for p in paths_mm]
+
+    elapsed = time.monotonic() - t0
+    total_draw_mm = sum(
+        float(np.sum(np.hypot(*np.diff(p, axis=0).T))) for p in paths_mm
+    )
+    print(f"  [6/6] Done.")
+    print(f"        Paths: {len(paths_mm)}")
+    print(f"        Total drawing distance: {total_draw_mm:.0f} mm")
+    print(f"        Processing time: {elapsed:.1f} s")
+
+    return paths_mm, paths_px, image_w_mm, image_h_mm, mm_per_px, H, W
+
+
+# ===========================================================================
 # Flow-imager processing pipeline
 # ===========================================================================
 
@@ -909,14 +1312,23 @@ def process_image(
     flow_field_type: str = "noise",
     flow_edge_field_mult: float | None = None,
     flow_dark_field_mult: float | None = None,
+    hatching_n_zones: int = 4,
+    hatching_pen_width_mm: float = 0.3,
+    hatching_angles: list[float] | None = None,
+    hatching_blur_radius: int = 5,
+    hatching_image_scale: float = 1.0,
+    hatching_include_outlines: bool = True,
+    hatching_outline_turdsize: int = 10,
+    hatching_connect_gap_px: float = 5.0,
 ) -> tuple[list[np.ndarray], list[np.ndarray], float, float, float, int, int]:
     """Run the full vectorisation pipeline on an image.
 
-    Three operating modes:
+    Four operating modes:
 
     - **line_tracing**: potrace outlines + vpype merge/sort.
-    - **hatched**: density-based hatch fill with gradient support.
-    - **flow_imager**: flow-field streamlines driven by image brightness.
+    - **hatched**: density-based hatch fill (``hatched`` library).
+    - **hatching**: zone-bounded cross-hatching with auto-levels.
+    - **flow_imager**: flow-field streamlines.
 
     Returns
     -------
@@ -932,6 +1344,23 @@ def process_image(
         Image pixel dimensions.
     """
     t0 = time.monotonic()
+
+    if mode == "hatching":
+        return _process_hatching(
+            image_path, paper_w, paper_h, margin,
+            n_zones=hatching_n_zones,
+            pen_width_mm=hatching_pen_width_mm,
+            angles=hatching_angles,
+            blur_radius=hatching_blur_radius,
+            image_scale=hatching_image_scale,
+            include_outlines=hatching_include_outlines,
+            outline_turdsize=hatching_outline_turdsize,
+            merge_tolerance_px=merge_tolerance_px,
+            simplify_tol_mm=simplify_tol_mm,
+            min_path_mm=min_path_mm,
+            connect_gap_px=hatching_connect_gap_px,
+            t0=t0,
+        )
 
     if mode == "hatched":
         return _process_hatched(
@@ -1724,9 +2153,10 @@ def main() -> None:
     # ---- Operating mode ----
     parser.add_argument(
         "--mode", type=str, default=_default_mode,
-        choices=["line_tracing", "hatched", "flow_imager"],
+        choices=["line_tracing", "hatched", "hatching", "flow_imager"],
         help="Operating mode: 'line_tracing' (B&W outlines), "
-             "'hatched' (density-based hatch fill), or "
+             "'hatched' (colour hatching, good for photos), "
+             "'hatching' (zone-bounded cross-hatching with auto-levels), or "
              "'flow_imager' (flow-field streamlines)",
     )
 
@@ -1790,6 +2220,42 @@ def main() -> None:
     hatch_group.add_argument(
         "--no-outlines", action="store_true",
         help="Disable potrace outline overlay in hatched mode",
+    )
+
+    # ---- Hatching mode parameters (zone-bounded) ----
+    htng_group = parser.add_argument_group(
+        "Hatching mode parameters (only used when --mode hatching)")
+    htng_group.add_argument(
+        "--n-zones", type=int,
+        default=_LINEART_HTNG.get("n_zones", 4),
+        help="Number of gray zones including white (4 = 3 hatched + white). "
+             "Auto-detected from image histogram (default: 4)",
+    )
+    htng_group.add_argument(
+        "--hatching-angles", type=float, nargs="+",
+        default=_LINEART_HTNG.get("angles", [45.0]),
+        help="Hatching angles in degrees.  Single value = one direction, "
+             "multiple = cross-hatch (e.g., 45 -45 for X-pattern) "
+             "(default: 45)",
+    )
+    htng_group.add_argument(
+        "--hatching-blur", type=int,
+        default=_LINEART_HTNG.get("blur_radius", 5),
+        help="Gaussian blur radius before zone detection (default: 5)",
+    )
+    htng_group.add_argument(
+        "--hatching-scale", type=float,
+        default=_LINEART_HTNG.get("image_scale", 1.0),
+        help="Image scale factor; reduce for speed (default: 1.0)",
+    )
+    htng_group.add_argument(
+        "--hatching-no-outlines", action="store_true",
+        help="Disable potrace outline overlay in hatching mode",
+    )
+    htng_group.add_argument(
+        "--connect-gap", type=float,
+        default=_LINEART_HTNG.get("connect_gap_px", 5.0),
+        help="Max pixel gap for zigzag connection within zones (default: 5)",
     )
 
     # ---- Flow-imager mode parameters ----
@@ -2006,7 +2472,8 @@ def main() -> None:
     # ---- Banner ----
     _mode_banners = {
         "line_tracing": "PEN PLOTTER - LINE ART TRACER",
-        "hatched": "PEN PLOTTER - HATCHED FILL + GRADIENT MODE",
+        "hatched": "PEN PLOTTER - COLOUR HATCHING (hatched library)",
+        "hatching": "PEN PLOTTER - ZONE-BOUNDED CROSS-HATCHING",
         "flow_imager": "PEN PLOTTER - FLOW FIELD IMAGER",
     }
     print("=" * 60)
@@ -2024,6 +2491,15 @@ def main() -> None:
         print(f"  Levels:      {list(args.levels)} ({len(args.levels) + 1} zones)")
         print(f"  Pitch:       {args.hatch_pitch:.2f} mm")
         print(f"  Outlines:    {'yes' if not args.no_outlines else 'no'}")
+    elif args.mode == "hatching":
+        angle_str = ", ".join(f"{a:.0f}" for a in args.hatching_angles)
+        cross = "cross-hatch" if len(args.hatching_angles) > 1 else "single"
+        print(f"  Zones:       {args.n_zones} (auto-detected levels)")
+        print(f"  Angles:      [{angle_str}] deg ({cross})")
+        print(f"  Pen width:   {_LINE_WIDTH_MM:.2f} mm")
+        print(f"  Blur:        {args.hatching_blur}")
+        print(f"  Outlines:    {'yes' if not args.hatching_no_outlines else 'no'}")
+        print(f"  Connect gap: {args.connect_gap:.1f} px")
     elif args.mode == "flow_imager":
         print(f"  Field type:  {args.field_type}")
         print(f"  Flow seed:   {args.flow_seed}")
@@ -2086,6 +2562,14 @@ def main() -> None:
         flow_field_type=args.field_type,
         flow_edge_field_mult=args.edge_field_mult,
         flow_dark_field_mult=args.dark_field_mult,
+        hatching_n_zones=args.n_zones,
+        hatching_pen_width_mm=_LINE_WIDTH_MM,
+        hatching_angles=args.hatching_angles,
+        hatching_blur_radius=args.hatching_blur,
+        hatching_image_scale=args.hatching_scale,
+        hatching_include_outlines=not args.hatching_no_outlines,
+        hatching_outline_turdsize=_LINEART_HTNG.get("outline_turdsize", 10),
+        hatching_connect_gap_px=args.connect_gap,
     )
 
     if not paths_mm:

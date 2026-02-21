@@ -7,7 +7,7 @@
 # Canvas geometry (paper size, origin, margin) is read from jobs.yaml.
 # All linear dimensions in millimeters unless stated otherwise.
 
-# Operating mode: "line_tracing", "hatched", or "flow_imager"
+# Operating mode: "line_tracing", "hatched", "hatching", or "flow_imager"
 mode: line_tracing
 
 # --- Physical pen properties ------------------------------------------------
@@ -45,6 +45,24 @@ hatched:
   min_path_mm: 0.3                   # Drop paths shorter than this (mm)
   simplify_tol_mm: 0.05              # Douglas-Peucker tolerance (mm)
   merge_tolerance_px: 5.0            # vpype endpoint merge tolerance (px)
+
+# --- Hatching mode (zone-bounded cross-hatching) ------------------------------
+# Best for: maps, diagrams, images with distinct gray regions.
+# Auto-detects gray zones from the image histogram and fills each zone with
+# hatching lines clipped to its boundary.  Supports cross-hatching (multiple
+# angles) and zigzag connection for continuous pen paths.
+hatching:
+  n_zones: 4                           # Total zones incl. white.  4 = 3 hatched + white
+  angles: [45.0]                       # Hatching angles (deg).  [45, -45] = cross-hatch,
+                                       # [0, 60, 120] = triple cross
+  blur_radius: 5                       # Gaussian blur before zone detection
+  image_scale: 1.0                     # Scale factor; reduce for speed
+  include_outlines: true               # Overlay potrace outlines on top
+  outline_turdsize: 10                 # Potrace turdsize for outlines
+  connect_gap_px: 5.0                  # Max px gap for zigzag line connection
+  min_path_mm: 0.3                     # Drop paths shorter than this (mm)
+  simplify_tol_mm: 0.05                # Douglas-Peucker tolerance (mm)
+  merge_tolerance_px: 5.0              # vpype endpoint merge tolerance (px)
 
 # --- Flow-imager mode (vpype-flow-imager) ------------------------------------
 # Best for: artistic renderings, stylized reproductions, abstract line art.
