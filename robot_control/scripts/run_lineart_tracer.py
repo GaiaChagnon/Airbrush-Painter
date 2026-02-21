@@ -574,19 +574,25 @@ def render_machine_preview(
         cy = int(round((pb + ph - y_mm) * dpi))  # flip Y
         return cx, cy
 
+    # Scale factor relative to the 10 px/mm baseline
+    sf = dpi / 10.0
+    line_w = max(1, int(round(sf)))
+
     # Draw paper border (light grey)
     paper_corners = transform.get_paper_corners()
     paper_pts = np.array(
         [mm_to_canvas(x, y) for x, y in paper_corners], dtype=np.int32,
     ).reshape(-1, 1, 2)
-    cv2.polylines(canvas, [paper_pts], isClosed=True, color=(200, 200, 200), thickness=2)
+    cv2.polylines(canvas, [paper_pts], isClosed=True,
+                  color=(200, 200, 200), thickness=max(2, int(2 * sf)))
 
-    # Draw margin boundary (medium grey, dashed via segments)
+    # Draw margin boundary (medium grey)
     margin_corners = transform.get_margin_corners()
     margin_pts = np.array(
         [mm_to_canvas(x, y) for x, y in margin_corners], dtype=np.int32,
     ).reshape(-1, 1, 2)
-    cv2.polylines(canvas, [margin_pts], isClosed=True, color=(160, 160, 160), thickness=1)
+    cv2.polylines(canvas, [margin_pts], isClosed=True,
+                  color=(160, 160, 160), thickness=line_w)
 
     # Draw all vectorised paths (black)
     for mpts in machine_paths:
@@ -595,17 +601,20 @@ def render_machine_preview(
         pts = np.array(
             [mm_to_canvas(x, y) for x, y in mpts], dtype=np.int32,
         ).reshape(-1, 1, 2)
-        cv2.polylines(canvas, [pts], isClosed=False, color=(0, 0, 0), thickness=1)
+        cv2.polylines(canvas, [pts], isClosed=False,
+                      color=(0, 0, 0), thickness=line_w)
 
-    # Annotate dimensions along bottom and right edges
+    # Annotate dimensions
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.4
+    font_scale = 0.4 * sf
     font_color = (120, 120, 120)
-    thickness = 1
+    font_thick = max(1, int(sf))
+    line_spacing = int(14 * sf)
 
     # Paper size label (bottom-left)
     label = f"{pw:.0f} x {ph:.0f} mm"
-    cv2.putText(canvas, label, (5, canvas_h - 8), font, font_scale, font_color, thickness)
+    cv2.putText(canvas, label, (int(5 * sf), canvas_h - int(8 * sf)),
+                font, font_scale, font_color, font_thick)
 
     # Margin label (inside margin top-left)
     mx, my = mm_to_canvas(
@@ -614,18 +623,17 @@ def render_machine_preview(
     )
     cv2.putText(
         canvas, f"margin {transform.margin:.0f} mm",
-        (mx, my + 12), font, font_scale * 0.9, font_color, thickness,
+        (mx, my + int(12 * sf)), font, font_scale * 0.9,
+        font_color, font_thick,
     )
 
     # Stats + config annotation (top-right area inside margin)
     if stats:
         info_lines: list[str] = []
 
-        # Mode line
         mode = stats.get("mode", "?")
         info_lines.append(f"Mode: {mode}")
 
-        # CLI overrides (only values that differ from config defaults)
         overrides = stats.get("cli_overrides", [])
         if overrides:
             info_lines.append("CLI overrides:")
@@ -643,11 +651,11 @@ def render_machine_preview(
             transform.draw_left + transform.draw_width - 50.0,
             transform.draw_bottom + transform.draw_height - 2.0,
         )
-        for k, line in enumerate(info_lines):
+        for k, line_txt in enumerate(info_lines):
             cv2.putText(
-                canvas, line,
-                (sx, sy + k * 14 + 14), font, font_scale * 0.85,
-                font_color, thickness,
+                canvas, line_txt,
+                (sx, sy + k * line_spacing + line_spacing),
+                font, font_scale * 0.85, font_color, font_thick,
             )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -718,9 +726,13 @@ def _hatch_mask_at_angle(
 ) -> list[np.ndarray]:
     """Generate hatching lines inside *mask* at a given angle and pitch.
 
-    Rotates the mask so that hatch lines become horizontal scanlines,
-    extracts runs of True pixels per row, then rotates the resulting
-    segments back.  Fully vectorized -- no per-pixel Python loops.
+    Algorithm:
+    1. Pad mask into a square canvas large enough that no pixels are
+       clipped after rotation.
+    2. Rotate the padded canvas around its centre.
+    3. Extract horizontal scanline runs from the rotated mask.
+    4. Map the run coordinates back to the *original* (un-padded) image
+       frame using ``cv2.invertAffineTransform``.
 
     Parameters
     ----------
@@ -737,33 +749,28 @@ def _hatch_mask_at_angle(
         Polylines in original image coordinates, shape ``(N, 2)`` each.
     """
     H, W = mask.shape
-    cx, cy = W / 2.0, H / 2.0
     diag = int(math.ceil(math.sqrt(H * H + W * W)))
-    new_cx, new_cy = diag / 2.0, diag / 2.0
 
-    # Build rotation matrix that maps dst (rotated) -> src (original).
-    # cv2.warpAffine uses M to look up src pixels for each dst pixel.
-    rot_mat = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
+    # Step 1: Pad mask into a diag x diag canvas, centred
+    pad_x = (diag - W) // 2
+    pad_y = (diag - H) // 2
+    padded_mask = np.zeros((diag, diag), dtype=np.uint8)
+    padded_mask[pad_y:pad_y + H, pad_x:pad_x + W] = mask.astype(np.uint8)
 
-    # Correct center-shift for enlarged canvas: (cx,cy) in dst must map
-    # to (cx,cy) in src after the canvas grows to (diag x diag).
-    sx = new_cx - cx
-    sy = new_cy - cy
-    rot_mat[0, 2] -= rot_mat[0, 0] * sx + rot_mat[0, 1] * sy
-    rot_mat[1, 2] -= rot_mat[1, 0] * sx + rot_mat[1, 1] * sy
-
+    # Step 2: Rotate around the centre of the padded canvas
+    centre = (diag / 2.0, diag / 2.0)
+    fwd_mat = cv2.getRotationMatrix2D(centre, angle_deg, 1.0)
     rot_mask = cv2.warpAffine(
-        mask.astype(np.uint8), rot_mat, (diag, diag),
+        padded_mask, fwd_mat, (diag, diag),
         flags=cv2.INTER_NEAREST, borderValue=0,
     )
 
-    # rot_mat already maps dst -> src, so applying it to rotated-frame
-    # points gives original-frame coordinates directly.
-    m00, m01, m02 = rot_mat[0]
-    m10, m11, m12 = rot_mat[1]
+    # Step 3 & 4: Extract scanlines and map back to original coords
+    # invertAffineTransform gives us M_inv: rotated coords -> padded coords
+    inv_mat = cv2.invertAffineTransform(fwd_mat)
+    i00, i01, i02 = inv_mat[0]
+    i10, i11, i12 = inv_mat[1]
 
-    # Process horizontal scanlines at pitch_px spacing.
-    # Alternate left-right / right-left per row for zigzag connectivity.
     segments: list[np.ndarray] = []
     step = max(int(round(pitch_px)), 1)
     row_idx = 0
@@ -773,8 +780,9 @@ def _hatch_mask_at_angle(
             row_idx += 1
             continue
 
-        padded = np.concatenate([[0], line, [0]])
-        d = np.diff(padded.astype(np.int8))
+        # Find contiguous runs of True pixels
+        bordered = np.concatenate([[0], line, [0]])
+        d = np.diff(bordered.astype(np.int8))
         starts = np.where(d == 1)[0]
         ends = np.where(d == -1)[0]
 
@@ -784,11 +792,18 @@ def _hatch_mask_at_angle(
                 continue
             xs_rot = np.arange(s, e, dtype=np.float64)
             ys_rot = np.full_like(xs_rot, row, dtype=np.float64)
-            xs_orig = m00 * xs_rot + m01 * ys_rot + m02
-            ys_orig = m10 * xs_rot + m11 * ys_rot + m12
+
+            # Rotated -> padded coords via inverse matrix
+            xs_pad = i00 * xs_rot + i01 * ys_rot + i02
+            ys_pad = i10 * xs_rot + i11 * ys_rot + i12
+
+            # Padded -> original image coords (subtract padding offset)
+            xs_orig = xs_pad - pad_x
+            ys_orig = ys_pad - pad_y
+
             row_segs.append(np.column_stack((xs_orig, ys_orig)))
 
-        # Reverse segment order and each segment for odd rows (zigzag)
+        # Alternate direction per row for zigzag connectivity
         if row_idx % 2 == 1:
             row_segs = [seg[::-1] for seg in reversed(row_segs)]
 
@@ -1014,16 +1029,22 @@ def _process_hatching(
         # use that as the minimum connect gap.
         effective_gap = max(connect_gap_px, pitch_px * 1.5)
 
+        # Light zones (upper half of gradient) use single-direction
+        # hatching; only the darker half gets the full cross-hatch.
+        is_light = zone_idx >= n_hatched_zones / 2.0
+        zone_angles = [angles[0]] if (is_light and len(angles) > 1) else angles
+
         zone_segments: list[np.ndarray] = []
-        for angle in angles:
+        for angle in zone_angles:
             clipped = _hatch_mask_at_angle(mask, pitch_px, angle)
             connected = _zigzag_connect(clipped, max_gap_px=effective_gap)
             zone_segments.extend(connected)
 
         n_segs = len(zone_segments)
         total_pts = sum(len(s) for s in zone_segments)
+        cross_label = "cross" if len(zone_angles) > 1 else "single"
         print(f"        Zone {zone_idx} (thr<{thresholds[zone_idx]}): "
-              f"pitch={pitch_px:.1f}px, "
+              f"pitch={pitch_px:.1f}px {cross_label}, "
               f"{n_segs} paths, {total_pts} pts")
         all_hatch_segments.extend(zone_segments)
 
@@ -2806,7 +2827,7 @@ def main() -> None:
         if args.dry_run:
             preview_path = DEFAULT_PREVIEW_DIR / f"{stem}_preview.png"
             render_machine_preview(
-                machine_paths, xform, preview_path, dpi=10.0, stats=stats,
+                machine_paths, xform, preview_path, dpi=20.0, stats=stats,
             )
 
         if not args.dry_run:
