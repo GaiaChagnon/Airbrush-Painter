@@ -38,6 +38,7 @@ pyclipper>=1.3.0
 pypotrace>=0.3.0
 vpype>=1.14.0
 hatched @ git+https://github.com/plottertools/hatched.git
+vpype-flow-imager[all] @ git+https://github.com/serycjon/vpype-flow-imager.git
 
 # GUI (optional, comment out if headless)
 PyQt5>=5.15.10

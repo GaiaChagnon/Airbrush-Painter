@@ -58,12 +58,13 @@ robot_control/
 
 ## Line-art tracer (`run_lineart_tracer.py`)
 
-Standalone single-file script that vectorizes images and draws them on the robot.  Two operating modes:
+Standalone single-file script that vectorizes images and draws them on the robot.  Three operating modes:
 
 | Mode | Purpose | Engine |
 |------|---------|--------|
 | `line_tracing` | B&W outlines for schematics, text, line drawings | Potrace + vpype |
 | `hatched` | Density-based hatch fill with gradient support | hatched library + vpype |
+| `flow_imager` | Flow-field streamlines for artistic rendering | vpype-flow-imager |
 
 ### Quick start
 
@@ -77,6 +78,10 @@ cp "data/raw_images/hard/Syringe Pump Drawing v1.png" robot_control/images/
 # Line-tracing dry-run (B&W outlines, no robot)
 .venv/bin/python robot_control/scripts/run_lineart_tracer.py \
   --image "Syringe Pump Drawing v1.png" --dry-run --save-preview
+
+# Line-tracing with higher threshold (for maps with light-gray features)
+.venv/bin/python robot_control/scripts/run_lineart_tracer.py \
+  --image "peakpx (4).jpg" --threshold 180 --dry-run --save-preview
 
 # Hatched mode dry-run (density gradients)
 .venv/bin/python robot_control/scripts/run_lineart_tracer.py \
@@ -94,13 +99,24 @@ cp "data/raw_images/hard/Syringe Pump Drawing v1.png" robot_control/images/
   --mode hatched --image-path "data/raw_images/hard/peakpx.jpg" \
   --no-outlines --dry-run --save-preview
 
-# Execute on the robot (line_tracing mode)
+# Flow-imager (artistic streamlines)
+.venv/bin/python robot_control/scripts/run_lineart_tracer.py \
+  --mode flow_imager --image-path "data/raw_images/hard/peakpx (2).jpg" \
+  --dry-run --save-preview
+
+# Flow-imager with hexagonal pattern and edge following
+.venv/bin/python robot_control/scripts/run_lineart_tracer.py \
+  --mode flow_imager --image-path "data/raw_images/hard/peakpx.jpg" \
+  --n-fields 6 --edge-field-mult 1.0 --dry-run --save-preview
+
+# Flow-imager with curl noise and dark-area swirling
+.venv/bin/python robot_control/scripts/run_lineart_tracer.py \
+  --mode flow_imager --image-path "data/raw_images/hard/peakpx.jpg" \
+  --field-type curl_noise --dark-field-mult 1.0 --dry-run --save-preview
+
+# Execute on the robot (any mode)
 .venv/bin/python robot_control/scripts/run_lineart_tracer.py \
   --image "Syringe Pump Drawing v1.png"
-
-# Execute on the robot (hatched mode)
-.venv/bin/python robot_control/scripts/run_lineart_tracer.py \
-  --mode hatched --image-path "data/raw_images/hard/peakpx (2).jpg"
 ```
 
 ### Configuration
@@ -124,7 +140,7 @@ CLI arguments override config values.  `lineart.yaml` is the primary config for 
 | `--image-path PATH` | -- | Direct path to any image (overrides `--image`) |
 | `--list` | -- | List available images and exit |
 | **Mode** | | |
-| `--mode` | `line_tracing` | `line_tracing` (B&W outlines) or `hatched` (gradient fill) |
+| `--mode` | `line_tracing` | `line_tracing`, `hatched`, or `flow_imager` |
 | **Line-tracing params** | | |
 | `--merge-tolerance` | 5.0 | Max pixel distance for vpype endpoint merging |
 | `--turdsize` | 10 | Potrace speckle filter (discard contours < N px^2) |
@@ -140,6 +156,18 @@ CLI arguments override config values.  `lineart.yaml` is the primary config for 
 | `--circular` | off | Concentric circles instead of diagonals |
 | `--invert` | off | Invert image before processing |
 | `--no-outlines` | off | Disable potrace outline overlay |
+| **Flow-imager params** | | |
+| `--noise-coeff` | 0.001 | Simplex noise frequency (smaller = smoother) |
+| `--n-fields` | 1 | Rotated field copies (1=smooth, 6=hexagonal) |
+| `--flow-min-sep` | 0.8 | Min flowline separation (px) |
+| `--flow-max-sep` | 10.0 | Max flowline separation (px) |
+| `--flow-min-length` | 0.0 | Min flowline length (px) |
+| `--flow-max-length` | 40.0 | Max flowline length (px) |
+| `--flow-max-size` | 800 | Resize image largest side (px) |
+| `--flow-seed` | 42 | PRNG seed for flow field |
+| `--field-type` | noise | `noise` or `curl_noise` |
+| `--edge-field-mult` | off | Blend edge-following field (try 1.0) |
+| `--dark-field-mult` | off | Blend dark-curling field (try 1.0) |
 | **Z-axis** | | |
 | `--z-contact` | from jobs.yaml | Z position where pen touches paper (mm) |
 | `--z-retract` | from jobs.yaml | Retract distance above contact (mm) |

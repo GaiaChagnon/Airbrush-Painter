@@ -1,23 +1,21 @@
 # lineart.yaml -- Configuration for the standalone line-art tracer script
 #
-# Controls vectorization mode, hatching parameters, and tracing defaults.
+# Controls vectorization mode, hatching, and flow-imager parameters.
 # CLI arguments override any value here.
 # Loaded by robot_control/scripts/run_lineart_tracer.py.
 #
 # Canvas geometry (paper size, origin, margin) is read from jobs.yaml.
 # All linear dimensions in millimeters unless stated otherwise.
 
-# Operating mode: "line_tracing" or "hatched"
-#   line_tracing  -- potrace outlines, no fill (B&W schematics / text)
-#   hatched       -- density-based hatching with gradient support (photos / art)
+# Operating mode: "line_tracing", "hatched", or "flow_imager"
 mode: line_tracing
 
 # --- Physical pen properties ------------------------------------------------
-# Used by hatched mode to compute minimum hatch spacing.
-# The hatch_pitch_mm should be >= line_width_mm to avoid ink bleed.
 line_width_mm: 0.3                   # Pen trace width on paper (mm)
 
 # --- Line-tracing mode (potrace + vpype) ------------------------------------
+# Best for: schematics, text, engineering drawings, maps.
+# For maps with light-gray features, increase threshold (try 180-200).
 line_tracing:
   turdsize: 10                       # Potrace speckle filter: discard contours
                                      # with area < this many px^2
@@ -27,33 +25,57 @@ line_tracing:
   threshold: null                    # Binary threshold 0-255; null = default 128
 
 # --- Hatched mode (hatched library + vpype) ----------------------------------
+# Best for: photos, portraits, illustrations, grayscale art.
 hatched:
-  pen_width_mm: 0.3                  # Physical pen trace width (mm);
-                                     # mirrors top-level line_width_mm
+  pen_width_mm: 0.3                  # Physical pen width (mirrors line_width_mm)
 
   # Threshold levels (0-255) dividing the grayscale image into zones.
-  # 3 thresholds = 4 zones: black | dark | light | white.
-  # The hatched library interleaves hatch density automatically:
-  #   zone 0 (darkest): pitch = 1x base    (densest)
-  #   zone 1:           pitch = 2x base
-  #   zone 2:           pitch = 4x base    (sparsest)
-  #   zone 3 (white):   no hatching
-  # More levels = smoother gradients (e.g., [32, 64, 96, 128, 160, 192, 224]).
+  # 3 thresholds = 4 zones; more levels = smoother gradients.
   levels: [64, 128, 192]
 
-  hatch_pitch_mm: 0.6                # Densest hatching pitch (~2x pen width);
-                                     # smaller = denser fill, min ~= pen_width_mm
+  hatch_pitch_mm: 0.6                # Densest hatching pitch (~2x pen width)
   hatch_angle_deg: 45.0              # Diagonal hatching angle (degrees)
-  blur_radius: 10                    # Gaussian blur radius before thresholding;
-                                     # smooths transitions, 0 = disabled
-  image_scale: 1.0                   # Scale factor applied to image before
-                                     # hatching; reduce for faster processing
-  circular: false                    # true = concentric circles, false = diagonal
+  blur_radius: 10                    # Gaussian blur before thresholding
+  image_scale: 1.0                   # Scale factor; reduce for speed
+  circular: false                    # true = concentric circles
   invert: false                      # Invert image before processing
 
-  include_outlines: true             # Overlay potrace outlines on hatched fill
-                                     # for crisper edges
-  outline_turdsize: 10               # Potrace turdsize when generating outlines
+  include_outlines: true             # Overlay potrace outlines for crisper edges
+  outline_turdsize: 10               # Potrace turdsize for outline overlay
+  min_path_mm: 0.3                   # Drop paths shorter than this (mm)
+  simplify_tol_mm: 0.05              # Douglas-Peucker tolerance (mm)
+  merge_tolerance_px: 5.0            # vpype endpoint merge tolerance (px)
+
+# --- Flow-imager mode (vpype-flow-imager) ------------------------------------
+# Best for: artistic renderings, stylized reproductions, abstract line art.
+# Uses density-modulated flow-field streamlines that follow image brightness.
+flow_imager:
+  # Flow field generation
+  noise_coeff: 0.001                 # Simplex noise frequency; smaller = smoother
+  n_fields: 1                        # Rotated field copies; 1=smooth,
+                                     # 3=triangular, 4=rectangular, 6=hexagonal
+  field_type: noise                  # "noise" (opensimplex) or "curl_noise" (curly)
+
+  # Streamline density and length (in px at max_size resolution)
+  min_sep: 0.8                       # Minimum flowline separation (px)
+  max_sep: 10.0                      # Maximum flowline separation (px)
+  min_length: 0.0                    # Minimum flowline length (px)
+  max_length: 40.0                   # Maximum flowline length (px)
+
+  # Image scaling
+  max_size: 800                      # Largest side resized to this (px);
+                                     # higher = more detail but slower
+
+  # Reproducibility -- all flow seeds identical for consistent results
+  flow_seed: 42                      # PRNG seed for flow field construction
+  search_ef: 50                      # HNSWlib search accuracy (higher = slower)
+  test_frequency: 2.0                # Separation tests per current line spacing
+
+  # Optional field modifiers (null = disabled)
+  edge_field_multiplier: null        # Blend edge-following field (try 1.0)
+  dark_field_multiplier: null        # Blend dark-curling field (try 1.0)
+
+  # Path post-processing
   min_path_mm: 0.3                   # Drop paths shorter than this (mm)
   simplify_tol_mm: 0.05              # Douglas-Peucker tolerance (mm)
   merge_tolerance_px: 5.0            # vpype endpoint merge tolerance (px)

@@ -1,27 +1,21 @@
 #!/usr/bin/env python3
-"""Standalone line-art tracer and hatched-fill generator for the robot pen plotter.
+"""Standalone line-art tracer, hatched-fill, and flow-imager for the robot pen plotter.
 
-Two operating modes:
+Three operating modes:
 
 **line_tracing** (default)
-    Potrace outlines with no fill -- faithful B&W line-by-line replication
-    of schematics, text, and engineering drawings.
+    Potrace outlines with no fill -- faithful B&W replication of
+    schematics, text, and engineering drawings.
 
 **hatched**
-    Density-based hatching with gradient support -- converts photos,
-    illustrations, and grayscale art into plotter-friendly hatch patterns.
+    Density-based hatching with gradient support -- converts photos
+    and grayscale art into plotter-friendly hatch patterns.
 
-Default method (line_tracing): potrace + vpype
-    1. Grayscale -> binary threshold.
-    2. Potrace extracts smooth Bezier outlines of black regions.
-    3. vpype ``merge`` joins endpoint-connected paths.
-    4. vpype ``LineIndex`` nearest-neighbour sort minimises pen lifts.
-    5. Paper transform -> G-code streaming to Klipper.
+**flow_imager**
+    Flow-field streamlines driven by image brightness -- artistic
+    line-art rendering with configurable density and field type.
 
 Usage::
-
-    # List images in robot_control/images/:
-    python robot_control/scripts/run_lineart_tracer.py --list
 
     # Line-tracing dry-run:
     python robot_control/scripts/run_lineart_tracer.py \\
@@ -30,6 +24,11 @@ Usage::
     # Hatched mode with gradient fill:
     python robot_control/scripts/run_lineart_tracer.py \\
         --mode hatched --image-path data/raw_images/hard/peakpx.jpg \\
+        --dry-run --save-preview
+
+    # Flow-imager mode:
+    python robot_control/scripts/run_lineart_tracer.py \\
+        --mode flow_imager --image-path data/raw_images/hard/peakpx.jpg \\
         --dry-run --save-preview
 
     # Execute on robot:
@@ -54,6 +53,7 @@ import potrace
 import vpype
 from hatched.hatched import _build_hatch, _load_image
 from PIL import Image
+from vpype_flow_imager.vpype_flow_imager import draw_image as flow_draw_image
 
 # ---------------------------------------------------------------------------
 # Project root and config loading
@@ -131,6 +131,7 @@ def _load_lineart_config() -> dict:
 _LINEART = _load_lineart_config()
 _LINEART_LT = _LINEART.get("line_tracing", {})
 _LINEART_HATCH = _LINEART.get("hatched", {})
+_LINEART_FLOW = _LINEART.get("flow_imager", {})
 _LINE_WIDTH_MM = float(_LINEART.get("line_width_mm", 0.3))
 
 
@@ -694,10 +695,185 @@ def save_vectors_yaml(
 
 
 # ===========================================================================
+# Flow-imager processing pipeline
+# ===========================================================================
+
+
+def _process_flow_imager(
+    image_path: Path,
+    paper_w: float,
+    paper_h: float,
+    margin: float,
+    *,
+    noise_coeff: float = 0.001,
+    n_fields: int = 1,
+    min_sep: float = 0.8,
+    max_sep: float = 10.0,
+    min_length: float = 0.0,
+    max_length: float = 40.0,
+    max_size: int = 800,
+    seed: int = 42,
+    flow_seed: int = 42,
+    search_ef: int = 50,
+    test_frequency: float = 2.0,
+    field_type: str = "noise",
+    edge_field_multiplier: float | None = None,
+    dark_field_multiplier: float | None = None,
+    merge_tolerance_px: float = 5.0,
+    simplify_tol_mm: float = 0.05,
+    min_path_mm: float = 0.3,
+    t0: float = 0.0,
+) -> tuple[list[np.ndarray], list[np.ndarray], float, float, float, int, int]:
+    """Generate flow-field streamline art from an image.
+
+    Uses vpype-flow-imager's ``draw_image`` to produce density-modulated
+    streamlines whose spacing follows image brightness.
+
+    Parameters
+    ----------
+    image_path : Path
+        Input image (colour or grayscale).
+    paper_w, paper_h, margin : float
+        Paper geometry in mm.
+    noise_coeff : float
+        Simplex noise frequency multiplier; smaller = smoother flow.
+    n_fields : int
+        Number of rotated copies of the flow field (1 = smooth,
+        3/4/6 = triangular/rectangular/hexagonal patterns).
+    min_sep, max_sep : float
+        Flowline separation range in px at max_size resolution.
+    min_length, max_length : float
+        Flowline length range in px.
+    max_size : int
+        Image is resized so its largest side is at most this many px.
+    seed, flow_seed : int
+        PRNG seeds for reproducibility.
+    field_type : str
+        ``"noise"`` (opensimplex) or ``"curl_noise"`` (curly).
+    edge_field_multiplier, dark_field_multiplier : float or None
+        If set, blend edge-following or dark-curling fields into the
+        noise field (try 1.0 as a starting point).
+
+    Returns
+    -------
+    Same 7-tuple as ``process_image``.
+    """
+    print("  [1/4] Loading image for flow-field generation...")
+    img = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
+
+    H_orig, W_orig = img.shape[:2]
+    drawable_w = paper_w - 2.0 * margin
+    drawable_h = paper_h - 2.0 * margin
+    mm_per_px = min(drawable_w / W_orig, drawable_h / H_orig)
+    image_w_mm = W_orig * mm_per_px
+    image_h_mm = H_orig * mm_per_px
+
+    alpha = None
+    if len(img.shape) == 3 and img.shape[2] == 4:
+        alpha = img[:, :, 3]
+
+    print(f"        Image: {W_orig} x {H_orig} px -> "
+          f"{image_w_mm:.1f} x {image_h_mm:.1f} mm")
+    print(f"        flow_seed={flow_seed}, field_type={field_type}, "
+          f"n_fields={n_fields}")
+    print(f"        sep=[{min_sep}, {max_sep}], "
+          f"length=[{min_length}, {max_length}], max_size={max_size}")
+
+    print("  [2/4] Generating flow-field streamlines...")
+    try:
+        from vpype_flow_imager.vpype_flow_imager import HNSWSearcher
+        searcher_class = HNSWSearcher
+    except ImportError:
+        from vpype_flow_imager.kdtree import KDTSearcher
+        searcher_class = KDTSearcher
+
+    numpy_paths = flow_draw_image(
+        img, alpha,
+        mult=noise_coeff,
+        n_fields=n_fields,
+        min_sep=min_sep,
+        max_sep=max_sep,
+        min_length=min_length,
+        max_length=max_length,
+        max_img_size=max_size,
+        flow_seed=flow_seed,
+        search_ef=search_ef,
+        test_frequency=test_frequency,
+        field_type=field_type,
+        transparent_val=127,
+        transparent_mask=False,
+        edge_field_multiplier=edge_field_multiplier,
+        dark_field_multiplier=dark_field_multiplier,
+        searcher_class=searcher_class,
+        rotate=0,
+        flow_image_data=None,
+    )
+    print(f"        {len(numpy_paths)} streamlines generated")
+
+    if not numpy_paths:
+        return [], [], image_w_mm, image_h_mm, mm_per_px, H_orig, W_orig
+
+    # Convert to vpype LineCollection for merge + sort
+    print(f"  [3/4] Merging & sorting ({len(numpy_paths)} paths)...")
+    lc = vpype.LineCollection()
+    for path in numpy_paths:
+        cline = path[:, 0] + 1j * path[:, 1]
+        lc.append(cline)
+
+    lc.merge(tolerance=merge_tolerance_px, flip=True)
+    print(f"        {len(lc)} paths after merge")
+
+    li = vpype.LineIndex(lc.lines, reverse=True)
+    sorted_lines: list[np.ndarray] = []
+    if len(li) > 0:
+        first = li.pop_front()
+        sorted_lines.append(first)
+        while len(li) > 0:
+            last_pt = sorted_lines[-1][-1]
+            idx, rev = li.find_nearest(last_pt)
+            path = li.pop(idx)
+            if path is None:
+                break
+            if rev:
+                path = path[::-1]
+            sorted_lines.append(path)
+
+    # Convert complex -> (N,2) float64 in pixel coords
+    paths_px: list[np.ndarray] = []
+    for cline in sorted_lines:
+        arr = np.column_stack((cline.real, cline.imag)).astype(np.float64)
+        if len(arr) >= 2:
+            paths_px.append(arr)
+
+    # Scale to mm and filter
+    paths_mm: list[np.ndarray] = []
+    for p in paths_px:
+        p_mm = p * mm_per_px
+        length = float(np.sum(np.hypot(*np.diff(p_mm, axis=0).T)))
+        if length >= min_path_mm:
+            paths_mm.append(p_mm)
+
+    paths_mm = simplify_paths(paths_mm, simplify_tol_mm)
+    paths_px = [p / mm_per_px for p in paths_mm]
+
+    elapsed = time.monotonic() - t0
+    total_draw_mm = sum(
+        float(np.sum(np.hypot(*np.diff(p, axis=0).T))) for p in paths_mm
+    )
+    print(f"  [4/4] Done.")
+    print(f"        Paths: {len(paths_mm)}")
+    print(f"        Total drawing distance: {total_draw_mm:.0f} mm")
+    print(f"        Processing time: {elapsed:.1f} s")
+
+    return paths_mm, paths_px, image_w_mm, image_h_mm, mm_per_px, H_orig, W_orig
+
+
+# ===========================================================================
 # Full image processing pipeline
 # ===========================================================================
 
-    return paths_mm, paths_px, image_w_mm, image_h_mm, mm_per_px, H, W
 
 def process_image(
     image_path: Path,
@@ -719,13 +895,28 @@ def process_image(
     hatch_invert: bool = False,
     hatch_include_outlines: bool = True,
     hatch_outline_turdsize: int = 10,
+    flow_noise_coeff: float = 0.001,
+    flow_n_fields: int = 1,
+    flow_min_sep: float = 0.8,
+    flow_max_sep: float = 10.0,
+    flow_min_length: float = 0.0,
+    flow_max_length: float = 40.0,
+    flow_max_size: int = 800,
+    flow_seed: int = 42,
+    flow_flow_seed: int = 42,
+    flow_search_ef: int = 50,
+    flow_test_frequency: float = 2.0,
+    flow_field_type: str = "noise",
+    flow_edge_field_mult: float | None = None,
+    flow_dark_field_mult: float | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray], float, float, float, int, int]:
     """Run the full vectorisation pipeline on an image.
 
-    Two operating modes:
+    Three operating modes:
 
     - **line_tracing**: potrace outlines + vpype merge/sort.
     - **hatched**: density-based hatch fill with gradient support.
+    - **flow_imager**: flow-field streamlines driven by image brightness.
 
     Returns
     -------
@@ -754,6 +945,29 @@ def process_image(
             invert=hatch_invert,
             include_outlines=hatch_include_outlines,
             outline_turdsize=hatch_outline_turdsize,
+            merge_tolerance_px=merge_tolerance_px,
+            simplify_tol_mm=simplify_tol_mm,
+            min_path_mm=min_path_mm,
+            t0=t0,
+        )
+
+    if mode == "flow_imager":
+        return _process_flow_imager(
+            image_path, paper_w, paper_h, margin,
+            noise_coeff=flow_noise_coeff,
+            n_fields=flow_n_fields,
+            min_sep=flow_min_sep,
+            max_sep=flow_max_sep,
+            min_length=flow_min_length,
+            max_length=flow_max_length,
+            max_size=flow_max_size,
+            seed=flow_seed,
+            flow_seed=flow_flow_seed,
+            search_ef=flow_search_ef,
+            test_frequency=flow_test_frequency,
+            field_type=flow_field_type,
+            edge_field_multiplier=flow_edge_field_mult,
+            dark_field_multiplier=flow_dark_field_mult,
             merge_tolerance_px=merge_tolerance_px,
             simplify_tol_mm=simplify_tol_mm,
             min_path_mm=min_path_mm,
@@ -1397,25 +1611,44 @@ def execute_on_robot(
     print()
 
     t_start = time.monotonic()
+    last_report_time = t_start
     prev_pct = -1
     DRAW_BATCH = 64
+    REPORT_INTERVAL_S = 60.0  # update at least every minute
 
     z_travel_c = max(Z_MIN_SAFE, min(z_travel, Z_MAX_SAFE))
     z_contact_c = max(Z_MIN_SAFE, min(z_contact, Z_MAX_SAFE))
 
     for path_idx, mpts in enumerate(machine_paths):
         pct = int(100.0 * (path_idx + 1) / len(machine_paths))
-        if pct >= prev_pct + 5 or path_idx == len(machine_paths) - 1:
-            elapsed = time.monotonic() - t_start
+        now = time.monotonic()
+        time_since_report = now - last_report_time
+        is_milestone = pct >= prev_pct + 5
+        is_timer = time_since_report >= REPORT_INTERVAL_S
+        is_last = path_idx == len(machine_paths) - 1
+
+        if is_milestone or is_timer or is_last:
+            elapsed = now - t_start
             frac = (path_idx + 1) / len(machine_paths)
             eta_s = (elapsed / frac - elapsed) if frac > 0.01 else 0.0
+            draw_done_mm = sum(
+                math.sqrt(
+                    (mpts[i][0] - mpts[i-1][0])**2
+                    + (mpts[i][1] - mpts[i-1][1])**2
+                )
+                for mp in machine_paths[:path_idx + 1]
+                for i in range(1, len(mp))
+            ) if path_idx < 20 else total_draw_mm * frac
+            speed_actual = draw_done_mm / elapsed if elapsed > 1.0 else 0.0
             sys.stdout.write(
                 f"\r  Path {path_idx + 1}/{len(machine_paths)} "
                 f"({pct}%)  elapsed: {elapsed / 60.0:.1f} min  "
-                f"ETA: {eta_s / 60.0:.1f} min    "
+                f"ETA: {eta_s / 60.0:.1f} min  "
+                f"speed: {speed_actual:.0f} mm/s    "
             )
             sys.stdout.flush()
             prev_pct = pct
+            last_report_time = now
 
         x0 = max(0.0, min(mpts[0][0], WORKSPACE_X_MM))
         y0 = max(0.0, min(mpts[0][1], WORKSPACE_Y_MM))
@@ -1491,9 +1724,10 @@ def main() -> None:
     # ---- Operating mode ----
     parser.add_argument(
         "--mode", type=str, default=_default_mode,
-        choices=["line_tracing", "hatched"],
-        help="Operating mode: 'line_tracing' (B&W outlines, default) or "
-             "'hatched' (density-based hatch fill with gradients)",
+        choices=["line_tracing", "hatched", "flow_imager"],
+        help="Operating mode: 'line_tracing' (B&W outlines), "
+             "'hatched' (density-based hatch fill), or "
+             "'flow_imager' (flow-field streamlines)",
     )
 
     # ---- Potrace / vpype parameters (line_tracing mode) ----
@@ -1556,6 +1790,67 @@ def main() -> None:
     hatch_group.add_argument(
         "--no-outlines", action="store_true",
         help="Disable potrace outline overlay in hatched mode",
+    )
+
+    # ---- Flow-imager mode parameters ----
+    flow_group = parser.add_argument_group(
+        "Flow-imager mode parameters (only used when --mode flow_imager)")
+    flow_group.add_argument(
+        "--noise-coeff", type=float,
+        default=_LINEART_FLOW.get("noise_coeff", 0.001),
+        help="Simplex noise frequency; smaller = smoother flow (default: 0.001)",
+    )
+    flow_group.add_argument(
+        "--n-fields", type=int,
+        default=_LINEART_FLOW.get("n_fields", 1),
+        help="Rotated copies of the flow field; 1=smooth, "
+             "3/4/6=triangular/rectangular/hexagonal (default: 1)",
+    )
+    flow_group.add_argument(
+        "--flow-min-sep", type=float,
+        default=_LINEART_FLOW.get("min_sep", 0.8),
+        help="Minimum flowline separation in px (default: 0.8)",
+    )
+    flow_group.add_argument(
+        "--flow-max-sep", type=float,
+        default=_LINEART_FLOW.get("max_sep", 10.0),
+        help="Maximum flowline separation in px (default: 10)",
+    )
+    flow_group.add_argument(
+        "--flow-min-length", type=float,
+        default=_LINEART_FLOW.get("min_length", 0.0),
+        help="Minimum flowline length in px (default: 0)",
+    )
+    flow_group.add_argument(
+        "--flow-max-length", type=float,
+        default=_LINEART_FLOW.get("max_length", 40.0),
+        help="Maximum flowline length in px (default: 40)",
+    )
+    flow_group.add_argument(
+        "--flow-max-size", type=int,
+        default=_LINEART_FLOW.get("max_size", 800),
+        help="Resize image so largest side <= this (default: 800)",
+    )
+    flow_group.add_argument(
+        "--flow-seed", type=int,
+        default=_LINEART_FLOW.get("flow_seed", 42),
+        help="PRNG seed for flow field (default: 42)",
+    )
+    flow_group.add_argument(
+        "--field-type", type=str,
+        default=_LINEART_FLOW.get("field_type", "noise"),
+        choices=["noise", "curl_noise"],
+        help="Flow field type: 'noise' or 'curl_noise' (default: noise)",
+    )
+    flow_group.add_argument(
+        "--edge-field-mult", type=float,
+        default=_LINEART_FLOW.get("edge_field_multiplier"),
+        help="Blend edge-following field (try 1.0); omit to disable",
+    )
+    flow_group.add_argument(
+        "--dark-field-mult", type=float,
+        default=_LINEART_FLOW.get("dark_field_multiplier"),
+        help="Blend dark-curling field (try 1.0); omit to disable",
     )
 
     # ---- Image processing parameters ----
@@ -1709,24 +2004,36 @@ def main() -> None:
         sys.exit(1)
 
     # ---- Banner ----
+    _mode_banners = {
+        "line_tracing": "PEN PLOTTER - LINE ART TRACER",
+        "hatched": "PEN PLOTTER - HATCHED FILL + GRADIENT MODE",
+        "flow_imager": "PEN PLOTTER - FLOW FIELD IMAGER",
+    }
     print("=" * 60)
-    if args.mode == "hatched":
-        print("  PEN PLOTTER - HATCHED FILL + GRADIENT MODE")
-    else:
-        print("  PEN PLOTTER - LINE ART TRACER")
+    print(f"  {_mode_banners.get(args.mode, args.mode)}")
     print("=" * 60)
     print()
     print(f"  Image:       {image_path}")
     print(f"  Mode:        {args.mode}")
 
     if args.mode == "line_tracing":
-        print(f"  Method:      potrace + vpype (smooth Bezier outlines + merge/sort)")
-    else:
+        print("  Method:      potrace + vpype (smooth Bezier outlines + merge/sort)")
+    elif args.mode == "hatched":
         hatch_style = "circular" if args.circular else f"diagonal {args.hatch_angle:.0f} deg"
         print(f"  Hatch style: {hatch_style}")
         print(f"  Levels:      {list(args.levels)} ({len(args.levels) + 1} zones)")
         print(f"  Pitch:       {args.hatch_pitch:.2f} mm")
         print(f"  Outlines:    {'yes' if not args.no_outlines else 'no'}")
+    elif args.mode == "flow_imager":
+        print(f"  Field type:  {args.field_type}")
+        print(f"  Flow seed:   {args.flow_seed}")
+        print(f"  Separation:  [{args.flow_min_sep}, {args.flow_max_sep}] px")
+        print(f"  Length:      [{args.flow_min_length}, {args.flow_max_length}] px")
+        print(f"  N fields:    {args.n_fields}")
+        if args.edge_field_mult is not None:
+            print(f"  Edge blend:  {args.edge_field_mult}")
+        if args.dark_field_mult is not None:
+            print(f"  Dark blend:  {args.dark_field_mult}")
 
     print(f"  Machine cfg: {Path(_CFG._source_path).resolve()}"
           if hasattr(_CFG, '_source_path') else
@@ -1765,6 +2072,20 @@ def main() -> None:
         hatch_invert=args.invert,
         hatch_include_outlines=_include_outlines,
         hatch_outline_turdsize=_LINEART_HATCH.get("outline_turdsize", 10),
+        flow_noise_coeff=args.noise_coeff,
+        flow_n_fields=args.n_fields,
+        flow_min_sep=args.flow_min_sep,
+        flow_max_sep=args.flow_max_sep,
+        flow_min_length=args.flow_min_length,
+        flow_max_length=args.flow_max_length,
+        flow_max_size=args.flow_max_size,
+        flow_seed=args.flow_seed,
+        flow_flow_seed=args.flow_seed,
+        flow_search_ef=_LINEART_FLOW.get("search_ef", 50),
+        flow_test_frequency=_LINEART_FLOW.get("test_frequency", 2.0),
+        flow_field_type=args.field_type,
+        flow_edge_field_mult=args.edge_field_mult,
+        flow_dark_field_mult=args.dark_field_mult,
     )
 
     if not paths_mm:
