@@ -617,17 +617,30 @@ def render_machine_preview(
         (mx, my + 12), font, font_scale * 0.9, font_color, thickness,
     )
 
-    # Stats annotation (top-right area inside margin)
+    # Stats + config annotation (top-right area inside margin)
     if stats:
-        info_lines = [
-            f"Paths: {stats.get('paths', '?')}",
-            f"Draw: {stats.get('draw_mm', 0):.0f} mm",
-            f"Travel: {stats.get('travel_mm', 0):.0f} mm",
-            f"Pen lifts: {stats.get('pen_lifts', '?')}",
-            f"Est. time: {stats.get('estimated_time_min', 0):.1f} min",
-        ]
+        info_lines: list[str] = []
+
+        # Mode line
+        mode = stats.get("mode", "?")
+        info_lines.append(f"Mode: {mode}")
+
+        # CLI overrides (only values that differ from config defaults)
+        overrides = stats.get("cli_overrides", [])
+        if overrides:
+            info_lines.append("CLI overrides:")
+            for ov in overrides:
+                info_lines.append(f"  {ov}")
+
+        info_lines.append("")
+        info_lines.append(f"Paths: {stats.get('paths', '?')}")
+        info_lines.append(f"Draw: {stats.get('draw_mm', 0):.0f} mm")
+        info_lines.append(f"Travel: {stats.get('travel_mm', 0):.0f} mm")
+        info_lines.append(f"Pen lifts: {stats.get('pen_lifts', '?')}")
+        info_lines.append(f"Est. time: {stats.get('estimated_time_min', 0):.1f} min")
+
         sx, sy = mm_to_canvas(
-            transform.draw_left + transform.draw_width - 40.0,
+            transform.draw_left + transform.draw_width - 50.0,
             transform.draw_bottom + transform.draw_height - 2.0,
         )
         for k, line in enumerate(info_lines):
@@ -725,24 +738,29 @@ def _hatch_mask_at_angle(
     """
     H, W = mask.shape
     cx, cy = W / 2.0, H / 2.0
-    theta = -math.radians(angle_deg)
-
-    # Rotate mask so hatch lines become horizontal rows
-    rot_mat = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
     diag = int(math.ceil(math.sqrt(H * H + W * W)))
-    # Shift center so rotated image fits
-    rot_mat[0, 2] += (diag - W) / 2.0
-    rot_mat[1, 2] += (diag - H) / 2.0
+    new_cx, new_cy = diag / 2.0, diag / 2.0
+
+    # Build rotation matrix that maps dst (rotated) -> src (original).
+    # cv2.warpAffine uses M to look up src pixels for each dst pixel.
+    rot_mat = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
+
+    # Correct center-shift for enlarged canvas: (cx,cy) in dst must map
+    # to (cx,cy) in src after the canvas grows to (diag x diag).
+    sx = new_cx - cx
+    sy = new_cy - cy
+    rot_mat[0, 2] -= rot_mat[0, 0] * sx + rot_mat[0, 1] * sy
+    rot_mat[1, 2] -= rot_mat[1, 0] * sx + rot_mat[1, 1] * sy
+
     rot_mask = cv2.warpAffine(
         mask.astype(np.uint8), rot_mat, (diag, diag),
         flags=cv2.INTER_NEAREST, borderValue=0,
     )
 
-    # Inverse rotation matrix (to map rotated coords back to original)
-    cos_t = math.cos(theta)
-    sin_t = math.sin(theta)
-    shift_x = (diag - W) / 2.0
-    shift_y = (diag - H) / 2.0
+    # rot_mat already maps dst -> src, so applying it to rotated-frame
+    # points gives original-frame coordinates directly.
+    m00, m01, m02 = rot_mat[0]
+    m10, m11, m12 = rot_mat[1]
 
     # Process horizontal scanlines at pitch_px spacing.
     # Alternate left-right / right-left per row for zigzag connectivity.
@@ -766,10 +784,8 @@ def _hatch_mask_at_angle(
                 continue
             xs_rot = np.arange(s, e, dtype=np.float64)
             ys_rot = np.full_like(xs_rot, row, dtype=np.float64)
-            xs_shifted = xs_rot - shift_x - cx
-            ys_shifted = ys_rot - shift_y - cy
-            xs_orig = cos_t * xs_shifted - sin_t * ys_shifted + cx
-            ys_orig = sin_t * xs_shifted + cos_t * ys_shifted + cy
+            xs_orig = m00 * xs_rot + m01 * ys_rot + m02
+            ys_orig = m10 * xs_rot + m11 * ys_rot + m12
             row_segs.append(np.column_stack((xs_orig, ys_orig)))
 
         # Reverse segment order and each segment for odd rows (zigzag)
@@ -2668,9 +2684,50 @@ def main() -> None:
             ("blur_radius", str(args.blur_radius),
              args.blur_radius != _LINEART_HATCH.get("blur_radius", 10)),
         ])
+    elif args.mode == "hatching":
+        _show.extend([
+            ("n_zones", str(args.n_zones),
+             args.n_zones != _LINEART_HTNG.get("n_zones", 4)),
+            ("hatching_angles", str(args.hatching_angles),
+             args.hatching_angles != _LINEART_HTNG.get("angles", [45.0])),
+            ("hatching_blur", str(args.hatching_blur),
+             args.hatching_blur != _LINEART_HTNG.get("blur_radius", 5)),
+            ("hatching_scale", str(args.hatching_scale),
+             args.hatching_scale != _LINEART_HTNG.get("image_scale", 1.0)),
+            ("connect_gap", f"{args.connect_gap:.1f}",
+             args.connect_gap != _LINEART_HTNG.get("connect_gap_px", 5.0)),
+        ])
+    elif args.mode == "flow_imager":
+        _show.extend([
+            ("field_type", args.field_type,
+             args.field_type != _LINEART_FLOW.get("field_type", "noise")),
+            ("flow_seed", str(args.flow_seed),
+             args.flow_seed != _LINEART_FLOW.get("flow_seed", 42)),
+            ("n_fields", str(args.n_fields),
+             args.n_fields != _LINEART_FLOW.get("n_fields", 1)),
+            ("flow_min_sep", str(args.flow_min_sep),
+             args.flow_min_sep != _LINEART_FLOW.get("min_sep", 0.8)),
+            ("flow_max_sep", str(args.flow_max_sep),
+             args.flow_max_sep != _LINEART_FLOW.get("max_sep", 10.0)),
+        ])
+    elif args.mode == "line_tracing":
+        thr_val = args.threshold if args.threshold is not None else 128
+        thr_default = _LINEART_LT.get("threshold", None)
+        thr_default_val = thr_default if thr_default is not None else 128
+        _show.extend([
+            ("threshold", str(thr_val),
+             thr_val != thr_default_val),
+            ("turdsize", str(args.turdsize),
+             args.turdsize != _LINEART_LT.get("turdsize", 10)),
+        ])
+
+    # Collect CLI overrides for the preview annotation
+    _cli_overrides: list[str] = []
     for name, val, overridden in _show:
         flag = " *" if overridden else ""
         print(f"    {name}: {val}{flag}")
+        if overridden:
+            _cli_overrides.append(f"{name}={val}")
     print()
 
     # ---- Robot setup or dry-run ----
@@ -2740,6 +2797,10 @@ def main() -> None:
             dry_run=args.dry_run,
             skip_corners=args.skip_corners,
         )
+
+        # Inject mode/config info for the preview annotation
+        stats["mode"] = args.mode
+        stats["cli_overrides"] = _cli_overrides
 
         # In dry-run, always produce a machine-coordinate preview
         if args.dry_run:
