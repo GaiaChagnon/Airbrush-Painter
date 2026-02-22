@@ -165,8 +165,106 @@ interactive:
 file_execution:
   gcode_directory: "/home/klipper/gcode_files"
 
-# --- Future hardware (disabled) ---------------------------------------------
+# --- Syringe pump hardware ---------------------------------------------------
+# Linear stepper motors driving syringe plungers via T8 lead screws.
+# Each pump is a Klipper [manual_stepper] independent of XYZ kinematics.
+#
+# Coordinate convention (per pump):
+#   Position 0 = at the limit switch (homing position)
+#   Positive homing_direction means the limit switch is in the + direction.
+#   Dispensing moves AWAY from the switch; retracting moves TOWARD it.
+#
+# All linear dimensions in mm.  All speeds in mm/s.
 pumps:
-  enabled: false
+  enabled: true
+
+  # Shared stepper/driver specs for all pump motors.
+  # Different from XY/Z steppers: 1.8deg motor + lead screw (not belt).
+  stepper:
+    motor_type: "1.8deg"              # 200 native full steps/rev
+    full_steps_per_rotation: 200      # 1.8deg = 200 full steps
+    driver_pulses_per_rev: 12800      # DIP-switch setting for max precision
+    klipper_microsteps: 64           # 200 * 64 = 12800
+    rotation_distance: 4.0            # T8 lead screw: 4 mm/rev
+    lead_per_step_mm: 0.02            # Reference: 4.0 / 200
+    step_pulse_duration_s: 0.000005   # 5 us -- same driver family as XY/Z
+    enable_pin_inverted: false        # Common-anode wiring (DM542TE-style)
+    direction_reversal_pause_s: 0.3   # 300 ms pause between rapid reversals
+
+  # Default syringe specs (can be overridden per pump).
+  syringe:
+    volume_ml: 1.0                    # Total syringe capacity
+    plunger_travel_mm: 16.0           # Full plunger stroke to empty syringe
+    # Derived: volume_per_mm = 1.0 / 16.0 = 0.0625 ml/mm
+    # Derived: mm_per_ml     = 16.0 / 1.0 = 16.0   mm/ml
+
+  # Per-pump motor definitions.
+  # Key = pump identifier used in scripts and job IR.
+  motors:
+    pump_0:
+      octopus_slot: "Motor 3"         # Driver 4 on Octopus Pro (next free after X dual)
+      pins:
+        step: "PF9"
+        dir: "PF10"
+        enable: "PG2"
+      endstop_pin: "PG11"            # DIAG3 header -- limit switch at position 0
+      endstop_polarity: "^!"         # Pull-up + inverted (NO switch to GND)
+      endstop_type: "NO_to_GND"
+      homing_direction: 1            # +1 = switch in positive direction, -1 = negative
+      homing_speed_mm_s: 2.0         # Slow homing for precision
+      home_backoff_mm: 0.5           # Back off from switch after homing
+      max_dispense_speed_mm_s: 4.0   # Max plunger push speed (mm/s)
+      max_retract_speed_mm_s: 4.0    # Max plunger pull speed (mm/s)
+      # Per-pump syringe override (uncomment to differ from defaults above):
+      # syringe:
+      #   volume_ml: 1.0
+      #   plunger_travel_mm: 16.0
+
+    # pump_1:                         # Motor 4 / Driver 5
+    #   octopus_slot: "Motor 4"
+    #   pins:
+    #     step: "PC13"
+    #     dir: "PF0"
+    #     enable: "PF1"
+    #   endstop_pin: "PG12"           # DIAG4
+    #   endstop_polarity: "^!"
+    #   endstop_type: "NO_to_GND"
+    #   homing_direction: 1
+    #   homing_speed_mm_s: 2.0
+    #   home_backoff_mm: 0.5
+    #   max_dispense_speed_mm_s: 4.0
+    #   max_retract_speed_mm_s: 4.0
+
+    # pump_2:                         # Motor 5 / Driver 6
+    #   octopus_slot: "Motor 5"
+    #   pins:
+    #     step: "PE2"
+    #     dir: "PE3"
+    #     enable: "PD4"
+    #   endstop_pin: "PG13"           # DIAG5
+    #   endstop_polarity: "^!"
+    #   endstop_type: "NO_to_GND"
+    #   homing_direction: 1
+    #   homing_speed_mm_s: 2.0
+    #   home_backoff_mm: 0.5
+    #   max_dispense_speed_mm_s: 4.0
+    #   max_retract_speed_mm_s: 4.0
+
+    # pump_3:                         # Motor 6 / Driver 7
+    #   octopus_slot: "Motor 6"
+    #   pins:
+    #     step: "PE6"
+    #     dir: "PA14"
+    #     enable: "PE0"
+    #   endstop_pin: "PG14"           # DIAG6
+    #   endstop_polarity: "^!"
+    #   endstop_type: "NO_to_GND"
+    #   homing_direction: 1
+    #   homing_speed_mm_s: 2.0
+    #   home_backoff_mm: 0.5
+    #   max_dispense_speed_mm_s: 4.0
+    #   max_retract_speed_mm_s: 4.0
+
+# --- Future hardware (disabled) ---------------------------------------------
 servos:
   enabled: false

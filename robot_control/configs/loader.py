@@ -181,6 +181,138 @@ class FileExecutionConfig:
     gcode_directory: str
 
 
+# ---------------------------------------------------------------------------
+# Pump configuration dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PumpStepperConfig:
+    """Motor / driver / lead-screw spec shared by all pump steppers.
+
+    Parameters
+    ----------
+    motor_type : str
+        Descriptive label, e.g. ``"1.8deg"``.
+    full_steps_per_rotation : int
+        Native full steps per revolution (200 for 1.8 deg motor).
+    driver_pulses_per_rev : int
+        DIP-switch micro-step setting on the driver.
+    klipper_microsteps : int
+        Klipper micro-step divisor.  Must satisfy
+        ``full_steps_per_rotation * klipper_microsteps == driver_pulses_per_rev``.
+    rotation_distance : float
+        Lead-screw travel per revolution in mm.
+    step_pulse_duration_s : float
+        Minimum step pulse width required by the driver.
+    enable_pin_inverted : bool
+        True if the enable signal is active-low.
+    direction_reversal_pause_s : float
+        Dwell time in seconds between rapid direction changes.
+    """
+
+    motor_type: str
+    full_steps_per_rotation: int
+    driver_pulses_per_rev: int
+    klipper_microsteps: int
+    rotation_distance: float
+    step_pulse_duration_s: float
+    enable_pin_inverted: bool
+    direction_reversal_pause_s: float
+
+
+@dataclass(frozen=True)
+class SyringeConfig:
+    """Syringe geometry: volume capacity and plunger stroke.
+
+    Parameters
+    ----------
+    volume_ml : float
+        Total syringe capacity in ml.
+    plunger_travel_mm : float
+        Full plunger stroke from retracted to fully extended, in mm.
+    """
+
+    volume_ml: float
+    plunger_travel_mm: float
+
+    @property
+    def volume_per_mm(self) -> float:
+        """Dispensed volume per mm of plunger travel (ml/mm)."""
+        return self.volume_ml / self.plunger_travel_mm
+
+    @property
+    def mm_per_ml(self) -> float:
+        """Plunger travel per ml of dispensed volume (mm/ml)."""
+        return self.plunger_travel_mm / self.volume_ml
+
+
+@dataclass(frozen=True)
+class PumpMotorConfig:
+    """Per-pump motor wiring, endstop, homing, and speed config.
+
+    Parameters
+    ----------
+    octopus_slot : str
+        Board connector label, e.g. ``"Motor 3"``.
+    pins : PinConfig
+        Step / dir / enable pin assignments.
+    endstop_pin : str
+        GPIO pin for the limit switch.
+    endstop_polarity : str
+        Klipper polarity prefix, e.g. ``"^!"``.
+    endstop_type : str
+        Switch wiring description, e.g. ``"NO_to_GND"``.
+    homing_direction : int
+        ``+1`` if the limit switch is in the positive travel direction,
+        ``-1`` if it is in the negative direction.
+    homing_speed_mm_s : float
+        Speed when homing toward the limit switch, in mm/s.
+    home_backoff_mm : float
+        Distance to back off from the switch after homing, in mm.
+    max_dispense_speed_mm_s : float
+        Maximum plunger push speed, in mm/s.
+    max_retract_speed_mm_s : float
+        Maximum plunger pull speed, in mm/s.
+    syringe : SyringeConfig
+        Syringe geometry (may override the shared default).
+    """
+
+    octopus_slot: str
+    pins: PinConfig
+    endstop_pin: str
+    endstop_polarity: str
+    endstop_type: str
+    homing_direction: int
+    homing_speed_mm_s: float
+    home_backoff_mm: float
+    max_dispense_speed_mm_s: float
+    max_retract_speed_mm_s: float
+    syringe: SyringeConfig
+
+
+@dataclass(frozen=True)
+class PumpsConfig:
+    """Top-level pump subsystem configuration.
+
+    Parameters
+    ----------
+    enabled : bool
+        Whether the pump subsystem is active.
+    stepper : PumpStepperConfig
+        Shared motor/driver specs for all pump steppers.
+    syringe_defaults : SyringeConfig
+        Default syringe geometry (overridable per pump).
+    motors : dict[str, PumpMotorConfig]
+        Per-pump motor configs keyed by pump identifier.
+    """
+
+    enabled: bool
+    stepper: PumpStepperConfig
+    syringe_defaults: SyringeConfig
+    motors: dict[str, PumpMotorConfig]
+
+
 @dataclass(frozen=True)
 class MachineConfig:
     """Complete machine configuration loaded from ``machine.yaml``.
@@ -199,7 +331,7 @@ class MachineConfig:
     motion: MotionConfig
     interactive: InteractiveConfig
     file_execution: FileExecutionConfig
-    pumps_enabled: bool = False
+    pumps: PumpsConfig | None = None
     servos_enabled: bool = False
 
     # -- Convenience helpers ------------------------------------------------
@@ -326,6 +458,106 @@ def _parse_pins(raw: Any) -> tuple[PinConfig, ...]:
     raise ConfigError(f"axis pins must be a dict or list, got {type(raw)}")
 
 
+def _parse_syringe(data: dict[str, Any]) -> SyringeConfig:
+    """Parse a syringe specification from raw YAML dict."""
+    return SyringeConfig(
+        volume_ml=float(data["volume_ml"]),
+        plunger_travel_mm=float(data["plunger_travel_mm"]),
+    )
+
+
+def _parse_pump_stepper(data: dict[str, Any]) -> PumpStepperConfig:
+    """Parse the ``pumps.stepper`` section."""
+    return PumpStepperConfig(
+        motor_type=str(data["motor_type"]),
+        full_steps_per_rotation=int(data["full_steps_per_rotation"]),
+        driver_pulses_per_rev=int(data["driver_pulses_per_rev"]),
+        klipper_microsteps=int(data["klipper_microsteps"]),
+        rotation_distance=float(data["rotation_distance"]),
+        step_pulse_duration_s=float(data["step_pulse_duration_s"]),
+        enable_pin_inverted=bool(data.get("enable_pin_inverted", False)),
+        direction_reversal_pause_s=float(
+            data.get("direction_reversal_pause_s", 0.3)
+        ),
+    )
+
+
+def _parse_homing_direction(pump_name: str, data: dict[str, Any]) -> int:
+    """Parse and validate ``homing_direction`` (+1 or -1)."""
+    raw = data.get("homing_direction", 1)
+    val = int(raw)
+    if val not in (1, -1):
+        raise ConfigError(
+            f"Pump '{pump_name}' homing_direction must be +1 or -1, "
+            f"got {val}"
+        )
+    return val
+
+
+def _parse_pump_motor(
+    name: str,
+    data: dict[str, Any],
+    syringe_defaults: SyringeConfig,
+) -> PumpMotorConfig:
+    """Parse a single pump motor entry from ``pumps.motors``."""
+    raw_pins = data.get("pins")
+    if raw_pins is None:
+        raise ConfigError(f"Pump '{name}' is missing 'pins' field")
+    pins = PinConfig(
+        step=str(raw_pins["step"]),
+        dir=str(raw_pins["dir"]),
+        enable=str(raw_pins["enable"]),
+    )
+    syringe_override = data.get("syringe")
+    syringe = (
+        _parse_syringe(syringe_override)
+        if syringe_override
+        else syringe_defaults
+    )
+    return PumpMotorConfig(
+        octopus_slot=str(data["octopus_slot"]),
+        pins=pins,
+        endstop_pin=str(data["endstop_pin"]),
+        endstop_polarity=str(data.get("endstop_polarity", "^!")),
+        endstop_type=str(data.get("endstop_type", "NO_to_GND")),
+        homing_direction=_parse_homing_direction(name, data),
+        homing_speed_mm_s=float(data.get("homing_speed_mm_s", 2.0)),
+        home_backoff_mm=float(data.get("home_backoff_mm", 0.5)),
+        max_dispense_speed_mm_s=float(
+            data.get("max_dispense_speed_mm_s", 5.0)
+        ),
+        max_retract_speed_mm_s=float(
+            data.get("max_retract_speed_mm_s", 8.0)
+        ),
+        syringe=syringe,
+    )
+
+
+def _parse_pumps(data: dict[str, Any]) -> PumpsConfig | None:
+    """Parse the top-level ``pumps`` section.
+
+    Returns ``None`` when pumps are disabled or absent.
+    """
+    if not data or not data.get("enabled", False):
+        return None
+
+    stepper = _parse_pump_stepper(data["stepper"])
+    syringe_defaults = _parse_syringe(data["syringe"])
+
+    motors_data = data.get("motors", {})
+    motors = {
+        name: _parse_pump_motor(name, motor_data, syringe_defaults)
+        for name, motor_data in motors_data.items()
+    }
+
+    return PumpsConfig(
+        enabled=True,
+        stepper=stepper,
+        syringe_defaults=syringe_defaults,
+        motors=motors,
+    )
+
+
 def _parse_axis(name: str, data: dict[str, Any]) -> AxisConfig:
     """Parse a single axis entry from the ``axes`` section."""
     raw_pins = data.get("pins")
@@ -435,6 +667,32 @@ def _validate_config(cfg: MachineConfig) -> None:
                 f"Tool '{name}' feed_mm_s ({tool.feed_mm_s}) "
                 f"exceeds max_velocity_mm_s ({cfg.motion.max_velocity_mm_s})"
             )
+
+    # -- Pump stepper sanity (if enabled) ------------------------------------
+    if cfg.pumps is not None:
+        ps = cfg.pumps.stepper
+        expected_pump_pulses = (
+            ps.klipper_microsteps * ps.full_steps_per_rotation
+        )
+        if expected_pump_pulses != ps.driver_pulses_per_rev:
+            raise ConfigError(
+                f"Pump stepper: klipper_microsteps ({ps.klipper_microsteps}) "
+                f"* full_steps_per_rotation ({ps.full_steps_per_rotation}) = "
+                f"{expected_pump_pulses}, but driver_pulses_per_rev = "
+                f"{ps.driver_pulses_per_rev}. These must match."
+            )
+        for pump_name, pump_motor in cfg.pumps.motors.items():
+            sy = pump_motor.syringe
+            if sy.volume_ml <= 0:
+                raise ConfigError(
+                    f"Pump '{pump_name}' syringe volume_ml must be > 0, "
+                    f"got {sy.volume_ml}"
+                )
+            if sy.plunger_travel_mm <= 0:
+                raise ConfigError(
+                    f"Pump '{pump_name}' syringe plunger_travel_mm must "
+                    f"be > 0, got {sy.plunger_travel_mm}"
+                )
 
     # -- Connection values positive -----------------------------------------
     c = cfg.connection
@@ -585,6 +843,9 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
             gcode_directory=fe["gcode_directory"],
         )
 
+        # -- pumps (optional) -----------------------------------------------
+        pumps = _parse_pumps(data.get("pumps", {}))
+
         config = MachineConfig(
             connection=connection,
             work_area=work_area,
@@ -596,7 +857,7 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
             motion=motion,
             interactive=interactive,
             file_execution=file_execution,
-            pumps_enabled=data.get("pumps", {}).get("enabled", False),
+            pumps=pumps,
             servos_enabled=data.get("servos", {}).get("enabled", False),
         )
 

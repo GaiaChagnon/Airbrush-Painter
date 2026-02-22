@@ -53,12 +53,12 @@ hatched:
 # angles) and zigzag connection for continuous pen paths.
 hatching:
   n_zones: 4                           # Total zones incl. white.  4 = 3 hatched + white
-  angles: [45.0]                       # Hatching angles (deg).  [45, -45] = cross-hatch,
+  angles: [45.0, -45.0]                       # Hatching angles (deg).  [45, -45] = cross-hatch,
                                        # [0, 60, 120] = triple cross
-  blur_radius: 5                       # Gaussian blur before zone detection
+  blur_radius: 7                       # Gaussian blur before zone detection
   image_scale: 1.0                     # Scale factor; reduce for speed
   include_outlines: true               # Overlay potrace outlines on top
-  outline_turdsize: 10                 # Potrace turdsize for outlines
+  outline_turdsize: 5                 # Potrace turdsize for outlines
   connect_gap_px: 5.0                  # Max px gap for zigzag line connection
   min_path_mm: 0.3                     # Drop paths shorter than this (mm)
   simplify_tol_mm: 0.05                # Douglas-Peucker tolerance (mm)
