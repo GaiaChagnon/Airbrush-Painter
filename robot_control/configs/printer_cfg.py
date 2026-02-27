@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from robot_control.configs.loader import (
         AxisConfig,
+        BedMeshConfig,
         MachineConfig,
         PumpMotorConfig,
     )
@@ -265,7 +266,71 @@ def generate_printer_cfg(config: MachineConfig) -> str:
         f"{z_homing_dir_line}"
     )
 
-    return "\n".join(lines)
+    # -- [bed_mesh] (optional) ---------------------------------------------
+    if config.bed_mesh is not None:
+        lines.append(_gen_bed_mesh_section(config.bed_mesh))
+
+    cfg_body = "\n".join(lines)
+
+    # Append the #*# save block AFTER the main config if a calibrated
+    # profile exists.  Klipper expects this at the very end of the file.
+    if config.bed_mesh is not None and config.bed_mesh.calibrated_points is not None:
+        cfg_body += "\n" + _gen_bed_mesh_save_block(config.bed_mesh)
+
+    return cfg_body
+
+
+def _gen_bed_mesh_section(bm: BedMeshConfig) -> str:
+    """Generate the ``[bed_mesh]`` config section.
+
+    This tells Klipper to load the bed_mesh module and defines the
+    probing parameters.  The actual mesh data comes from the save block.
+    """
+    return (
+        f"# --- Bed mesh (surface leveling) ---\n"
+        f"[bed_mesh]\n"
+        f"speed: {bm.speed:.0f}\n"
+        f"horizontal_move_z: {bm.horizontal_move_z:.1f}\n"
+        f"mesh_min: {bm.mesh_min[0]:.1f}, {bm.mesh_min[1]:.1f}\n"
+        f"mesh_max: {bm.mesh_max[0]:.1f}, {bm.mesh_max[1]:.1f}\n"
+        f"probe_count: {bm.probe_count[0]}, {bm.probe_count[1]}\n"
+    )
+
+
+def _gen_bed_mesh_save_block(bm: BedMeshConfig) -> str:
+    """Generate the ``#*#`` save block containing the calibrated mesh profile.
+
+    Klipper parses this block on startup and loads the ``default`` mesh
+    profile so ``BED_MESH_PROFILE LOAD=default`` activates it.
+    """
+    lines: list[str] = [
+        "#*# <save_config>",
+        "#*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.",
+        "#*#",
+        "#*# [bed_mesh default]",
+        "#*# version = 1",
+        "#*# points =",
+    ]
+
+    assert bm.calibrated_points is not None
+    for row in bm.calibrated_points:
+        formatted = ", ".join(f"{v:.6f}" for v in row)
+        lines.append(f"#*#   {formatted}")
+
+    lines.extend([
+        f"#*# x_count = {bm.probe_count[0]}",
+        f"#*# y_count = {bm.probe_count[1]}",
+        f"#*# mesh_x_pps = {bm.mesh_pps[0]}",
+        f"#*# mesh_y_pps = {bm.mesh_pps[1]}",
+        f"#*# algo = {bm.algorithm}",
+        "#*# tension = 0.2",
+        f"#*# min_x = {bm.mesh_min[0]:.1f}",
+        f"#*# max_x = {bm.mesh_max[0]:.1f}",
+        f"#*# min_y = {bm.mesh_min[1]:.1f}",
+        f"#*# max_y = {bm.mesh_max[1]:.1f}",
+    ])
+
+    return "\n".join(lines) + "\n"
 
 
 def _pump_endstop_pin_str(pump: PumpMotorConfig) -> str:

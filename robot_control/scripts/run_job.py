@@ -112,6 +112,14 @@ def main() -> None:
 
     try:
         client.connect()
+
+        # Load bed mesh profile for dynamic Z compensation (no-op if absent)
+        try:
+            client.send_gcode("BED_MESH_PROFILE LOAD=default")
+            logger.info("Bed mesh profile loaded")
+        except Exception:
+            logger.debug("No bed mesh profile available (expected if uncalibrated)")
+
         executor = JobExecutor(client, config)
 
         if args.interactive or args.step:

@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 
@@ -275,3 +277,78 @@ def format_calibration_summary(results: dict[str, object]) -> str:
             lines.append(f"  {key}: {val}")
     lines.append("=" * 50)
     return "\n".join(lines)
+
+
+@dataclass
+class PlanarityResult:
+    """Result of the planarity (flatness) check.
+
+    Parameters
+    ----------
+    is_planar : bool
+        ``True`` if all residuals are within *tolerance*.
+    max_residual_mm : float
+        Largest absolute deviation from the fitted plane (mm).
+    residuals : list[float]
+        Per-point signed residual in the same order as input (mm).
+    plane_coeffs : tuple[float, float, float]
+        ``(a, b, c)`` of the fitted plane ``z = a*x + b*y + c``.
+    """
+
+    is_planar: bool
+    max_residual_mm: float
+    residuals: list[float]
+    plane_coeffs: tuple[float, float, float]
+
+
+def check_planarity(
+    points_xyz: list[tuple[float, float, float]],
+    tolerance: float = 0.15,
+) -> PlanarityResult:
+    """Fit a plane to probed XYZ points and measure deviation.
+
+    Uses ordinary least-squares to fit ``z = a*x + b*y + c`` and
+    reports the per-point residuals.  A rigid glass surface should
+    produce a nearly perfect plane; residuals beyond *tolerance*
+    suggest the surface is warped or the glass is bending.
+
+    Parameters
+    ----------
+    points_xyz : list[tuple[float, float, float]]
+        Probed points ``(x_mm, y_mm, z_contact_mm)``.
+        Must contain at least 3 non-collinear points.
+    tolerance : float
+        Maximum acceptable residual in mm (default 0.15).
+
+    Returns
+    -------
+    PlanarityResult
+
+    Raises
+    ------
+    ValueError
+        If fewer than 3 points are provided.
+    """
+    if len(points_xyz) < 3:
+        raise ValueError(
+            f"Need >= 3 points for plane fit, got {len(points_xyz)}"
+        )
+
+    pts = np.asarray(points_xyz, dtype=np.float64)
+    xs, ys, zs = pts[:, 0], pts[:, 1], pts[:, 2]
+
+    # Least-squares: z = a*x + b*y + c  ->  A @ [a, b, c]^T = z
+    A = np.column_stack([xs, ys, np.ones_like(xs)])
+    coeffs, _, _, _ = np.linalg.lstsq(A, zs, rcond=None)
+    a, b, c = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
+
+    z_pred = A @ coeffs
+    residuals = (zs - z_pred).tolist()
+    max_res = float(np.max(np.abs(zs - z_pred)))
+
+    return PlanarityResult(
+        is_planar=max_res <= tolerance,
+        max_residual_mm=max_res,
+        residuals=residuals,
+        plane_coeffs=(a, b, c),
+    )

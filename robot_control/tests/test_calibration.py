@@ -13,9 +13,11 @@ import pytest
 from robot_control.calibration import patterns
 from robot_control.calibration.measurement import (
     MeasurementResult,
+    PlanarityResult,
     calculate_new_rotation_distance,
     calculate_steps_correction,
     calculate_tool_offset,
+    check_planarity,
     format_calibration_summary,
 )
 from robot_control.job_ir.operations import (
@@ -187,3 +189,72 @@ class TestMeasurementCalcs:
         assert "key" in text
         assert "1.234" in text
         assert "test" in text
+
+
+# ---------------------------------------------------------------------------
+# Planarity check tests
+# ---------------------------------------------------------------------------
+
+
+class TestPlanarityCheck:
+    def test_perfectly_flat(self) -> None:
+        """All points at the same Z -> zero residuals, pass."""
+        pts = [
+            (0.0, 0.0, 80.0),
+            (100.0, 0.0, 80.0),
+            (200.0, 0.0, 80.0),
+            (0.0, 100.0, 80.0),
+            (100.0, 100.0, 80.0),
+            (200.0, 100.0, 80.0),
+        ]
+        result = check_planarity(pts, tolerance=0.01)
+        assert result.is_planar
+        assert result.max_residual_mm < 1e-10
+
+    def test_tilted_plane(self) -> None:
+        """Points on a tilted plane -> zero residuals, pass."""
+        pts = [
+            (0.0, 0.0, 80.0),
+            (450.0, 0.0, 80.1),
+            (0.0, 300.0, 79.9),
+            (450.0, 300.0, 80.0),
+        ]
+        result = check_planarity(pts, tolerance=0.01)
+        assert result.is_planar
+        assert result.max_residual_mm < 1e-6
+
+    def test_warped_surface(self) -> None:
+        """One point off-plane -> residual exceeds tolerance, warning."""
+        pts = [
+            (0.0, 0.0, 80.0),
+            (225.0, 0.0, 80.0),
+            (450.0, 0.0, 80.0),
+            (0.0, 150.0, 80.0),
+            (225.0, 150.0, 80.5),  # warped
+            (450.0, 150.0, 80.0),
+            (0.0, 300.0, 80.0),
+            (225.0, 300.0, 80.0),
+            (450.0, 300.0, 80.0),
+        ]
+        result = check_planarity(pts, tolerance=0.15)
+        assert not result.is_planar
+        assert result.max_residual_mm > 0.15
+
+    def test_too_few_points(self) -> None:
+        with pytest.raises(ValueError, match="Need >= 3"):
+            check_planarity([(0, 0, 1), (1, 0, 1)])
+
+    def test_returns_plane_coefficients(self) -> None:
+        """Plane z = 0.001*x + 80."""
+        pts = [
+            (0.0, 0.0, 80.0),
+            (100.0, 0.0, 80.1),
+            (200.0, 0.0, 80.2),
+            (0.0, 100.0, 80.0),
+            (200.0, 100.0, 80.2),
+        ]
+        result = check_planarity(pts)
+        a, b, c = result.plane_coeffs
+        assert pytest.approx(a, abs=1e-6) == 0.001
+        assert pytest.approx(b, abs=1e-6) == 0.0
+        assert pytest.approx(c, abs=1e-3) == 80.0

@@ -18,6 +18,7 @@ from __future__ import annotations
 import pytest
 
 from robot_control.configs.loader import (
+    BedMeshConfig,
     ConfigError,
     MachineConfig,
     PinConfig,
@@ -243,3 +244,75 @@ class TestPrinterCfgGeneration:
     ) -> None:
         """Z homes to max, so position_endstop == work_area.z."""
         assert f"position_endstop: {config.work_area.z:.0f}" in printer_cfg
+
+
+# ---------------------------------------------------------------------------
+# Bed mesh: config loading + printer.cfg generation
+# ---------------------------------------------------------------------------
+
+
+class TestBedMeshConfig:
+    def test_bed_mesh_loaded(self, config: MachineConfig) -> None:
+        """bed_mesh section is present in default machine.yaml."""
+        assert config.bed_mesh is not None
+        assert isinstance(config.bed_mesh, BedMeshConfig)
+
+    def test_bed_mesh_probe_count(self, config: MachineConfig) -> None:
+        bm = config.bed_mesh
+        assert bm is not None
+        assert bm.probe_count == (3, 3)
+
+    def test_bed_mesh_bounds(self, config: MachineConfig) -> None:
+        bm = config.bed_mesh
+        assert bm is not None
+        assert bm.mesh_min == (10.0, 10.0)
+        assert bm.mesh_max == (440.0, 310.0)
+
+    def test_bed_mesh_uncalibrated(self, config: MachineConfig) -> None:
+        """Default config has no calibrated points."""
+        assert config.bed_mesh is not None
+        assert config.bed_mesh.calibrated_points is None
+
+
+class TestBedMeshPrinterCfg:
+    def test_bed_mesh_section_generated(self, printer_cfg: str) -> None:
+        """[bed_mesh] section present when bed_mesh config exists."""
+        assert "[bed_mesh]" in printer_cfg
+        assert "mesh_min:" in printer_cfg
+        assert "mesh_max:" in printer_cfg
+        assert "probe_count:" in printer_cfg
+
+    def test_no_save_block_when_uncalibrated(self, printer_cfg: str) -> None:
+        """No #*# save block when calibrated_points is null."""
+        assert "#*# <save_config>" not in printer_cfg
+        assert "#*# [bed_mesh default]" not in printer_cfg
+
+    def test_save_block_when_calibrated(self, config: MachineConfig) -> None:
+        """#*# save block present when calibrated_points is set."""
+        from dataclasses import replace
+
+        cal_points = [
+            [-0.05, 0.0, 0.025],
+            [0.0, 0.012, -0.012],
+            [0.025, -0.012, -0.037],
+        ]
+        bm_cal = replace(config.bed_mesh, calibrated_points=cal_points)
+        cfg_cal = replace(config, bed_mesh=bm_cal)
+        text = generate_printer_cfg(cfg_cal)
+
+        assert "#*# <save_config>" in text
+        assert "#*# [bed_mesh default]" in text
+        assert "#*# version = 1" in text
+        assert "#*# x_count = 3" in text
+        assert "#*# y_count = 3" in text
+        assert "#*# algo = lagrange" in text
+        assert "-0.050000" in text
+        assert "0.025000" in text
+
+    def test_bed_mesh_values_match_config(
+        self, config: MachineConfig, printer_cfg: str,
+    ) -> None:
+        bm = config.bed_mesh
+        assert bm is not None
+        assert f"speed: {bm.speed:.0f}" in printer_cfg
+        assert f"horizontal_move_z: {bm.horizontal_move_z:.1f}" in printer_cfg

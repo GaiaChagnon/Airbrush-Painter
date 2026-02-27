@@ -265,6 +265,27 @@ pumps:
     #   max_dispense_speed_mm_s: 4.0
     #   max_retract_speed_mm_s: 4.0
 
+# --- Bed mesh (surface leveling) --------------------------------------------
+# Klipper [bed_mesh] parameters for manual pen-surface calibration.
+# The calibration script probes a grid of points, records Z contact heights,
+# and writes the offsets into calibrated_points.  printer_cfg.py emits both
+# the [bed_mesh] config section and the saved profile block so Klipper
+# applies dynamic Z compensation during all XY motion.
+#
+# mesh_min/mesh_max define the XY probing area (should cover the usable canvas).
+# horizontal_move_z is the safe retracted-pen Z used between probe points.
+# All linear dimensions in mm, speed in mm/s.
+bed_mesh:
+  mesh_min: [10.0, 10.0]              # XY of first probe point (canvas origin)
+  mesh_max: [440.0, 310.0]            # XY of last probe point (canvas far corner)
+  probe_count: [3, 3]                 # Grid dimensions [X, Y]; 3x3 = 9 points
+  horizontal_move_z: 75.0             # Pen retracted ~5 mm from typical contact
+  speed: 200.0                        # XY travel speed between probe points
+  mesh_pps: [2, 2]                    # Interpolation points per segment [X, Y]
+  algorithm: lagrange                 # 'lagrange' for <=6 probes/axis, 'bicubic' for >6
+  # Written by: calibrate --bed-mesh.  null = not yet calibrated.
+  calibrated_points: null
+
 # --- Future hardware (disabled) ---------------------------------------------
 servos:
   enabled: false

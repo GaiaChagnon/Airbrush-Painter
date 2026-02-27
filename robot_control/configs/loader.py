@@ -181,6 +181,41 @@ class FileExecutionConfig:
     gcode_directory: str
 
 
+@dataclass(frozen=True)
+class BedMeshConfig:
+    """Klipper ``[bed_mesh]`` parameters for manual surface leveling.
+
+    Parameters
+    ----------
+    mesh_min : tuple[float, float]
+        XY of the first probe point in mm (canvas near corner).
+    mesh_max : tuple[float, float]
+        XY of the last probe point in mm (canvas far corner).
+    probe_count : tuple[int, int]
+        Grid dimensions ``(X, Y)``.  3x3 is the default.
+    horizontal_move_z : float
+        Z height (mm) for pen-retracted travel between probe points.
+    speed : float
+        XY travel speed between probe points in mm/s.
+    mesh_pps : tuple[int, int]
+        Interpolation points per mesh segment ``(X, Y)``.
+    algorithm : str
+        Interpolation algorithm: ``"lagrange"`` or ``"bicubic"``.
+    calibrated_points : list[list[float]] | None
+        2-D array of Z offsets (rows = Y, cols = X) written by the
+        calibration routine.  ``None`` when not yet calibrated.
+    """
+
+    mesh_min: tuple[float, float]
+    mesh_max: tuple[float, float]
+    probe_count: tuple[int, int]
+    horizontal_move_z: float
+    speed: float
+    mesh_pps: tuple[int, int]
+    algorithm: str
+    calibrated_points: list[list[float]] | None = None
+
+
 # ---------------------------------------------------------------------------
 # Pump configuration dataclasses
 # ---------------------------------------------------------------------------
@@ -332,6 +367,7 @@ class MachineConfig:
     interactive: InteractiveConfig
     file_execution: FileExecutionConfig
     pumps: PumpsConfig | None = None
+    bed_mesh: BedMeshConfig | None = None
     servos_enabled: bool = False
 
     # -- Convenience helpers ------------------------------------------------
@@ -558,6 +594,73 @@ def _parse_pumps(data: dict[str, Any]) -> PumpsConfig | None:
     )
 
 
+def _parse_bed_mesh(data: dict[str, Any]) -> BedMeshConfig | None:
+    """Parse the optional ``bed_mesh`` section.
+
+    Returns ``None`` when the section is absent or empty.
+    """
+    if not data:
+        return None
+
+    mesh_min_raw = data.get("mesh_min", [10.0, 10.0])
+    mesh_max_raw = data.get("mesh_max", [440.0, 310.0])
+    probe_count_raw = data.get("probe_count", [3, 3])
+    mesh_pps_raw = data.get("mesh_pps", [2, 2])
+
+    for label, val in [
+        ("mesh_min", mesh_min_raw),
+        ("mesh_max", mesh_max_raw),
+        ("probe_count", probe_count_raw),
+        ("mesh_pps", mesh_pps_raw),
+    ]:
+        if not isinstance(val, (list, tuple)) or len(val) != 2:
+            raise ConfigError(
+                f"bed_mesh.{label} must be a 2-element list, got {val!r}"
+            )
+
+    pc = (int(probe_count_raw[0]), int(probe_count_raw[1]))
+    if pc[0] < 2 or pc[1] < 2:
+        raise ConfigError(
+            f"bed_mesh.probe_count must be >= [2, 2], got {list(pc)}"
+        )
+
+    cal_raw = data.get("calibrated_points")
+    calibrated: list[list[float]] | None = None
+    if cal_raw is not None:
+        calibrated = [
+            [float(v) for v in row] for row in cal_raw
+        ]
+        if len(calibrated) != pc[1]:
+            raise ConfigError(
+                f"bed_mesh.calibrated_points has {len(calibrated)} rows "
+                f"but probe_count Y = {pc[1]}"
+            )
+        for i, row in enumerate(calibrated):
+            if len(row) != pc[0]:
+                raise ConfigError(
+                    f"bed_mesh.calibrated_points row {i} has {len(row)} "
+                    f"values but probe_count X = {pc[0]}"
+                )
+
+    algorithm = str(data.get("algorithm", "lagrange"))
+    if algorithm not in ("lagrange", "bicubic"):
+        raise ConfigError(
+            f"bed_mesh.algorithm must be 'lagrange' or 'bicubic', "
+            f"got '{algorithm}'"
+        )
+
+    return BedMeshConfig(
+        mesh_min=(float(mesh_min_raw[0]), float(mesh_min_raw[1])),
+        mesh_max=(float(mesh_max_raw[0]), float(mesh_max_raw[1])),
+        probe_count=pc,
+        horizontal_move_z=float(data.get("horizontal_move_z", 75.0)),
+        speed=float(data.get("speed", 200.0)),
+        mesh_pps=(int(mesh_pps_raw[0]), int(mesh_pps_raw[1])),
+        algorithm=algorithm,
+        calibrated_points=calibrated,
+    )
+
+
 def _parse_axis(name: str, data: dict[str, Any]) -> AxisConfig:
     """Parse a single axis entry from the ``axes`` section."""
     raw_pins = data.get("pins")
@@ -693,6 +796,24 @@ def _validate_config(cfg: MachineConfig) -> None:
                     f"Pump '{pump_name}' syringe plunger_travel_mm must "
                     f"be > 0, got {sy.plunger_travel_mm}"
                 )
+
+    # -- Bed mesh bounds within canvas --------------------------------------
+    if cfg.bed_mesh is not None:
+        bm = cfg.bed_mesh
+        canvas_min_x = cfg.canvas.offset_x_mm
+        canvas_min_y = cfg.canvas.offset_y_mm
+        canvas_max_x = cfg.canvas.offset_x_mm + cfg.canvas.width_mm
+        canvas_max_y = cfg.canvas.offset_y_mm + cfg.canvas.height_mm
+        if bm.mesh_min[0] < canvas_min_x or bm.mesh_min[1] < canvas_min_y:
+            raise ConfigError(
+                f"bed_mesh.mesh_min {bm.mesh_min} is outside canvas "
+                f"bounds ({canvas_min_x}, {canvas_min_y})"
+            )
+        if bm.mesh_max[0] > canvas_max_x or bm.mesh_max[1] > canvas_max_y:
+            raise ConfigError(
+                f"bed_mesh.mesh_max {bm.mesh_max} is outside canvas "
+                f"bounds ({canvas_max_x}, {canvas_max_y})"
+            )
 
     # -- Connection values positive -----------------------------------------
     c = cfg.connection
@@ -846,6 +967,9 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
         # -- pumps (optional) -----------------------------------------------
         pumps = _parse_pumps(data.get("pumps", {}))
 
+        # -- bed mesh (optional) --------------------------------------------
+        bed_mesh = _parse_bed_mesh(data.get("bed_mesh", {}))
+
         config = MachineConfig(
             connection=connection,
             work_area=work_area,
@@ -858,6 +982,7 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
             interactive=interactive,
             file_execution=file_execution,
             pumps=pumps,
+            bed_mesh=bed_mesh,
             servos_enabled=data.get("servos", {}).get("enabled", False),
         )
 

@@ -2099,8 +2099,8 @@ def execute_on_robot(
             eta_s = (elapsed / frac - elapsed) if frac > 0.01 else 0.0
             draw_done_mm = sum(
                 math.sqrt(
-                    (mpts[i][0] - mpts[i-1][0])**2
-                    + (mpts[i][1] - mpts[i-1][1])**2
+                    (mp[i][0] - mp[i-1][0])**2
+                    + (mp[i][1] - mp[i-1][1])**2
                 )
                 for mp in machine_paths[:path_idx + 1]
                 for i in range(1, len(mp))
@@ -2661,6 +2661,8 @@ def main() -> None:
     # ---- Convert paths to machine coordinates ----
     machine_paths: list[list[tuple[float, float]]] = []
     for p in paths_mm:
+        if len(p) < 2:
+            continue
         mpts = [xform.image_to_machine(float(pt[0]), float(pt[1])) for pt in p]
         machine_paths.append(mpts)
 
@@ -2798,6 +2800,10 @@ def main() -> None:
         pen_up(sock, z_travel_val, args.z_retract_speed * 60.0)
         _raw_gcode(sock, "M400")
         print(f"    Z retracted to {z_travel_val:.1f} mm")
+
+        # Load bed mesh profile for dynamic Z compensation (no-op if absent)
+        if _raw_gcode(sock, "BED_MESH_PROFILE LOAD=default"):
+            print("    Bed mesh profile loaded")
         print()
 
     # ---- Execute ----

@@ -12,6 +12,7 @@ Usage::
     python -m robot_control.scripts.calibrate --tool-offset # Tool offset
     python -m robot_control.scripts.calibrate --speed      # Speed calibration
     python -m robot_control.scripts.calibrate --endstops   # Verify endstops
+    python -m robot_control.scripts.calibrate --bed-mesh  # Surface leveling
 """
 
 from __future__ import annotations
@@ -53,6 +54,8 @@ def main() -> None:
                         help="Calibrate drawing speed")
     parser.add_argument("--endstops", action="store_true",
                         help="Verify endstop repeatability")
+    parser.add_argument("--bed-mesh", action="store_true",
+                        help="Calibrate bed mesh (surface leveling)")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -62,6 +65,7 @@ def main() -> None:
     run_all = not any([
         args.steps_x, args.steps_y, args.z_heights,
         args.tool_offset, args.speed, args.endstops,
+        args.bed_mesh,
     ])
 
     client = KlipperClient(
@@ -96,6 +100,12 @@ def main() -> None:
 
         if args.endstops or run_all:
             routines.verify_endstops(client, config)
+
+        if args.bed_mesh or run_all:
+            config_path = Path(args.config) if args.config else None
+            routines.calibrate_bed_mesh(
+                client, config, config_path=config_path,
+            )
 
         print("\nCalibration complete.")
 
