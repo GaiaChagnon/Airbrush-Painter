@@ -12,7 +12,8 @@ Usage::
     python -m robot_control.scripts.calibrate --tool-offset # Tool offset
     python -m robot_control.scripts.calibrate --speed      # Speed calibration
     python -m robot_control.scripts.calibrate --endstops   # Verify endstops
-    python -m robot_control.scripts.calibrate --bed-mesh  # Surface leveling
+    python -m robot_control.scripts.calibrate --bed-mesh  # Surface leveling (paper bounds)
+    python -m robot_control.scripts.calibrate --bed-mesh --full-canvas  # Full canvas bounds
 """
 
 from __future__ import annotations
@@ -26,7 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from robot_control.calibration import routines
 from robot_control.configs.loader import load_config
-from robot_control.hardware.klipper_client import KlipperClient
+from robot_control.configs.printer_cfg import generate_printer_cfg
+from robot_control.hardware.klipper_client import KlipperClient, KlipperShutdown
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +58,9 @@ def main() -> None:
                         help="Verify endstop repeatability")
     parser.add_argument("--bed-mesh", action="store_true",
                         help="Calibrate bed mesh (surface leveling)")
+    parser.add_argument("--full-canvas", action="store_true",
+                        help="Probe the full canvas area instead of "
+                        "paper bounds (only with --bed-mesh)")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -68,6 +73,20 @@ def main() -> None:
         args.bed_mesh,
     ])
 
+    # Regenerate printer.cfg from machine.yaml so Klipper limits stay in
+    # sync with the config the Python code reads.
+    printer_cfg_path = Path.home() / "printer.cfg"
+    new_cfg_text = generate_printer_cfg(config)
+    old_cfg_text = printer_cfg_path.read_text() if printer_cfg_path.exists() else ""
+    cfg_changed = new_cfg_text != old_cfg_text
+    if cfg_changed:
+        if printer_cfg_path.exists():
+            backup = printer_cfg_path.with_suffix(".cfg.bak")
+            printer_cfg_path.rename(backup)
+            print(f"Backed up old printer.cfg -> {backup.name}")
+        printer_cfg_path.write_text(new_cfg_text)
+        print(f"Regenerated printer.cfg from machine.yaml (limits synced)")
+
     client = KlipperClient(
         socket_path=socket_path,
         timeout=config.connection.timeout_s,
@@ -77,7 +96,16 @@ def main() -> None:
     )
 
     try:
-        client.connect()
+        needs_restart = cfg_changed
+        try:
+            client.connect()
+        except KlipperShutdown:
+            needs_restart = True
+
+        if needs_restart:
+            print("Restarting Klipper to apply updated printer.cfg...")
+            client.reconnect()
+            print("Klipper restarted successfully.")
 
         # Home before any calibration
         print("\nHoming X Y before calibration...")
@@ -104,7 +132,9 @@ def main() -> None:
         if args.bed_mesh or run_all:
             config_path = Path(args.config) if args.config else None
             routines.calibrate_bed_mesh(
-                client, config, config_path=config_path,
+                client, config,
+                config_path=config_path,
+                use_full_canvas=args.full_canvas,
             )
 
         print("\nCalibration complete.")
@@ -115,6 +145,10 @@ def main() -> None:
         logger.error("Calibration error: %s", exc, exc_info=True)
         sys.exit(1)
     finally:
+        try:
+            client.send_gcode("M84", timeout=5.0)
+        except Exception:
+            pass
         client.disconnect()
 
 

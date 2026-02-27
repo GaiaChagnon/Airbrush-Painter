@@ -196,6 +196,14 @@ def generate_printer_cfg(config: MachineConfig) -> str:
         f"resolution: {_ARC_RESOLUTION_MM}\n"
     )
 
+    # -- [idle_timeout] -- disable steppers after inactivity ----------------
+    lines.append(
+        f"[idle_timeout]\n"
+        f"timeout: {m.idle_timeout_s:.0f}\n"
+        f"gcode:\n"
+        f"    M84\n"
+    )
+
     # -- [stepper_x] -- primary X motor ------------------------------------
     lines.append(
         f"# --- X axis primary ({x_axis.octopus_slot.split('+')[0].strip()}) ---\n"
@@ -207,7 +215,7 @@ def generate_printer_cfg(config: MachineConfig) -> str:
         f"endstop_pin: {_endstop_pin_str(x_axis)}\n"
         f"position_endstop: 0\n"
         f"position_min: 0\n"
-        f"position_max: {wa.x:.0f}\n"
+        f"position_max: {wa.x:g}\n"
         f"homing_speed: {m.homing_speed_mm_s}\n"
     )
 
@@ -234,22 +242,35 @@ def generate_printer_cfg(config: MachineConfig) -> str:
         f"enable_pin: {y_pins.enable}\n"
         f"{common}\n"
         f"endstop_pin: {_endstop_pin_str(y_axis)}\n"
-        f"position_endstop: {y_endstop_pos:.0f}\n"
+        f"position_endstop: {y_endstop_pos:g}\n"
         f"position_min: 0\n"
-        f"position_max: {wa.y:.0f}\n"
+        f"position_max: {wa.y:g}\n"
         f"homing_speed: {m.homing_speed_mm_s}\n"
         f"{y_homing_dir_line}"
     )
 
     # -- [stepper_z] -- seesaw belt axis ------------------------------------
-    # Klipper requires position_endstop inside [position_min, position_max],
-    # so position_max = wa.z (80).  The tighter 5..75 mm soft limits are
-    # enforced in the test script (Z_MIN_SAFE / Z_MAX_SAFE).
+    # position_endstop = wa.z (endstop trigger point, e.g. 80).
+    # position_max  = z_max + z_overtravel_mm (e.g. 80 + 1 = 81) so
+    #   Klipper allows moves past the endstop for calibration probing.
+    # Normal scripts clamp to soft_limits.z_min..z_max; calibration
+    #   uses z_max_with_overtravel.
+    sl = wa.soft_limits
     z_common = _stepper_common(config, s.z_rotation_distance)
     z_homing_dir_line = (
         "homing_positive_dir: True\n"
         if z_homes_positive else ""
     )
+    # Two-pass Z homing: first home at z_homing_speed, back off by
+    # homing_retract_dist, then re-home at second_homing_speed for precision.
+    z_homing_extras = ""
+    if m.z_homing_retract_mm > 0:
+        z_homing_extras += f"homing_retract_dist: {m.z_homing_retract_mm:g}\n"
+    if m.z_second_homing_speed_mm_s > 0:
+        z_homing_extras += (
+            f"second_homing_speed: {m.z_second_homing_speed_mm_s:g}\n"
+        )
+
     lines.append(
         f"# --- Z axis (seesaw belt, physical endstop at "
         f"{'max' if z_homes_positive else 'min'}) ---\n"
@@ -259,10 +280,11 @@ def generate_printer_cfg(config: MachineConfig) -> str:
         f"enable_pin: {z_pins.enable}\n"
         f"{z_common}\n"
         f"endstop_pin: {_endstop_pin_str(z_axis)}\n"
-        f"position_endstop: {z_endstop_pos:.0f}\n"
+        f"position_endstop: {z_endstop_pos:g}\n"
         f"position_min: 0\n"
-        f"position_max: {wa.z:.0f}\n"
+        f"position_max: {sl.z_max_with_overtravel:g}\n"
         f"homing_speed: {m.z_homing_speed_mm_s}\n"
+        f"{z_homing_extras}"
         f"{z_homing_dir_line}"
     )
 
@@ -300,13 +322,20 @@ def _gen_bed_mesh_section(bm: BedMeshConfig) -> str:
 def _gen_bed_mesh_save_block(bm: BedMeshConfig) -> str:
     """Generate the ``#*#`` save block containing the calibrated mesh profile.
 
-    Klipper parses this block on startup and loads the ``default`` mesh
-    profile so ``BED_MESH_PROFILE LOAD=default`` activates it.
+    The header must match Klipper's ``AUTOSAVE_HEADER`` in
+    ``klippy/configfile.py`` exactly -- Klipper uses ``data.find()``
+    with that literal string.  Continuation lines for ``points`` use
+    a tab prefix (matching Klipper's own ``SAVE_CONFIG`` output).
     """
+    # Exact header from klippy/configfile.py AUTOSAVE_HEADER
+    header = (
+        "\n"
+        "#*# <---------------------- SAVE_CONFIG ---------------------->\n"
+        "#*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.\n"
+        "#*#\n"
+    )
+
     lines: list[str] = [
-        "#*# <save_config>",
-        "#*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.",
-        "#*#",
         "#*# [bed_mesh default]",
         "#*# version = 1",
         "#*# points =",
@@ -314,8 +343,8 @@ def _gen_bed_mesh_save_block(bm: BedMeshConfig) -> str:
 
     assert bm.calibrated_points is not None
     for row in bm.calibrated_points:
-        formatted = ", ".join(f"{v:.6f}" for v in row)
-        lines.append(f"#*#   {formatted}")
+        formatted = ",".join(f"{v:.6f}" for v in row)
+        lines.append(f"#*# \t{formatted}")
 
     lines.extend([
         f"#*# x_count = {bm.probe_count[0]}",
@@ -330,7 +359,7 @@ def _gen_bed_mesh_save_block(bm: BedMeshConfig) -> str:
         f"#*# max_y = {bm.mesh_max[1]:.1f}",
     ])
 
-    return "\n".join(lines) + "\n"
+    return header + "\n".join(lines) + "\n"
 
 
 def _pump_endstop_pin_str(pump: PumpMotorConfig) -> str:

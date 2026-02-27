@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from robot_control.calibration import patterns
 from robot_control.calibration.measurement import (
@@ -359,6 +359,10 @@ def verify_endstops(
 
 _TEST_CIRCLE_RADIUS_MM = 3.0
 _PLANARITY_TOLERANCE_MM = 0.15
+# First point starts this far BELOW z_contact (pen further from paper)
+_FIRST_POINT_SAFE_MARGIN_MM = 2.0
+# Subsequent points start this far below the previous accepted Z
+_SUBSEQUENT_SAFE_MARGIN_MM = 0.25
 
 
 def _build_probe_grid(
@@ -439,6 +443,9 @@ def _draw_test_circle(
     )
 
 
+_XY_JOG_STEP_MM = 5.0
+
+
 def _probe_single_point(
     client: KlipperClient,
     config: MachineConfig,
@@ -447,47 +454,103 @@ def _probe_single_point(
     x: float,
     y: float,
     z_start: float,
-) -> float:
+) -> tuple[float, float, float]:
     """Interactive Z-probing at a single point.
 
     The user types numeric values to jog Z, ``circle`` to draw a test
-    circle, or ``accept`` to record the current Z and move on.
+    circle, XY jog commands to nudge the position, or ``accept`` to
+    record the current Z and move on.
 
-    Returns the accepted Z contact position in mm.
+    Parameters
+    ----------
+    x, y : float
+        Initial XY probe position in mm.
+
+    Returns
+    -------
+    tuple[float, float, float]
+        ``(accepted_z, final_x, final_y)`` -- the contact Z and the
+        (possibly nudged) XY position.
     """
     tc = config.get_tool("pen")
     f_plunge = tc.plunge_feed_mm_s * 60.0
+    f_travel = tc.travel_feed_mm_s * 60.0
     z_min = config.work_area.soft_limits.z_min
-    z_max = config.work_area.soft_limits.z_max
+    z_max = config.work_area.soft_limits.z_max_with_overtravel
+    x_max = config.work_area.x
+    y_max = config.work_area.y
     current_z = z_start
+    current_x = x
+    current_y = y
 
-    print(f"\n  --- Point {idx + 1}/{total}  X={x:.1f}  Y={y:.1f} ---")
+    xy_jog_aliases: dict[str, tuple[float, float]] = {
+        "l":       (-_XY_JOG_STEP_MM, 0.0),
+        "left":    (-_XY_JOG_STEP_MM, 0.0),
+        "r":       (_XY_JOG_STEP_MM, 0.0),
+        "right":   (_XY_JOG_STEP_MM, 0.0),
+        "f":       (0.0, _XY_JOG_STEP_MM),
+        "forward": (0.0, _XY_JOG_STEP_MM),
+        "b":       (0.0, -_XY_JOG_STEP_MM),
+        "back":    (0.0, -_XY_JOG_STEP_MM),
+    }
+
+    print(f"\n  --- Point {idx + 1}/{total}  X={current_x:.1f}  Y={current_y:.1f} ---")
     print(f"  Starting Z: {current_z:.3f} mm")
     print("  Commands:")
-    print("    <number>  Jog Z by that amount (e.g. +0.1, -0.05)")
-    print("    circle    Draw a 3 mm test circle at current Z")
-    print("    accept    Record this Z and move to next point")
+    print("    <number>       Jog Z by that amount (e.g. +0.1, -0.05)")
+    print("    l / r          Jog X by -5 / +5 mm  (left / right)")
+    print("    f / b          Jog Y by +5 / -5 mm  (forward / back)")
+    print("    circle         Draw a 3 mm test circle at current Z")
+    print("    accept         Record this Z and move to next point")
 
     while True:
-        raw = input(f"  Z={current_z:.3f} > ").strip().lower()
+        raw = input(
+            f"  X={current_x:.1f} Y={current_y:.1f} Z={current_z:.3f} > "
+        ).strip().lower()
 
         if raw == "accept":
-            print(f"  Accepted Z = {current_z:.3f} mm")
-            return current_z
+            print(f"  Accepted Z = {current_z:.3f} mm  "
+                  f"at X={current_x:.1f} Y={current_y:.1f}")
+            return current_z, current_x, current_y
 
         if raw == "circle":
             print("  Drawing test circle...")
-            _draw_test_circle(client, x, y, current_z, config)
-            # Re-descend to current Z after circle draws and retracts
+            _draw_test_circle(client, current_x, current_y, current_z, config)
             client.send_gcode(
                 f"G1 Z{current_z:.3f} F{f_plunge:.0f}\nM400", timeout=10.0,
             )
             continue
 
+        if raw in xy_jog_aliases:
+            dx, dy = xy_jog_aliases[raw]
+            new_x = max(0.0, min(current_x + dx, x_max))
+            new_y = max(0.0, min(current_y + dy, y_max))
+            # Retract, move, re-descend
+            z_safe = (
+                config.bed_mesh.horizontal_move_z
+                if config.bed_mesh else 75.0
+            )
+            client.send_gcode(
+                f"G0 Z{z_safe:.1f} F{f_plunge:.0f}\nM400",
+                timeout=10.0,
+            )
+            client.send_gcode(
+                f"G0 X{new_x:.2f} Y{new_y:.2f} F{f_travel:.0f}\nM400",
+                timeout=10.0,
+            )
+            client.send_gcode(
+                f"G1 Z{current_z:.3f} F{f_plunge:.0f}\nM400",
+                timeout=10.0,
+            )
+            current_x = new_x
+            current_y = new_y
+            continue
+
         try:
             delta = float(raw)
         except ValueError:
-            print("  Invalid input. Enter a number, 'circle', or 'accept'.")
+            print("  Invalid input. Type a number, l/r/f/b, 'circle', "
+                  "or 'accept'.")
             continue
 
         new_z = current_z + delta
@@ -502,28 +565,101 @@ def _save_bed_mesh_to_config(
     config_path: Path,
     calibrated_points: list[list[float]],
     new_pen_work_mm: float,
+    mesh_min: tuple[float, float],
+    mesh_max: tuple[float, float],
 ) -> None:
-    """Write calibrated mesh offsets and updated pen_work_mm to machine.yaml.
+    """Write calibrated mesh offsets and bounds to machine.yaml.
 
-    Performs a read-modify-write cycle on the raw YAML dict so that
-    comments and ordering for other sections are preserved as much as
-    ``yaml.safe_dump`` allows.
+    Also updates ``pen_work_mm`` to the mean contact Z so the mesh
+    offsets are centred around zero.
+
+    Performs a read-modify-write on the raw YAML dict.
     """
     data = load_yaml(config_path)
 
     if "bed_mesh" not in data:
         data["bed_mesh"] = {}
     data["bed_mesh"]["calibrated_points"] = calibrated_points
+    data["bed_mesh"]["mesh_min"] = [round(v, 1) for v in mesh_min]
+    data["bed_mesh"]["mesh_max"] = [round(v, 1) for v in mesh_max]
 
     data["z_states"]["pen_work_mm"] = round(new_pen_work_mm, 3)
 
     atomic_yaml_dump(data, config_path)
     logger.info(
-        "Saved bed mesh (%d points) and pen_work_mm=%.3f to %s",
+        "Saved bed mesh (%d points), pen_work_mm=%.3f, "
+        "bounds=(%.1f,%.1f)-(%.1f,%.1f) to %s",
         sum(len(row) for row in calibrated_points),
         new_pen_work_mm,
+        mesh_min[0], mesh_min[1], mesh_max[0], mesh_max[1],
         config_path,
     )
+
+
+def _save_z_contact_to_jobs(new_z_contact_mm: float) -> None:
+    """Update ``pen_tracer.z_contact_mm`` in ``jobs.yaml``.
+
+    Performs a read-modify-write so other fields remain untouched.
+    """
+    jobs_path = (
+        Path(__file__).resolve().parent.parent / "configs" / "jobs.yaml"
+    )
+    data = load_yaml(jobs_path)
+
+    if "pen_tracer" not in data:
+        data["pen_tracer"] = {}
+    data["pen_tracer"]["z_contact_mm"] = round(new_z_contact_mm, 3)
+
+    atomic_yaml_dump(data, jobs_path)
+    logger.info(
+        "Saved z_contact_mm=%.3f to %s", new_z_contact_mm, jobs_path,
+    )
+
+
+class _JobsPenConfig(NamedTuple):
+    """Subset of jobs.yaml needed by bed-mesh calibration."""
+
+    mesh_min: tuple[float, float]
+    mesh_max: tuple[float, float]
+    z_contact_mm: float
+
+
+def _load_jobs_pen_config() -> _JobsPenConfig:
+    """Load paper bounds and ``z_contact_mm`` from ``jobs.yaml``.
+
+    Returns
+    -------
+    _JobsPenConfig
+        ``mesh_min/mesh_max`` covering the paper area (origin to
+        origin+size) without margin inset, plus the current
+        ``z_contact_mm`` pen-touch height.
+
+    Raises
+    ------
+    KeyError
+        If ``pen_tracer.z_contact_mm`` is missing from the YAML.
+    """
+    jobs_path = (
+        Path(__file__).resolve().parent.parent / "configs" / "jobs.yaml"
+    )
+    jobs = load_yaml(jobs_path)
+
+    paper = jobs.get("paper", {})
+    origin = paper.get("origin_mm", [25.0, 25.0])
+    size = paper.get("size_mm", [297.0, 210.0])
+
+    mesh_min = (float(origin[0]), float(origin[1]))
+    mesh_max = (float(origin[0] + size[0]), float(origin[1] + size[1]))
+
+    pen_tracer = jobs.get("pen_tracer", {})
+    z_contact = pen_tracer.get("z_contact_mm")
+    if z_contact is None:
+        raise KeyError(
+            "pen_tracer.z_contact_mm not found in jobs.yaml -- "
+            "this is required to determine the safe starting Z."
+        )
+
+    return _JobsPenConfig(mesh_min, mesh_max, float(z_contact))
 
 
 def calibrate_bed_mesh(
@@ -531,17 +667,27 @@ def calibrate_bed_mesh(
     config: MachineConfig,
     config_path: Path | None = None,
     planarity_tolerance: float = _PLANARITY_TOLERANCE_MM,
+    use_full_canvas: bool = False,
 ) -> dict[str, Any]:
     """Manually probe a grid of points to build a Klipper bed-mesh profile.
+
+    The reference contact height is read from ``jobs.yaml``'s
+    ``pen_tracer.z_contact_mm``.  The first probe point starts
+    ``_FIRST_POINT_SAFE_MARGIN_MM`` (2 mm) below that value (pen
+    further from paper on the seesaw), so the pen cannot crash on
+    initial approach.  Every subsequent point starts
+    ``_SUBSEQUENT_SAFE_MARGIN_MM`` (0.25 mm) below the previously
+    accepted contact Z.
 
     At each point the user jogs Z until the pen just touches the paper,
     optionally draws a test circle to verify contact, then accepts.
     After all points are probed the routine:
 
-    1. Computes the mean contact Z and updates ``pen_work_mm``.
+    1. Computes the mean contact Z and updates ``pen_work_mm`` in
+       ``machine.yaml`` **and** ``z_contact_mm`` in ``jobs.yaml``.
     2. Computes per-point mesh offsets (contact - mean).
     3. Runs a planarity check (least-squares plane fit).
-    4. Writes the mesh data and pen_work_mm to ``machine.yaml``.
+    4. Writes the mesh data to ``machine.yaml``.
     5. Regenerates ``printer.cfg`` with the saved mesh profile.
 
     Parameters
@@ -555,6 +701,10 @@ def calibrate_bed_mesh(
         location alongside ``loader.py``.
     planarity_tolerance : float
         Max acceptable plane-fit residual in mm (default 0.15).
+    use_full_canvas : bool
+        When ``False`` (default), probe within the paper bounds from
+        ``jobs.yaml``.  When ``True``, probe the full canvas area
+        from ``machine.yaml``'s ``bed_mesh.mesh_min/mesh_max``.
 
     Returns
     -------
@@ -574,18 +724,45 @@ def calibrate_bed_mesh(
 
     bm = config.bed_mesh
     if config_path is None:
-        config_path = Path(__file__).resolve().parent.parent / "configs" / "machine.yaml"
+        config_path = (
+            Path(__file__).resolve().parent.parent / "configs" / "machine.yaml"
+        )
+
+    jobs_pen = _load_jobs_pen_config()
+    z_contact = jobs_pen.z_contact_mm
+
+    # Determine probe bounds
+    if use_full_canvas:
+        mesh_min = bm.mesh_min
+        mesh_max = bm.mesh_max
+        bounds_label = "full canvas"
+    else:
+        mesh_min = jobs_pen.mesh_min
+        mesh_max = jobs_pen.mesh_max
+        bounds_label = "paper (jobs.yaml)"
+
+    probe_count = bm.probe_count
+
+    # First point: approach from z_contact minus a safe margin (pen well
+    # above paper).  Subsequent points start just above the previously
+    # accepted contact Z.  Lower Z = pen further from paper on the seesaw.
+    first_z_start = z_contact - _FIRST_POINT_SAFE_MARGIN_MM
 
     logger.info("Starting bed-mesh calibration")
     print(f"\n{'='*60}")
     print("  BED MESH CALIBRATION (surface leveling)")
     print(f"{'='*60}")
-    print(f"  Grid: {bm.probe_count[0]}x{bm.probe_count[1]}")
-    print(f"  Area: ({bm.mesh_min[0]}, {bm.mesh_min[1]}) -> "
-          f"({bm.mesh_max[0]}, {bm.mesh_max[1]}) mm")
+    print(f"  Bounds:       {bounds_label}")
+    print(f"  Grid:         {probe_count[0]}x{probe_count[1]}")
+    print(f"  Area:         ({mesh_min[0]:.1f}, {mesh_min[1]:.1f}) -> "
+          f"({mesh_max[0]:.1f}, {mesh_max[1]:.1f}) mm")
+    print(f"  z_contact_mm: {z_contact:.3f}  (from jobs.yaml)")
+    print(f"  First start:  {first_z_start:.3f}  "
+          f"({_FIRST_POINT_SAFE_MARGIN_MM} mm safety margin)")
+    print(f"  Subsequent:   accepted_z - {_SUBSEQUENT_SAFE_MARGIN_MM} mm")
     print()
 
-    probe_points = _build_probe_grid(bm.mesh_min, bm.mesh_max, bm.probe_count)
+    probe_points = _build_probe_grid(mesh_min, mesh_max, probe_count)
     total = len(probe_points)
 
     tc = config.get_tool("pen")
@@ -593,8 +770,7 @@ def calibrate_bed_mesh(
     f_plunge = tc.plunge_feed_mm_s * 60.0
     z_safe = bm.horizontal_move_z
 
-    # The starting Z for probing: use existing pen_work_mm as initial guess
-    z_start = config.z_states.pen_work_mm
+    z_start = first_z_start
 
     print("  Place paper on the glass surface.")
     print("  The pen will move to each point; adjust Z until it touches.\n")
@@ -607,6 +783,7 @@ def calibrate_bed_mesh(
     client.send_gcode("G28 Z\nM400", timeout=60.0)
 
     contact_zs: list[float] = []
+    final_xys: list[tuple[float, float]] = []
 
     for idx, (px, py) in enumerate(probe_points):
         # Retract and travel to probe point
@@ -616,18 +793,19 @@ def calibrate_bed_mesh(
         client.send_gcode(
             f"G0 X{px:.2f} Y{py:.2f} F{f_travel:.0f}\nM400", timeout=10.0,
         )
-        # Pre-descend to starting Z
+        # Pre-descend to starting Z (safe offset above expected contact)
         client.send_gcode(
             f"G1 Z{z_start:.3f} F{f_plunge:.0f}\nM400", timeout=10.0,
         )
 
-        z_val = _probe_single_point(
+        z_val, final_x, final_y = _probe_single_point(
             client, config, idx, total, px, py, z_start,
         )
         contact_zs.append(z_val)
+        final_xys.append((final_x, final_y))
 
-        # Use the just-accepted Z as initial guess for the next point
-        z_start = z_val
+        # Subsequent points: start 0.25 mm above the contact just found
+        z_start = z_val - _SUBSEQUENT_SAFE_MARGIN_MM
 
     # Retract after last point
     client.send_gcode(
@@ -638,16 +816,17 @@ def calibrate_bed_mesh(
     mean_z = sum(contact_zs) / len(contact_zs)
     offsets_flat = [z - mean_z for z in contact_zs]
 
-    nx, ny = bm.probe_count
+    nx, ny = probe_count
     offsets_2d: list[list[float]] = []
     for row_idx in range(ny):
         row = offsets_flat[row_idx * nx : (row_idx + 1) * nx]
         offsets_2d.append([round(v, 6) for v in row])
 
     # ---- Planarity check ----
+    # Use the final (possibly nudged) XY positions for the plane fit
     points_xyz = [
-        (px, py, cz)
-        for (px, py), cz in zip(probe_points, contact_zs)
+        (fx, fy, cz)
+        for (fx, fy), cz in zip(final_xys, contact_zs)
     ]
     planarity = check_planarity(points_xyz, tolerance=planarity_tolerance)
 
@@ -668,19 +847,24 @@ def calibrate_bed_mesh(
         print("  This may indicate the glass is flexing or "
               "the surface is not rigid.")
         print("  Per-point residuals:")
-        for i, (pt, res) in enumerate(
-            zip(probe_points, planarity.residuals)
+        for i, ((fx, fy), res) in enumerate(
+            zip(final_xys, planarity.residuals)
         ):
             flag = " <<<" if abs(res) > planarity_tolerance else ""
-            print(f"    Point {i+1} ({pt[0]:.0f}, {pt[1]:.0f}): "
+            print(f"    Point {i+1} ({fx:.0f}, {fy:.0f}): "
                   f"{res:+.4f} mm{flag}")
 
     print()
 
     # ---- Save to config ----
     if get_yes_no("Save mesh to machine.yaml and regenerate printer.cfg?"):
-        _save_bed_mesh_to_config(config_path, offsets_2d, mean_z)
+        _save_bed_mesh_to_config(
+            config_path, offsets_2d, mean_z, mesh_min, mesh_max,
+        )
         print(f"  Updated machine.yaml (pen_work_mm = {mean_z:.3f})")
+
+        _save_z_contact_to_jobs(mean_z)
+        print(f"  Updated jobs.yaml   (z_contact_mm = {mean_z:.3f})")
 
         # Regenerate printer.cfg
         from robot_control.configs.loader import load_config

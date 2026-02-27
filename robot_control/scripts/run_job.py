@@ -147,6 +147,10 @@ def main() -> None:
         logger.error("Job error: %s", exc, exc_info=True)
         sys.exit(1)
     finally:
+        try:
+            client.send_gcode("M84", timeout=5.0)
+        except Exception:
+            pass
         client.disconnect()
 
 

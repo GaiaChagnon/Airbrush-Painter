@@ -1,291 +1,172 @@
-# machine.yaml - Hardware configuration for Octopus Pro Painter
-#
-# Single source of truth for machine dimensions, stepper hardware, and tool
-# configuration.  The code reads this file at startup via configs/loader.py.
-# Change values here -- do NOT hardcode them in Python.
-#
-# All linear dimensions are in millimeters.
-# All feed/speed values are in mm/s (converted to mm/min at G-code boundary).
-#
-# Values validated against hardware bring-up (test_motors.py, 2026-02-12).
-
-# --- Klipper API connection ------------------------------------------------
 connection:
-  socket_path: "/tmp/klippy_uds"
-  timeout_s: 10.0                    # Must cover slow Z homing; bump if timeouts occur
-  reconnect_attempts: 5            # Retries if Octopus was power-cycled
-  reconnect_interval_s: 2.0        # Seconds between reconnect attempts
-  auto_reconnect: true             # Re-establish connection on MCU reset
-  mcu_serial: "/dev/serial/by-id/usb-Klipper_stm32h723xx_130028001051313234353230-if00"
-
-# --- Physical work area (measure your machine) -----------------------------
-# These are the ACTUAL travel limits of each axis in mm.
-# Must match position_min/position_max in printer.cfg.
+  socket_path: /tmp/klippy_uds
+  timeout_s: 10.0
+  reconnect_attempts: 5
+  reconnect_interval_s: 2.0
+  auto_reconnect: true
+  mcu_serial: /dev/serial/by-id/usb-Klipper_stm32h723xx_130028001051313234353230-if00
 machine:
   work_area_mm:
-    x: 450.0                       # Validated during bring-up
-    y: 320.0                       # Validated during bring-up
-    z: 80.0                        # Seesaw belt: 80 mm total travel
-
-  # Soft limits: scripts clamp all commanded positions to this range.
-  # Set these inside the physical travel to protect endstops / mechanics.
-  # Units: mm.  z_min/z_max must be within [0, work_area_mm.z].
+    x: 450.0
+    y: 320.0
+    z: 80
   soft_limits:
-    z_min: 2.0                     # 2 mm above Z=0 endstop
-    z_max: 80.0                    # Full travel allowed (endstop at 80)
-
-# --- Canvas position within work area (airbrush system) --------------------
-# Used by the airbrush G-code generator and interactive controller origin.
-# Pen tracer uses paper placement from jobs.yaml instead.
+    z_min: 0.0
+    z_max: 80
+    z_overtravel_mm: 1.0
 canvas:
-  offset_x_mm: 10.0                # Distance from X home to canvas left edge
-  offset_y_mm: 10.0                # Distance from Y home to canvas bottom edge
-  width_mm: 430.0                  # Full usable X width (450 - 2×10)
-  height_mm: 300.0                 # Full usable Y height (320 - 2×10)
-
-# --- Z-axis seesaw states --------------------------------------------------
-# Reference positions for the seesaw mechanism (Z=0 at one end, Z=80 at other).
-# Higher Z = pen closer to paper.  Lower Z = airbrush closer to paper.
+  offset_x_mm: 10.0
+  offset_y_mm: 10.0
+  width_mm: 430.0
+  height_mm: 300.0
 z_states:
-  travel_mm: 40.0                  # Mid-range: both tools clear of paper
-  pen_work_mm: 80                # Pen contacts paper (near Z-max endstop)
-  airbrush_work_mm: 0.0            # Airbrush at spray height (near Z-min)
-
-# --- Tool definitions -------------------------------------------------------
-# All feed rates in mm/s.
-# NOTE: For pen tracing jobs, operational speeds come from jobs.yaml.
-#       These values are defaults for interactive mode and airbrush jobs.
+  travel_mm: 40.0
+  pen_work_mm: 80.5
+  airbrush_work_mm: 0.0
 tools:
   pen:
-    xy_offset_mm: [0.0, 0.0]       # Calibrate with crosshair test
-    feed_mm_s: 150.0                # Default drawing speed (interactive)
-    travel_feed_mm_s: 400.0         # Default rapid speed (interactive)
-    plunge_feed_mm_s: 20.0          # Default Z lowering speed (interactive)
-
+    xy_offset_mm:
+    - 0.0
+    - 0.0
+    feed_mm_s: 150.0
+    travel_feed_mm_s: 400.0
+    plunge_feed_mm_s: 20.0
   airbrush:
-    xy_offset_mm: [0.0, 0.0]
+    xy_offset_mm:
+    - 0.0
+    - 0.0
     feed_mm_s: 100.0
     travel_feed_mm_s: 160.0
     plunge_feed_mm_s: 10.0
-    spray_height_mm: 3.0            # Height above canvas when spraying
-
-# --- Stepper / driver hardware ---------------------------------------------
-# Documents the physical motor+driver+belt+pulley combination so calibration,
-# motion tests, and printer.cfg generation stay consistent.
-#
-# All XY axes share the same motor/driver/belt/pulley combination.
-# Z may differ -- update z_rotation_distance separately when wired.
+    spray_height_mm: 3.0
 steppers:
-  motor_type: "0.9deg"              # 400 native full steps/rev
-  full_steps_per_rotation: 400      # 0.9deg motor = 400 full steps
-  driver: "DM542TE"
-  driver_pulses_per_rev: 3200       # DIP-switch setting (8x for 0.9deg motor)
-  wiring: "common_anode"            # Octopus drives +, - to GND
-  enable_pin_inverted: false        # common_anode -> enable is NOT inverted
-  step_pulse_duration_s: 0.000005   # 5 us -- required for DM542TE via LS08
-  direction_reversal_pause_s: 0.5   # 500 ms pause between rapid reversals
-
-  # Klipper stepper settings (derived from motor + driver)
-  # Validation: full_steps_per_rotation * klipper_microsteps == driver_pulses_per_rev
-  #             400 * 8 = 3200
-  klipper_microsteps: 8             # 400 x 8 = 3200 = driver_pulses_per_rev
-  xy_rotation_distance: 32.0        # GT2 belt (2 mm pitch) x 16T pulley
-  z_rotation_distance: 32.0         # Same belt/pulley as XY
-
-  # Belt & pulley specs (reference / calibration calculations)
-  belt_type: "GT2"
+  motor_type: 0.9deg
+  full_steps_per_rotation: 400
+  driver: DM542TE
+  driver_pulses_per_rev: 3200
+  wiring: common_anode
+  enable_pin_inverted: false
+  step_pulse_duration_s: 5.0e-06
+  direction_reversal_pause_s: 0.5
+  klipper_microsteps: 8
+  xy_rotation_distance: 32.0
+  z_rotation_distance: 32.0
+  belt_type: GT2
   belt_pitch_mm: 2.0
   pulley_teeth: 16
   pulley_bore_mm: 5.0
-
-# --- Axis-to-Motor mapping (Octopus Pro V1.0.1 H723) ----------------------
-# Pin assignments validated during hardware bring-up (test_motors.py).
-# Used by printer.cfg generator and calibration routines.
-#
-# Klipper config mapping:
-#   [stepper_x]  = x.pins[0] (primary)
-#   [stepper_x1] = x.pins[1] (secondary, auto-synced via LookupMultiRail)
-#   [stepper_y]  = y.pins
-#   [stepper_z]  = z.pins (dummy, not physically homed)
 axes:
   y:
-    octopus_slot: "Motor 0"
+    octopus_slot: Motor 0
     motors: 1
     pins:
-      step: "PF13"
-      dir: "!PF12"                   # Inverted so Y=0 is at the endstop
-      enable: "PF14"
-    endstop_pin: "PG9"              # STOP_1
-    endstop_polarity: "^!"          # pull-up + inverted (NO switch to GND)
-    endstop_type: "NO_to_GND"
-    homing_side: "min"              # Endstop at Y=0 (dir inverted to flip axis)
+      step: PF13
+      dir: '!PF12'
+      enable: PF14
+    endstop_pin: PG9
+    endstop_polarity: ^!
+    endstop_type: NO_to_GND
+    homing_side: min
   x:
-    octopus_slot: "Motor 2_1 + Motor 2_2"
-    motors: 2                       # Dual motor (stepper_x + stepper_x1)
+    octopus_slot: Motor 2_1 + Motor 2_2
+    motors: 2
     pins:
-      - step: "PF11"
-        dir: "PG3"
-        enable: "PG5"
-      - step: "PG4"
-        dir: "!PC1"                 # Inverted -- motors face each other
-        enable: "PA0"
-    endstop_pin: "PG6"              # STOP_0
-    endstop_polarity: "^!"          # pull-up + inverted (NO switch to GND)
-    endstop_type: "NO_to_GND"
-    homing_side: "min"              # Endstop at 0
+    - step: PF11
+      dir: PG3
+      enable: PG5
+    - step: PG4
+      dir: '!PC1'
+      enable: PA0
+    endstop_pin: PG6
+    endstop_polarity: ^!
+    endstop_type: NO_to_GND
+    homing_side: min
   z:
-    octopus_slot: "Motor 1"         # DRIVER_1 slot
+    octopus_slot: Motor 1
     motors: 1
     pins:
-      step: "PG0"
-      dir: "PG1"
-      enable: "PF15"
-    endstop_pin: "PG10"             # DIAG2 / STOP_2 position -- physical limit switch
-    endstop_polarity: "^!"          # pull-up + inverted (NO switch to GND)
-    endstop_type: "NO_to_GND"
-    homing_side: "max"              # Endstop at position 80 (far end of seesaw belt)
-
-# --- Motion limits ----------------------------------------------------------
-# Validated during hardware bring-up speed ramp tests (2026-02-12).
+      step: PG0
+      dir: PG1
+      enable: PF15
+    endstop_pin: PG10
+    endstop_polarity: ^!
+    endstop_type: NO_to_GND
+    homing_side: max
 motion:
-  max_velocity_mm_s: 500.0          # 2x previous; DM542TE at 8 microsteps allows higher speeds
-  max_accel_mm_s2: 3000.0           # 2x previous
-  square_corner_velocity_mm_s: 16.0 # 2x previous
-  homing_speed_mm_s: 32.0           # ~1 RPS with 32 mm rotation_distance
-  z_homing_speed_mm_s: 20.0         # 2x previous; still slower than XY due to less endstop play
+  max_velocity_mm_s: 500.0
+  max_accel_mm_s2: 3000.0
+  square_corner_velocity_mm_s: 16.0
+  homing_speed_mm_s: 32.0
+  z_homing_speed_mm_s: 10.0
+  z_second_homing_speed_mm_s: 2.5     # Slower re-home for precision (mm/s)
+  z_homing_retract_mm: 3.0            # Back off this far before re-homing
   junction_deviation_mm: 0.05
-
-# --- Interactive mode settings ----------------------------------------------
+  idle_timeout_s: 30
 interactive:
-  jog_increments_mm: [0.1, 1.0, 10.0, 50.0]
+  jog_increments_mm:
+  - 0.1
+  - 1.0
+  - 10.0
+  - 50.0
   default_jog_increment_mm: 1.0
   position_poll_interval_ms: 100
-
-# --- File execution (virtual_sdcard) ----------------------------------------
 file_execution:
-  gcode_directory: "/home/klipper/gcode_files"
-
-# --- Syringe pump hardware ---------------------------------------------------
-# Linear stepper motors driving syringe plungers via T8 lead screws.
-# Each pump is a Klipper [manual_stepper] independent of XYZ kinematics.
-#
-# Coordinate convention (per pump):
-#   Position 0 = at the limit switch (homing position)
-#   Positive homing_direction means the limit switch is in the + direction.
-#   Dispensing moves AWAY from the switch; retracting moves TOWARD it.
-#
-# All linear dimensions in mm.  All speeds in mm/s.
+  gcode_directory: /home/klipper/gcode_files
 pumps:
   enabled: true
-
-  # Shared stepper/driver specs for all pump motors.
-  # Different from XY/Z steppers: 1.8deg motor + lead screw (not belt).
   stepper:
-    motor_type: "1.8deg"              # 200 native full steps/rev
-    full_steps_per_rotation: 200      # 1.8deg = 200 full steps
-    driver_pulses_per_rev: 12800      # DIP-switch setting for max precision
-    klipper_microsteps: 64           # 200 * 64 = 12800
-    rotation_distance: 4.0            # T8 lead screw: 4 mm/rev
-    lead_per_step_mm: 0.02            # Reference: 4.0 / 200
-    step_pulse_duration_s: 0.000005   # 5 us -- same driver family as XY/Z
-    enable_pin_inverted: false        # Common-anode wiring (DM542TE-style)
-    direction_reversal_pause_s: 0.3   # 300 ms pause between rapid reversals
-
-  # Default syringe specs (can be overridden per pump).
+    motor_type: 1.8deg
+    full_steps_per_rotation: 200
+    driver_pulses_per_rev: 12800
+    klipper_microsteps: 64
+    rotation_distance: 4.0
+    lead_per_step_mm: 0.02
+    step_pulse_duration_s: 5.0e-06
+    enable_pin_inverted: false
+    direction_reversal_pause_s: 0.3
   syringe:
-    volume_ml: 1.0                    # Total syringe capacity
-    plunger_travel_mm: 16.0           # Full plunger stroke to empty syringe
-    # Derived: volume_per_mm = 1.0 / 16.0 = 0.0625 ml/mm
-    # Derived: mm_per_ml     = 16.0 / 1.0 = 16.0   mm/ml
-
-  # Per-pump motor definitions.
-  # Key = pump identifier used in scripts and job IR.
+    volume_ml: 1.0
+    plunger_travel_mm: 16.0
   motors:
     pump_0:
-      octopus_slot: "Motor 3"         # Driver 4 on Octopus Pro (next free after X dual)
+      octopus_slot: Motor 3
       pins:
-        step: "PF9"
-        dir: "PF10"
-        enable: "PG2"
-      endstop_pin: "PG11"            # DIAG3 header -- limit switch at position 0
-      endstop_polarity: "^!"         # Pull-up + inverted (NO switch to GND)
-      endstop_type: "NO_to_GND"
-      homing_direction: 1            # +1 = switch in positive direction, -1 = negative
-      homing_speed_mm_s: 2.0         # Slow homing for precision
-      home_backoff_mm: 0.5           # Back off from switch after homing
-      max_dispense_speed_mm_s: 4.0   # Max plunger push speed (mm/s)
-      max_retract_speed_mm_s: 4.0    # Max plunger pull speed (mm/s)
-      # Per-pump syringe override (uncomment to differ from defaults above):
-      # syringe:
-      #   volume_ml: 1.0
-      #   plunger_travel_mm: 16.0
-
-    # pump_1:                         # Motor 4 / Driver 5
-    #   octopus_slot: "Motor 4"
-    #   pins:
-    #     step: "PC13"
-    #     dir: "PF0"
-    #     enable: "PF1"
-    #   endstop_pin: "PG12"           # DIAG4
-    #   endstop_polarity: "^!"
-    #   endstop_type: "NO_to_GND"
-    #   homing_direction: 1
-    #   homing_speed_mm_s: 2.0
-    #   home_backoff_mm: 0.5
-    #   max_dispense_speed_mm_s: 4.0
-    #   max_retract_speed_mm_s: 4.0
-
-    # pump_2:                         # Motor 5 / Driver 6
-    #   octopus_slot: "Motor 5"
-    #   pins:
-    #     step: "PE2"
-    #     dir: "PE3"
-    #     enable: "PD4"
-    #   endstop_pin: "PG13"           # DIAG5
-    #   endstop_polarity: "^!"
-    #   endstop_type: "NO_to_GND"
-    #   homing_direction: 1
-    #   homing_speed_mm_s: 2.0
-    #   home_backoff_mm: 0.5
-    #   max_dispense_speed_mm_s: 4.0
-    #   max_retract_speed_mm_s: 4.0
-
-    # pump_3:                         # Motor 6 / Driver 7
-    #   octopus_slot: "Motor 6"
-    #   pins:
-    #     step: "PE6"
-    #     dir: "PA14"
-    #     enable: "PE0"
-    #   endstop_pin: "PG14"           # DIAG6
-    #   endstop_polarity: "^!"
-    #   endstop_type: "NO_to_GND"
-    #   homing_direction: 1
-    #   homing_speed_mm_s: 2.0
-    #   home_backoff_mm: 0.5
-    #   max_dispense_speed_mm_s: 4.0
-    #   max_retract_speed_mm_s: 4.0
-
-# --- Bed mesh (surface leveling) --------------------------------------------
-# Klipper [bed_mesh] parameters for manual pen-surface calibration.
-# The calibration script probes a grid of points, records Z contact heights,
-# and writes the offsets into calibrated_points.  printer_cfg.py emits both
-# the [bed_mesh] config section and the saved profile block so Klipper
-# applies dynamic Z compensation during all XY motion.
-#
-# mesh_min/mesh_max define the XY probing area (should cover the usable canvas).
-# horizontal_move_z is the safe retracted-pen Z used between probe points.
-# All linear dimensions in mm, speed in mm/s.
+        step: PF9
+        dir: PF10
+        enable: PG2
+      endstop_pin: PG11
+      endstop_polarity: ^!
+      endstop_type: NO_to_GND
+      homing_direction: 1
+      homing_speed_mm_s: 2.0
+      home_backoff_mm: 0.5
+      max_dispense_speed_mm_s: 4.0
+      max_retract_speed_mm_s: 4.0
 bed_mesh:
-  mesh_min: [10.0, 10.0]              # XY of first probe point (canvas origin)
-  mesh_max: [440.0, 310.0]            # XY of last probe point (canvas far corner)
-  probe_count: [3, 3]                 # Grid dimensions [X, Y]; 3x3 = 9 points
-  horizontal_move_z: 75.0             # Pen retracted ~5 mm from typical contact
-  speed: 200.0                        # XY travel speed between probe points
-  mesh_pps: [2, 2]                    # Interpolation points per segment [X, Y]
-  algorithm: lagrange                 # 'lagrange' for <=6 probes/axis, 'bicubic' for >6
-  # Written by: calibrate --bed-mesh.  null = not yet calibrated.
-  calibrated_points: null
-
-# --- Future hardware (disabled) ---------------------------------------------
+  mesh_min:
+  - 25.0
+  - 25.0
+  mesh_max:
+  - 322.0
+  - 235.0
+  probe_count:
+  - 3
+  - 3
+  horizontal_move_z: 75.0
+  speed: 200.0
+  mesh_pps:
+  - 2
+  - 2
+  algorithm: lagrange
+  calibrated_points:
+  - - -0.09
+    - -0.14
+    - -0.19
+  - - 0.01
+    - 0.01
+    - 0.01
+  - - 0.13
+    - 0.13
+    - 0.13
 servos:
   enabled: false

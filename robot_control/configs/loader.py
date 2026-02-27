@@ -57,10 +57,22 @@ class ConnectionConfig:
 
 @dataclass(frozen=True)
 class SoftLimitsConfig:
-    """Z-axis soft limits in mm.  Scripts clamp commands to this range."""
+    """Z-axis soft limits in mm.
+
+    ``z_max`` is the normal operational ceiling (usually == endstop).
+    ``z_overtravel_mm`` is the extra travel past the endstop that Klipper
+    allows (used during calibration probing).  Klipper's ``position_max``
+    is set to ``z_max + z_overtravel_mm``.
+    """
 
     z_min: float
     z_max: float
+    z_overtravel_mm: float = 0.0
+
+    @property
+    def z_max_with_overtravel(self) -> float:
+        """Absolute Z ceiling including calibration overtravel."""
+        return self.z_max + self.z_overtravel_mm
 
 
 @dataclass(frozen=True)
@@ -163,6 +175,9 @@ class MotionConfig:
     homing_speed_mm_s: float
     z_homing_speed_mm_s: float
     junction_deviation_mm: float
+    z_second_homing_speed_mm_s: float = 0.0
+    z_homing_retract_mm: float = 0.0
+    idle_timeout_s: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -895,6 +910,7 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
         soft_limits = SoftLimitsConfig(
             z_min=float(sl_data.get("z_min", 2.0)),
             z_max=float(sl_data.get("z_max", wa["z"])),
+            z_overtravel_mm=float(sl_data.get("z_overtravel_mm", 0.0)),
         )
         work_area = WorkAreaConfig(
             x=float(wa["x"]), y=float(wa["y"]), z=float(wa["z"]),
@@ -945,7 +961,14 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
             z_homing_speed_mm_s=float(
                 md.get("z_homing_speed_mm_s", md["homing_speed_mm_s"])
             ),
+            z_second_homing_speed_mm_s=float(
+                md.get("z_second_homing_speed_mm_s", 0.0)
+            ),
+            z_homing_retract_mm=float(
+                md.get("z_homing_retract_mm", 0.0)
+            ),
             junction_deviation_mm=float(md["junction_deviation_mm"]),
+            idle_timeout_s=float(md.get("idle_timeout_s", 30.0)),
         )
 
         # -- interactive ----------------------------------------------------

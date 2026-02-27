@@ -80,7 +80,7 @@ WORKSPACE_X_MM = _CFG.work_area.x
 WORKSPACE_Y_MM = _CFG.work_area.y
 WORKSPACE_Z_MM = _CFG.work_area.z
 Z_MIN_SAFE = _CFG.work_area.soft_limits.z_min
-Z_MAX_SAFE = _CFG.work_area.soft_limits.z_max
+Z_MAX_SAFE = _CFG.work_area.soft_limits.z_max_with_overtravel
 
 DEFAULT_IMAGES_DIR = Path(__file__).resolve().parent.parent / "images"
 DEFAULT_PREVIEW_DIR = DEFAULT_IMAGES_DIR / "previews"
@@ -337,6 +337,7 @@ class PaperTransform:
         image_w: float,
         image_h: float,
         paper_origin: tuple[float, float] | None = None,
+        mirror_x: bool = False,
     ) -> None:
         if paper_origin is not None:
             self.paper_left = paper_origin[0]
@@ -374,6 +375,7 @@ class PaperTransform:
         self.paper_h = paper_h
         self.image_w = image_w
         self.image_h = image_h
+        self.mirror_x = mirror_x
 
     def image_to_machine(
         self, x_img: float, y_img: float,
@@ -382,9 +384,13 @@ class PaperTransform:
 
         Image frame: top-left origin, +Y down.
         Machine frame: bottom-left origin, +Y up.
+        When ``mirror_x`` is True, the X axis is flipped so the image
+        is horizontally mirrored on paper.
         """
         x_scaled = x_img * self.scale
         y_scaled = y_img * self.scale
+        if self.mirror_x:
+            x_scaled = self.scaled_w - x_scaled
         y_flipped = self.scaled_h - y_scaled
         return self.origin_x + x_scaled, self.origin_y + y_flipped
 
@@ -2447,6 +2453,10 @@ def main() -> None:
 
     # ---- Operational flags ----
     parser.add_argument(
+        "--mirror-x", action="store_true",
+        help="Mirror the image horizontally on paper",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Compute stats without sending G-code",
     )
@@ -2651,6 +2661,7 @@ def main() -> None:
         image_w=image_w_mm,
         image_h=image_h_mm,
         paper_origin=(ox, oy),
+        mirror_x=args.mirror_x,
     )
 
     print()

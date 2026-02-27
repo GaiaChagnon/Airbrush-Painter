@@ -1,44 +1,18 @@
-# jobs.yaml -- Operational parameters for robot pen tracing / airbrush jobs
-#
-# Defines speeds, paper placement, and tracing behavior.
-# Hardware limits stay in machine.yaml; values here must not exceed them.
-# CLI arguments override any value here.
-#
-# All linear dimensions in millimeters, speeds in mm/s, accel in mm/s^2.
-
-# --- Paper placement --------------------------------------------------------
-# The paper's bottom-left corner is placed at `origin_mm` relative to the
-# endstops (X=0, Y=0).  Size determines scaling: the image is fitted
-# (uniform scale, no stretching) into the drawable area (paper minus margins).
 paper:
-  size_mm: [297.0, 210.0]           # [X, Y] -- A4 landscape (long side on X)
-  origin_mm: [25.0, 25.0]           # Bottom-left corner offset from endstops
-  margin_mm: 10.0                    # Inset from paper edge on all sides
-
-# --- Pen tracer job settings ------------------------------------------------
+  size_mm:
+  - 297.0
+  - 210.0
+  origin_mm:
+  - 25.0
+  - 25.0
+  margin_mm: 10.0
 pen_tracer:
-  # XY speeds
-  draw_speed_mm_s: 200.0             # Pen-down drawing speed
-  travel_speed_mm_s: 400.0           # Pen-up rapid move speed
-
-  # Z speeds (pen up/down)
-  z_plunge_speed_mm_s: 25.0          # Pen lowering speed
-  z_retract_speed_mm_s: 60.0         # Pen raising speed (fast, no precision needed)
-
-  # Acceleration and cornering
-  accel_mm_s2: 2000.0                # XY acceleration limit during drawing
-  square_corner_velocity_mm_s: 10.0   # Max speed through corners (Klipper junction limit; machine max=16)
-
-  # Z positions
-  z_contact_mm: 80                  # Z where pen touches paper (near endstop at 80)
-  z_retract_mm: 5                  # Distance to retract above contact (mm); keep small to minimize pen-lift time
-
-  # Alignment
-  corner_circle_radius_mm: 3.0       # Radius of alignment circles at paper corners
-
-# --- Airbrush job settings (placeholder) ------------------------------------
-# The airbrush control schema differs significantly from the pen tracer.
-# Only minimal settings here until the airbrush pipeline is implemented.
-# airbrush:
-#   spray_height_mm: 3.0
-#   flow_rate: 0.5
+  draw_speed_mm_s: 40.0
+  travel_speed_mm_s: 400.0
+  z_plunge_speed_mm_s: 25.0
+  z_retract_speed_mm_s: 60.0
+  accel_mm_s2: 2000.0
+  square_corner_velocity_mm_s: 10.0
+  z_contact_mm: 80.5
+  z_retract_mm: 3
+  corner_circle_radius_mm: 3.0

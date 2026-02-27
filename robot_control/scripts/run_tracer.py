@@ -72,7 +72,7 @@ WORKSPACE_Z_MM = _CFG.work_area.z  # 80
 
 # Z soft limits from machine.yaml (configurable, no more hardcoded buffer)
 Z_MIN_SAFE = _CFG.work_area.soft_limits.z_min
-Z_MAX_SAFE = _CFG.work_area.soft_limits.z_max
+Z_MAX_SAFE = _CFG.work_area.soft_limits.z_max_with_overtravel
 
 # Default pen traces output directory
 DEFAULT_TRACES_DIR = Path(_PROJECT_ROOT) / "outputs" / "pen_traces_hard"
