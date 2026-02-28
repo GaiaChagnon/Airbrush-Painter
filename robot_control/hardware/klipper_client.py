@@ -462,7 +462,7 @@ class KlipperClient:
         script: str,
         *,
         timeout: float | None = None,
-        collect_s: float = 2.0,
+        collect_s: float = 3.0,
     ) -> str:
         """Execute G-code and return any console output.
 
@@ -478,7 +478,7 @@ class KlipperClient:
             Per-request timeout for the script itself.
         collect_s : float
             Seconds to keep reading notifications after the command
-            response arrives (default 2 s).
+            response arrives (default 3 s).
 
         Returns
         -------
@@ -489,8 +489,13 @@ class KlipperClient:
         orig_callback = self._sub_callback
 
         def _on_notify(params: Any) -> None:
+            # notify_gcode_response sends params as ["line1", "line2", ...]
             if isinstance(params, list):
                 collected.extend(str(p) for p in params)
+            elif isinstance(params, dict):
+                resp = params.get("response")
+                if resp is not None:
+                    collected.append(str(resp))
             if orig_callback is not None:
                 orig_callback(params)
 
@@ -502,37 +507,7 @@ class KlipperClient:
             self._send_request(
                 "gcode/script", {"script": script}, timeout=timeout,
             )
-            # Drain late notifications after the command ACK
-            deadline = time.monotonic() + collect_s
-            while time.monotonic() < deadline:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._sock.settimeout(  # type: ignore[union-attr]
-                    min(0.5, remaining),
-                )
-                try:
-                    chunk = self._sock.recv(4096)  # type: ignore[union-attr]
-                    if not chunk:
-                        break
-                    self._recv_buffer += chunk
-                    while ETX in self._recv_buffer:
-                        idx = self._recv_buffer.index(ETX)
-                        raw = self._recv_buffer[:idx]
-                        self._recv_buffer = self._recv_buffer[idx + 1:]
-                        try:
-                            msg = json.loads(raw.decode("utf-8"))
-                            if (
-                                "method" in msg
-                                and self._sub_callback is not None
-                            ):
-                                self._sub_callback(
-                                    msg.get("params", {}),
-                                )
-                        except json.JSONDecodeError:
-                            pass
-                except socket.timeout:
-                    pass
+            self._drain_notifications(collect_s)
         except KlipperError as exc:
             raise GCodeError(
                 f"G-code execution failed: {exc}"
@@ -541,6 +516,48 @@ class KlipperClient:
             self._sub_callback = orig_callback
 
         return "\n".join(collected)
+
+    def _drain_notifications(self, duration_s: float) -> None:
+        """Read and dispatch notifications for *duration_s* seconds.
+
+        Processes any messages already in ``_recv_buffer`` first (they
+        may have been read by ``_recv_response`` but not dispatched
+        because the ID-matched response was found earlier in the
+        stream), then reads the socket until the deadline.
+        """
+        deadline = time.monotonic() + duration_s
+        while time.monotonic() < deadline:
+            # Process messages already sitting in the buffer before
+            # attempting any new recv -- _recv_response may have read
+            # extra messages past the ID-matched response.
+            while ETX in self._recv_buffer:
+                idx = self._recv_buffer.index(ETX)
+                raw = self._recv_buffer[:idx]
+                self._recv_buffer = self._recv_buffer[idx + 1:]
+                try:
+                    msg = json.loads(raw.decode("utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                if "method" in msg and self._sub_callback is not None:
+                    try:
+                        self._sub_callback(msg.get("params", {}))
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._sock.settimeout(  # type: ignore[union-attr]
+                min(0.5, remaining),
+            )
+            try:
+                chunk = self._sock.recv(4096)  # type: ignore[union-attr]
+                if not chunk:
+                    break
+                self._recv_buffer += chunk
+            except socket.timeout:
+                # No new data yet; loop back and check deadline
+                pass
 
     def emergency_stop(self) -> None:
         """Immediate halt via dedicated API endpoint (not queued).
