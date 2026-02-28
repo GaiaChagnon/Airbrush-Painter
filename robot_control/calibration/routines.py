@@ -143,9 +143,8 @@ def calibrate_z_heights(
     print("  Z-HEIGHT (SEESAW) CALIBRATION")
     print(f"{'='*50}\n")
 
-    # Home first
-    print("Homing X Y...")
-    client.send_gcode("G28 X Y\nM400", timeout=30.0)
+    print("Homing all axes...")
+    client.send_gcode("G28\nM400", timeout=60.0)
 
     # Move to test position (canvas centre)
     cx = config.canvas.offset_x_mm + config.canvas.width_mm / 2
@@ -1057,11 +1056,8 @@ def calibrate_bed_mesh(
     print("  The pen will move to each point; adjust Z until it touches.\n")
     input("  Press ENTER to begin...")
 
-    # Home all axes
-    print("\n  Homing X Y...")
-    client.send_gcode("G28 X Y\nM400", timeout=60.0)
-    print("  Homing Z...")
-    client.send_gcode("G28 Z\nM400", timeout=60.0)
+    print("\n  Homing all axes...")
+    client.send_gcode("G28\nM400", timeout=60.0)
 
     contact_zs: list[float] = []
     final_xys: list[tuple[float, float]] = []

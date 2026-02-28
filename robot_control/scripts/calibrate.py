@@ -120,6 +120,12 @@ def main() -> None:
             client.reconnect()
             print("Klipper restarted successfully.")
 
+        # Extend idle timeout so Klipper doesn't run M84 (which clears
+        # the homed state) while the user is at an interactive prompt.
+        client.send_gcode(
+            "SET_IDLE_TIMEOUT TIMEOUT=3600", timeout=5.0,
+        )
+
         # Home all axes before any calibration (Klipper rejects moves
         # unless every axis in the kinematic chain has been homed).
         print("\nHoming all axes before calibration...")
@@ -166,6 +172,12 @@ def main() -> None:
         sys.exit(1)
     finally:
         try:
+            # Restore default idle timeout, then disable steppers
+            client.send_gcode(
+                f"SET_IDLE_TIMEOUT TIMEOUT="
+                f"{config.motion.idle_timeout_s:.0f}",
+                timeout=5.0,
+            )
             client.send_gcode("M84", timeout=5.0)
         except Exception:
             pass

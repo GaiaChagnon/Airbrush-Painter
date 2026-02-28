@@ -501,8 +501,14 @@ class KlipperClient:
 
         self._sub_callback = _on_notify
         try:
+            # response_template tells Klipper to include a "method" key
+            # in every notification so _recv_response dispatches it.
             self._send_request(
-                "gcode/subscribe_output", {}, timeout=5.0,
+                "gcode/subscribe_output",
+                {"response_template": {
+                    "method": "notify_gcode_response",
+                }},
+                timeout=5.0,
             )
             self._send_request(
                 "gcode/script", {"script": script}, timeout=timeout,
