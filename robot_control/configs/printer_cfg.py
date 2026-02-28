@@ -288,6 +288,27 @@ def generate_printer_cfg(config: MachineConfig) -> str:
         f"{z_homing_dir_line}"
     )
 
+    # -- [endstop_phase] (optional) ----------------------------------------
+    if config.endstop_phase_enabled:
+        for axis_name in ("x", "y", "z"):
+            if axis_name in config.axes:
+                lines.append(
+                    f"[endstop_phase stepper_{axis_name}]\n"
+                )
+
+    # -- [servo] (optional) ------------------------------------------------
+    if config.servo is not None:
+        sv = config.servo
+        lines.append(
+            f"# --- Servo ({sv.name}, {sv.angle_range_deg:.0f} deg) ---\n"
+            f"[servo {sv.name}]\n"
+            f"pin: {sv.pin}\n"
+            f"maximum_servo_angle: {sv.angle_range_deg:g}\n"
+            f"minimum_pulse_width: {sv.min_pulse_width_s:.6f}\n"
+            f"maximum_pulse_width: {sv.max_pulse_width_s:.6f}\n"
+            f"initial_angle: {sv.neutral_angle_deg:.1f}\n"
+        )
+
     # -- [bed_mesh] (optional) ---------------------------------------------
     if config.bed_mesh is not None:
         lines.append(_gen_bed_mesh_section(config.bed_mesh))

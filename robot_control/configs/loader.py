@@ -364,6 +364,45 @@ class PumpsConfig:
 
 
 @dataclass(frozen=True)
+class ServoConfig:
+    """Servo motor hardware parameters.
+
+    Parameters
+    ----------
+    name : str
+        Klipper servo identifier (used in ``SET_SERVO SERVO=<name>``).
+    pin : str
+        MCU output pin (PWM-capable), e.g. ``"PB6"``.
+    angle_range_deg : float
+        Total mechanical travel in degrees (e.g. 270 for a 270-degree servo).
+    min_pulse_width_s : float
+        Pulse width at 0 degrees, in seconds (e.g. 0.0005 = 500 us).
+    max_pulse_width_s : float
+        Pulse width at max angle, in seconds (e.g. 0.0025 = 2500 us).
+    neutral_pulse_width_s : float
+        Pulse width for the neutral / centre position, in seconds
+        (e.g. 0.0015 = 1500 us).
+    """
+
+    name: str
+    pin: str
+    angle_range_deg: float
+    min_pulse_width_s: float
+    max_pulse_width_s: float
+    neutral_pulse_width_s: float
+
+    @property
+    def neutral_angle_deg(self) -> float:
+        """Angle corresponding to the neutral pulse width."""
+        pulse_range = self.max_pulse_width_s - self.min_pulse_width_s
+        frac = (
+            (self.neutral_pulse_width_s - self.min_pulse_width_s)
+            / pulse_range
+        )
+        return frac * self.angle_range_deg
+
+
+@dataclass(frozen=True)
 class MachineConfig:
     """Complete machine configuration loaded from ``machine.yaml``.
 
@@ -383,7 +422,8 @@ class MachineConfig:
     file_execution: FileExecutionConfig
     pumps: PumpsConfig | None = None
     bed_mesh: BedMeshConfig | None = None
-    servos_enabled: bool = False
+    servo: ServoConfig | None = None
+    endstop_phase_enabled: bool = False
 
     # -- Convenience helpers ------------------------------------------------
 
@@ -673,6 +713,45 @@ def _parse_bed_mesh(data: dict[str, Any]) -> BedMeshConfig | None:
         mesh_pps=(int(mesh_pps_raw[0]), int(mesh_pps_raw[1])),
         algorithm=algorithm,
         calibrated_points=calibrated,
+    )
+
+
+def _parse_servo(data: dict[str, Any]) -> ServoConfig | None:
+    """Parse the optional ``servos`` section.
+
+    Returns ``None`` when servos are disabled or absent.
+    """
+    if not data or not data.get("enabled", False):
+        return None
+
+    name = str(data.get("name", "tool_servo"))
+    pin = data.get("pin")
+    if not pin:
+        raise ConfigError("servos.pin is required when servos are enabled")
+
+    angle_range = float(data.get("angle_range_deg", 180.0))
+    if angle_range <= 0 or angle_range > 360:
+        raise ConfigError(
+            f"servos.angle_range_deg must be in (0, 360], got {angle_range}"
+        )
+
+    min_pw = float(data.get("min_pulse_width_s", 0.0005))
+    max_pw = float(data.get("max_pulse_width_s", 0.0025))
+    neutral_pw = float(data.get("neutral_pulse_width_s", 0.0015))
+
+    if not (min_pw < neutral_pw < max_pw):
+        raise ConfigError(
+            f"Servo pulse widths must satisfy min < neutral < max: "
+            f"{min_pw} < {neutral_pw} < {max_pw}"
+        )
+
+    return ServoConfig(
+        name=name,
+        pin=str(pin),
+        angle_range_deg=angle_range,
+        min_pulse_width_s=min_pw,
+        max_pulse_width_s=max_pw,
+        neutral_pulse_width_s=neutral_pw,
     )
 
 
@@ -993,6 +1072,15 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
         # -- bed mesh (optional) --------------------------------------------
         bed_mesh = _parse_bed_mesh(data.get("bed_mesh", {}))
 
+        # -- servo (optional) -----------------------------------------------
+        servo = _parse_servo(data.get("servos", {}))
+
+        # -- endstop phase (optional) ---------------------------------------
+        ep_data = data.get("endstop_phase", {})
+        endstop_phase_enabled = bool(
+            ep_data.get("enabled", False) if ep_data else False
+        )
+
         config = MachineConfig(
             connection=connection,
             work_area=work_area,
@@ -1006,7 +1094,8 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
             file_execution=file_execution,
             pumps=pumps,
             bed_mesh=bed_mesh,
-            servos_enabled=data.get("servos", {}).get("enabled", False),
+            servo=servo,
+            endstop_phase_enabled=endstop_phase_enabled,
         )
 
         _validate_config(config)

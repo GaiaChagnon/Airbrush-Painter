@@ -457,6 +457,91 @@ class KlipperClient:
         except KlipperError as exc:
             raise GCodeError(f"G-code execution failed: {exc}") from exc
 
+    def send_gcode_with_output(
+        self,
+        script: str,
+        *,
+        timeout: float | None = None,
+        collect_s: float = 2.0,
+    ) -> str:
+        """Execute G-code and return any console output.
+
+        Subscribes to ``gcode/subscribe_output``, sends *script*, and
+        collects ``notify_gcode_response`` notifications that arrive
+        during and shortly after command execution.
+
+        Parameters
+        ----------
+        script : str
+            G-code or Klipper command (e.g. ``ENDSTOP_PHASE_CALIBRATE``).
+        timeout : float | None
+            Per-request timeout for the script itself.
+        collect_s : float
+            Seconds to keep reading notifications after the command
+            response arrives (default 2 s).
+
+        Returns
+        -------
+        str
+            Concatenated console output lines.
+        """
+        collected: list[str] = []
+        orig_callback = self._sub_callback
+
+        def _on_notify(params: Any) -> None:
+            if isinstance(params, list):
+                collected.extend(str(p) for p in params)
+            if orig_callback is not None:
+                orig_callback(params)
+
+        self._sub_callback = _on_notify
+        try:
+            self._send_request(
+                "gcode/subscribe_output", {}, timeout=5.0,
+            )
+            self._send_request(
+                "gcode/script", {"script": script}, timeout=timeout,
+            )
+            # Drain late notifications after the command ACK
+            deadline = time.monotonic() + collect_s
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._sock.settimeout(  # type: ignore[union-attr]
+                    min(0.5, remaining),
+                )
+                try:
+                    chunk = self._sock.recv(4096)  # type: ignore[union-attr]
+                    if not chunk:
+                        break
+                    self._recv_buffer += chunk
+                    while ETX in self._recv_buffer:
+                        idx = self._recv_buffer.index(ETX)
+                        raw = self._recv_buffer[:idx]
+                        self._recv_buffer = self._recv_buffer[idx + 1:]
+                        try:
+                            msg = json.loads(raw.decode("utf-8"))
+                            if (
+                                "method" in msg
+                                and self._sub_callback is not None
+                            ):
+                                self._sub_callback(
+                                    msg.get("params", {}),
+                                )
+                        except json.JSONDecodeError:
+                            pass
+                except socket.timeout:
+                    pass
+        except KlipperError as exc:
+            raise GCodeError(
+                f"G-code execution failed: {exc}"
+            ) from exc
+        finally:
+            self._sub_callback = orig_callback
+
+        return "\n".join(collected)
+
     def emergency_stop(self) -> None:
         """Immediate halt via dedicated API endpoint (not queued).
 

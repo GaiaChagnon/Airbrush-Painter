@@ -98,7 +98,7 @@ motion:
   square_corner_velocity_mm_s: 16.0
   homing_speed_mm_s: 32.0
   z_homing_speed_mm_s: 10.0
-  z_second_homing_speed_mm_s: 2.5     # Slower re-home for precision (mm/s)
+  z_second_homing_speed_mm_s: 0.5     # Slower re-home for precision (mm/s)
   z_homing_retract_mm: 3.0            # Back off this far before re-homing
   junction_deviation_mm: 0.05
   idle_timeout_s: 30
@@ -168,5 +168,13 @@ bed_mesh:
   - - 0.13
     - 0.13
     - 0.13
+endstop_phase:
+  enabled: true
 servos:
-  enabled: false
+  enabled: true
+  name: tool_servo
+  pin: PB6
+  angle_range_deg: 270.0       # 0-270 degree travel
+  min_pulse_width_s: 0.0005    # 500 us at 0 deg
+  max_pulse_width_s: 0.0025    # 2500 us at 270 deg
+  neutral_pulse_width_s: 0.0015  # 1500 us (135 deg neutral)

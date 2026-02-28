@@ -13,6 +13,8 @@ a results dict.
 from __future__ import annotations
 
 import logging
+import math
+import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -296,59 +298,338 @@ def calibrate_speed(
 # ---------------------------------------------------------------------------
 
 
+def _axis_stats(
+    values: list[float],
+) -> dict[str, float]:
+    """Compute mean, std-dev, min, max, range for a list of positions."""
+    n = len(values)
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / n
+    std = math.sqrt(variance)
+    lo, hi = min(values), max(values)
+    return {
+        "mean": mean,
+        "std": std,
+        "min": lo,
+        "max": hi,
+        "range": hi - lo,
+    }
+
+
 def verify_endstops(
     client: KlipperClient,
     config: MachineConfig,
+    cycles: int = 10,
 ) -> dict[str, Any]:
-    """Home, jog away, re-home, verify positions match.
+    """Multi-cycle endstop repeatability test on X, Y, and Z.
 
-    Uses ``G28 X Y`` which works under cartesian kinematics.  Under the
-    current config, X homes to 0 (endstop at min) and Y homes to
-    ``work_area.y`` (endstop at max, ``homing_positive_dir: True``).
+    Each cycle:
+      1. Home all axes (``G28``).
+      2. Record the reported position.
+      3. Jog to ~75 % of each axis's travel range so the belt, pulleys,
+         and motor settle into a different physical orientation before
+         the next home.
 
-    Endstop keys in the Klipper object model are ``stepper_x`` and
-    ``stepper_y`` (not ``manual_stepper`` names).
+    After *cycles* repetitions, compute per-axis statistics (mean,
+    standard deviation, min, max, range) to quantify mechanical slop.
+
+    Parameters
+    ----------
+    cycles : int
+        Number of home-jog-home cycles.  10-20 is recommended for a
+        meaningful mechanical characterisation.
 
     Returns
     -------
     dict
-        ``passed``, ``home1``, ``home2``, ``delta``.
+        Per-axis statistics, raw positions, and pass/fail status.
+        Tolerance: 0.1 mm range for XY, 0.05 mm range for Z.
     """
-    logger.info("Starting endstop verification")
-    print(f"\n{'='*50}")
-    print("  ENDSTOP VERIFICATION")
-    print(f"{'='*50}\n")
+    xy_tol = 0.1   # mm -- max acceptable range
+    z_tol = 0.05   # mm
 
-    print("Home #1...")
-    client.send_gcode("G28 X Y\nM400", timeout=30.0)
-    pos1 = client.get_position()
-    print(f"  Position after home #1: X={pos1.x:.3f} Y={pos1.y:.3f}")
-
-    # Jog away
+    # Jog targets: 75 % of travel so the mechanics are well exercised
+    jog_x = config.work_area.x * 0.75
+    jog_y = config.work_area.y * 0.75
+    jog_z = config.z_states.travel_mm
     tc = config.get_tool("pen")
-    f_val = tc.travel_feed_mm_s * 60.0
-    client.send_gcode(f"G0 X50 Y50 F{f_val:.0f}\nM400")
+    f_xy = tc.travel_feed_mm_s * 60.0
+    f_z = tc.plunge_feed_mm_s * 60.0
 
-    print("Home #2...")
-    client.send_gcode("G28 X Y\nM400", timeout=30.0)
-    pos2 = client.get_position()
-    print(f"  Position after home #2: X={pos2.x:.3f} Y={pos2.y:.3f}")
+    microstep_mm = (
+        config.steppers.xy_rotation_distance
+        / (config.steppers.full_steps_per_rotation
+           * config.steppers.klipper_microsteps)
+    )
 
-    dx = abs(pos2.x - pos1.x)
-    dy = abs(pos2.y - pos1.y)
-    passed = dx < 0.1 and dy < 0.1
+    logger.info(
+        "Starting %d-cycle endstop verification (microstep=%.4f mm)",
+        cycles, microstep_mm,
+    )
+    print(f"\n{'='*60}")
+    print(f"  ENDSTOP REPEATABILITY TEST  ({cycles} cycles, X+Y+Z)")
+    print(f"{'='*60}")
+    print(f"  Jog between homes: X={jog_x:.0f}  Y={jog_y:.0f}  Z={jog_z:.0f}")
+    print(f"  Microstep size:    {microstep_mm:.4f} mm")
+    print(f"  Tolerance:         XY range < {xy_tol} mm, Z range < {z_tol} mm")
+    print()
+
+    xs: list[float] = []
+    ys: list[float] = []
+    zs: list[float] = []
+
+    for i in range(cycles):
+        # Home all axes
+        client.send_gcode("G28\nM400", timeout=60.0)
+        pos = client.get_position()
+        xs.append(pos.x)
+        ys.append(pos.y)
+        zs.append(pos.z)
+        print(
+            f"  Cycle {i+1:2d}/{cycles}:  "
+            f"X={pos.x:.4f}  Y={pos.y:.4f}  Z={pos.z:.4f}"
+        )
+
+        # Jog away (skip on last cycle -- no need to travel after final read)
+        if i < cycles - 1:
+            client.send_gcode(
+                f"G0 Z{jog_z:.1f} F{f_z:.0f}\nM400\n"
+                f"G0 X{jog_x:.1f} Y{jog_y:.1f} F{f_xy:.0f}\nM400"
+            )
+
+    sx = _axis_stats(xs)
+    sy = _axis_stats(ys)
+    sz = _axis_stats(zs)
+    xy_ok = sx["range"] < xy_tol and sy["range"] < xy_tol
+    z_ok = sz["range"] < z_tol
+    passed = xy_ok and z_ok
+
+    print(f"\n  {'Axis':<5} {'Mean':>9} {'StdDev':>9} "
+          f"{'Min':>9} {'Max':>9} {'Range':>9}  Result")
+    print(f"  {'-'*63}")
+    for label, stats, tol in [("X", sx, xy_tol),
+                               ("Y", sy, xy_tol),
+                               ("Z", sz, z_tol)]:
+        ok = stats["range"] < tol
+        tag = "PASS" if ok else "FAIL"
+        print(
+            f"  {label:<5} {stats['mean']:9.4f} {stats['std']:9.4f} "
+            f"{stats['min']:9.4f} {stats['max']:9.4f} "
+            f"{stats['range']:9.4f}  {tag}"
+        )
+
+    overall = "PASS" if passed else "FAIL"
+    print(f"\n  Overall: {overall}")
 
     summary: dict[str, Any] = {
         "passed": passed,
-        "home1_x": pos1.x,
-        "home1_y": pos1.y,
-        "home2_x": pos2.x,
-        "home2_y": pos2.y,
-        "delta_x": dx,
-        "delta_y": dy,
+        "cycles": cycles,
+        "microstep_mm": microstep_mm,
+        "x": sx,
+        "y": sy,
+        "z": sz,
+        "raw_x": xs,
+        "raw_y": ys,
+        "raw_z": zs,
     }
-    status = "PASS" if passed else "FAIL"
-    print(f"\n  Result: {status}  (delta X={dx:.3f}, Y={dy:.3f})")
+    print(format_calibration_summary(summary))
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Endstop phase calibration (Klipper [endstop_phase] module)
+# ---------------------------------------------------------------------------
+
+
+def calibrate_endstop_phase(
+    client: KlipperClient,
+    config: MachineConfig,
+) -> dict[str, Any]:
+    """Run Klipper's ``ENDSTOP_PHASE_CALIBRATE`` to measure switch slop.
+
+    Klipper's ``[endstop_phase]`` module tracks which microstep the
+    motor is on when the endstop triggers.  Over multiple homes it
+    reports the mathematical variance of the trigger point.
+
+    With 32 mm rotation distance, 400 full steps, and 8 microsteps,
+    each microstep is exactly 0.01 mm.  If the switch triggers on
+    microstep 15 on one home and microstep 30 on the next, Klipper
+    reports 0.15 mm of physical slop.
+
+    Prerequisites
+    -------------
+    - ``[endstop_phase stepper_x]``, ``[endstop_phase stepper_y]``,
+      and ``[endstop_phase stepper_z]`` must be present in
+      ``printer.cfg`` (generated when ``endstop_phase.enabled: true``
+      in ``machine.yaml``).
+
+    Returns
+    -------
+    dict
+        Raw Klipper response text and pass/fail status.
+    """
+    if not config.endstop_phase_enabled:
+        raise RuntimeError(
+            "endstop_phase.enabled is false in machine.yaml.  "
+            "Set it to true and regenerate printer.cfg first."
+        )
+
+    logger.info("Starting endstop phase calibration")
+    print(f"\n{'='*60}")
+    print("  ENDSTOP PHASE CALIBRATION")
+    print(f"{'='*60}")
+    print("  This uses Klipper's [endstop_phase] module to measure")
+    print("  the exact microstep variance of each endstop switch.")
+    print()
+
+    # Home a few times so Klipper accumulates trigger-phase data
+    n_homes = 10
+    print(f"  Homing {n_homes} times to gather phase data...")
+    for i in range(n_homes):
+        client.send_gcode("G28\nM400", timeout=60.0)
+        print(f"    Home {i+1}/{n_homes} done")
+        if i < n_homes - 1:
+            tc = config.get_tool("pen")
+            f_xy = tc.travel_feed_mm_s * 60.0
+            jog_x = config.work_area.x * 0.5
+            jog_y = config.work_area.y * 0.5
+            jog_z = config.z_states.travel_mm
+            f_z = tc.plunge_feed_mm_s * 60.0
+            client.send_gcode(
+                f"G0 Z{jog_z:.1f} F{f_z:.0f}\nM400\n"
+                f"G0 X{jog_x:.1f} Y{jog_y:.1f} F{f_xy:.0f}\nM400"
+            )
+
+    print("\n  Running ENDSTOP_PHASE_CALIBRATE...")
+    output = client.send_gcode_with_output(
+        "ENDSTOP_PHASE_CALIBRATE", timeout=30.0, collect_s=3.0,
+    )
+
+    if output.strip():
+        print(f"\n  Klipper output:\n{output}")
+    else:
+        print("\n  (No console output captured -- check Klipper log for"
+              " endstop_phase results)")
+
+    summary: dict[str, Any] = {
+        "homes": n_homes,
+        "klipper_output": output,
+    }
+    print(format_calibration_summary(summary))
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Servo test / calibration
+# ---------------------------------------------------------------------------
+
+
+def test_servo(
+    client: KlipperClient,
+    config: MachineConfig,
+) -> dict[str, Any]:
+    """Exercise the servo through its full range (~30 seconds).
+
+    Runs five phases to test the servo at different speeds and positions:
+
+    1. **Slow sweep** -- 0 to max angle in 10 equal steps (8 s).
+    2. **Slow sweep back** -- max angle to 0 in 10 steps (8 s).
+    3. **Key positions** -- 0, 45, 90, 135, 180, 225, 270 (5 s).
+    4. **Fast jumps** -- rapid alternation between 0 and max (3 s).
+    5. **Return to neutral** -- settle at centre position (1 s).
+
+    Uses Klipper's ``SET_SERVO SERVO=<name> ANGLE=<deg>`` command.
+
+    Returns
+    -------
+    dict
+        Positions visited and timing.
+
+    Raises
+    ------
+    RuntimeError
+        If no servo is configured in ``machine.yaml``.
+    """
+    sv = config.servo
+    if sv is None:
+        raise RuntimeError(
+            "No servo configured in machine.yaml.  "
+            "Enable 'servos' and set pin/pulse parameters."
+        )
+
+    max_angle = sv.angle_range_deg
+    neutral = sv.neutral_angle_deg
+    name = sv.name
+
+    def set_angle(angle: float) -> None:
+        client.send_gcode(
+            f"SET_SERVO SERVO={name} ANGLE={angle:.1f}", timeout=5.0,
+        )
+
+    logger.info("Starting servo test (%s, %.0f deg range)", name, max_angle)
+    print(f"\n{'='*60}")
+    print(f"  SERVO TEST  ({name}, 0-{max_angle:.0f} deg)")
+    print(f"{'='*60}")
+    print(f"  Pin:     {sv.pin}")
+    print(f"  Pulse:   {sv.min_pulse_width_s*1e6:.0f} - "
+          f"{sv.max_pulse_width_s*1e6:.0f} us")
+    print(f"  Neutral: {neutral:.1f} deg "
+          f"({sv.neutral_pulse_width_s*1e6:.0f} us)")
+    print()
+
+    positions_visited: list[float] = []
+    t_start = time.monotonic()
+
+    # Phase 1: slow sweep 0 -> max (10 steps, 0.8s each = 8s)
+    print("  Phase 1: Slow sweep 0 -> max...")
+    steps = 10
+    for i in range(steps + 1):
+        angle = max_angle * i / steps
+        set_angle(angle)
+        positions_visited.append(angle)
+        time.sleep(0.8)
+
+    # Phase 2: slow sweep max -> 0 (10 steps, 0.8s each = 8s)
+    print("  Phase 2: Slow sweep max -> 0...")
+    for i in range(steps + 1):
+        angle = max_angle * (1.0 - i / steps)
+        set_angle(angle)
+        positions_visited.append(angle)
+        time.sleep(0.8)
+
+    # Phase 3: key positions (7 positions, 0.7s each ~ 5s)
+    print("  Phase 3: Key positions (0/45/90/135/180/225/270)...")
+    key_angles = [a for a in [0, 45, 90, 135, 180, 225, 270]
+                  if a <= max_angle]
+    for angle in key_angles:
+        set_angle(angle)
+        positions_visited.append(angle)
+        time.sleep(0.7)
+
+    # Phase 4: fast jumps between extremes (10 jumps, 0.3s each = 3s)
+    print("  Phase 4: Fast jumps (0 <-> max)...")
+    for i in range(10):
+        angle = 0.0 if i % 2 == 0 else max_angle
+        set_angle(angle)
+        positions_visited.append(angle)
+        time.sleep(0.3)
+
+    # Phase 5: return to neutral
+    print("  Phase 5: Return to neutral...")
+    set_angle(neutral)
+    positions_visited.append(neutral)
+    time.sleep(1.0)
+
+    elapsed = time.monotonic() - t_start
+    print(f"\n  Servo test complete.  {len(positions_visited)} moves "
+          f"in {elapsed:.1f} s")
+
+    summary: dict[str, Any] = {
+        "servo_name": name,
+        "angle_range_deg": max_angle,
+        "positions_visited": len(positions_visited),
+        "elapsed_s": round(elapsed, 1),
+    }
     print(format_calibration_summary(summary))
     return summary
 

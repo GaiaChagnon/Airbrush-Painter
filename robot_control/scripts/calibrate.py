@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Calibration entry point.
-
-Runs one or more calibration routines interactively.
+"""Calibration entry point -- all routines are opt-in.
 
 Usage::
 
-    python -m robot_control.scripts.calibrate              # Full calibration
-    python -m robot_control.scripts.calibrate --steps-x    # X axis only
-    python -m robot_control.scripts.calibrate --steps-y    # Y axis only
-    python -m robot_control.scripts.calibrate --z-heights  # Z seesaw
-    python -m robot_control.scripts.calibrate --tool-offset # Tool offset
-    python -m robot_control.scripts.calibrate --speed      # Speed calibration
-    python -m robot_control.scripts.calibrate --endstops   # Verify endstops
-    python -m robot_control.scripts.calibrate --bed-mesh  # Surface leveling (paper bounds)
-    python -m robot_control.scripts.calibrate --bed-mesh --full-canvas  # Full canvas bounds
+    python robot_control/scripts/calibrate.py --steps-x       # X axis only
+    python robot_control/scripts/calibrate.py --steps-y       # Y axis only
+    python robot_control/scripts/calibrate.py --z-heights     # Z seesaw
+    python robot_control/scripts/calibrate.py --tool-offset   # Tool offset
+    python robot_control/scripts/calibrate.py --speed         # Speed calibration
+    python robot_control/scripts/calibrate.py --endstops      # Multi-cycle endstop test
+    python robot_control/scripts/calibrate.py --endstops --cycles 20
+    python robot_control/scripts/calibrate.py --endstop-phase # Klipper endstop phase cal
+    python robot_control/scripts/calibrate.py --servo         # Servo exercise (~30 s)
+    python robot_control/scripts/calibrate.py --bed-mesh      # Surface leveling
+    python robot_control/scripts/calibrate.py --bed-mesh --full-canvas
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Robot calibration",
+        description="Robot calibration (all routines are opt-in)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--socket", "-s", type=str, help="Socket path")
@@ -55,7 +55,15 @@ def main() -> None:
     parser.add_argument("--speed", action="store_true",
                         help="Calibrate drawing speed")
     parser.add_argument("--endstops", action="store_true",
-                        help="Verify endstop repeatability")
+                        help="Multi-cycle endstop repeatability test")
+    parser.add_argument("--cycles", type=int, default=10,
+                        help="Number of home cycles for --endstops "
+                        "(default: 10, recommended: 10-20)")
+    parser.add_argument("--endstop-phase", action="store_true",
+                        help="Run Klipper ENDSTOP_PHASE_CALIBRATE "
+                        "(requires endstop_phase.enabled in config)")
+    parser.add_argument("--servo", action="store_true",
+                        help="Exercise servo through full range (~30 s)")
     parser.add_argument("--bed-mesh", action="store_true",
                         help="Calibrate bed mesh (surface leveling)")
     parser.add_argument("--full-canvas", action="store_true",
@@ -63,21 +71,26 @@ def main() -> None:
                         "paper bounds (only with --bed-mesh)")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    socket_path = args.socket or config.connection.socket_path
-
-    # If no specific routine selected, run all
-    run_all = not any([
+    selected = any([
         args.steps_x, args.steps_y, args.z_heights,
         args.tool_offset, args.speed, args.endstops,
-        args.bed_mesh,
+        args.endstop_phase, args.servo, args.bed_mesh,
     ])
+    if not selected:
+        parser.print_help()
+        print("\nError: select at least one routine (e.g. --endstops).")
+        sys.exit(1)
+
+    config = load_config(args.config)
+    socket_path = args.socket or config.connection.socket_path
 
     # Regenerate printer.cfg from machine.yaml so Klipper limits stay in
     # sync with the config the Python code reads.
     printer_cfg_path = Path.home() / "printer.cfg"
     new_cfg_text = generate_printer_cfg(config)
-    old_cfg_text = printer_cfg_path.read_text() if printer_cfg_path.exists() else ""
+    old_cfg_text = (
+        printer_cfg_path.read_text() if printer_cfg_path.exists() else ""
+    )
     cfg_changed = new_cfg_text != old_cfg_text
     if cfg_changed:
         if printer_cfg_path.exists():
@@ -85,7 +98,7 @@ def main() -> None:
             printer_cfg_path.rename(backup)
             print(f"Backed up old printer.cfg -> {backup.name}")
         printer_cfg_path.write_text(new_cfg_text)
-        print(f"Regenerated printer.cfg from machine.yaml (limits synced)")
+        print("Regenerated printer.cfg from machine.yaml (limits synced)")
 
     client = KlipperClient(
         socket_path=socket_path,
@@ -107,29 +120,36 @@ def main() -> None:
             client.reconnect()
             print("Klipper restarted successfully.")
 
-        # Home before any calibration
-        print("\nHoming X Y before calibration...")
-        client.send_gcode("G28 X Y\nM400", timeout=30.0)
+        # Home all axes before any calibration (Klipper rejects moves
+        # unless every axis in the kinematic chain has been homed).
+        print("\nHoming all axes before calibration...")
+        client.send_gcode("G28\nM400", timeout=60.0)
 
-        if args.steps_x or run_all:
+        if args.steps_x:
             routines.calibrate_steps_per_mm(client, config, axis="X")
 
-        if args.steps_y or run_all:
+        if args.steps_y:
             routines.calibrate_steps_per_mm(client, config, axis="Y")
 
-        if args.z_heights or run_all:
+        if args.z_heights:
             routines.calibrate_z_heights(client, config)
 
-        if args.tool_offset or run_all:
+        if args.tool_offset:
             routines.calibrate_tool_offset(client, config)
 
-        if args.speed or run_all:
+        if args.speed:
             routines.calibrate_speed(client, config)
 
-        if args.endstops or run_all:
-            routines.verify_endstops(client, config)
+        if args.endstops:
+            routines.verify_endstops(client, config, cycles=args.cycles)
 
-        if args.bed_mesh or run_all:
+        if args.endstop_phase:
+            routines.calibrate_endstop_phase(client, config)
+
+        if args.servo:
+            routines.test_servo(client, config)
+
+        if args.bed_mesh:
             config_path = Path(args.config) if args.config else None
             routines.calibrate_bed_mesh(
                 client, config,
