@@ -126,6 +126,13 @@ def main() -> None:
             "SET_IDLE_TIMEOUT TIMEOUT=3600", timeout=5.0,
         )
 
+        # Clear any previously loaded bed mesh so its compensation
+        # doesn't corrupt Z probing during calibration.
+        try:
+            client.send_gcode("BED_MESH_CLEAR", timeout=5.0)
+        except Exception:
+            pass  # OK if no mesh was loaded
+
         # Home all axes before any calibration (Klipper rejects moves
         # unless every axis in the kinematic chain has been homed).
         print("\nHoming all axes before calibration...")

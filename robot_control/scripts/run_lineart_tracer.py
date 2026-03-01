@@ -211,6 +211,98 @@ def _raw_gcode(sock: socket.socket, script: str, timeout: float = 30.0) -> bool:
     return True
 
 
+def _query_mesh_status(sock: socket.socket) -> dict:
+    """Query Klipper's bed_mesh status object.
+
+    Returns the 'result' dict from Klipper's objects/query endpoint,
+    or an empty dict on failure.  The status includes 'profile_name',
+    'mesh_min', 'mesh_max', and 'probed_matrix' when a mesh is active.
+    """
+    resp = _raw_send(
+        sock, "objects/query",
+        {"objects": {"bed_mesh": None}},
+        timeout=5.0,
+    )
+    status = resp.get("result", {}).get("status", {}).get("bed_mesh", {})
+    return status
+
+
+def _verify_mesh_loaded(
+    sock: socket.socket,
+    corners: list[tuple[float, float]],
+    z_contact: float,
+) -> bool:
+    """Check that a bed mesh is active and print its compensation at corners.
+
+    Parameters
+    ----------
+    sock : socket.socket
+        Connected Klipper UDS socket.
+    corners : list[tuple[float, float]]
+        Corner positions to report mesh offsets for (BL, BR, TR, TL).
+    z_contact : float
+        Nominal contact Z (mm).
+
+    Returns
+    -------
+    bool
+        True if mesh is active, False otherwise.
+    """
+    status = _query_mesh_status(sock)
+    profile = status.get("profile_name", "")
+
+    if not profile:
+        print("    BED MESH: ** NOT ACTIVE **")
+        print("    No mesh compensation will be applied.")
+        return False
+
+    mesh_min = status.get("mesh_min", [0.0, 0.0])
+    mesh_max = status.get("mesh_max", [0.0, 0.0])
+    probed = status.get("probed_matrix", [])
+    mesh_matrix = status.get("mesh_matrix", [])
+
+    print(f"    BED MESH: active  profile='{profile}'")
+    print(f"    Mesh range: ({mesh_min[0]:.1f}, {mesh_min[1]:.1f}) -> "
+          f"({mesh_max[0]:.1f}, {mesh_max[1]:.1f})")
+
+    if probed:
+        flat = [v for row in probed for v in row]
+        print(f"    Probed range: [{min(flat):.4f}, {max(flat):.4f}] mm  "
+              f"({len(probed)}x{len(probed[0])} grid)")
+
+    if mesh_matrix:
+        flat_m = [v for row in mesh_matrix for v in row]
+        print(f"    Interpolated range: [{min(flat_m):.4f}, {max(flat_m):.4f}] mm  "
+              f"({len(mesh_matrix)}x{len(mesh_matrix[0])} grid)")
+
+    labels = ["BL", "BR", "TR", "TL"]
+    if mesh_matrix and len(mesh_matrix) > 0:
+        ny = len(mesh_matrix)
+        nx = len(mesh_matrix[0])
+        x_min, y_min = mesh_min
+        x_max, y_max = mesh_max
+        x_dist = (x_max - x_min) / max(nx - 1, 1)
+        y_dist = (y_max - y_min) / max(ny - 1, 1)
+
+        print(f"    Corner mesh offsets (Z_adjusted = {z_contact:.3f} + offset):")
+        for label, (cx, cy) in zip(labels, corners):
+            # Bilinear interpolation matching Klipper's _get_linear_index
+            xi_raw = (cx - x_min) / x_dist if x_dist > 0 else 0.0
+            yi_raw = (cy - y_min) / y_dist if y_dist > 0 else 0.0
+            xi = max(0, min(int(xi_raw), nx - 2))
+            yi = max(0, min(int(yi_raw), ny - 2))
+            tx = max(0.0, min(xi_raw - xi, 1.0))
+            ty = max(0.0, min(yi_raw - yi, 1.0))
+            z0 = mesh_matrix[yi][xi] * (1 - tx) + mesh_matrix[yi][xi + 1] * tx
+            z1 = mesh_matrix[yi + 1][xi] * (1 - tx) + mesh_matrix[yi + 1][xi + 1] * tx
+            offset = z0 * (1 - ty) + z1 * ty
+            inside = "inside" if (x_min <= cx <= x_max and y_min <= cy <= y_max) else "OUTSIDE"
+            print(f"      {label} ({cx:.0f}, {cy:.0f}): offset={offset:+.4f} mm  "
+                  f"-> Z={z_contact + offset:.3f}  [{inside} mesh]")
+
+    return True
+
+
 def _wait_for_ready(timeout: float = 30.0) -> socket.socket:
     """Connect to Klipper UDS and wait until state is 'ready'."""
     deadline = time.monotonic() + timeout
@@ -435,13 +527,13 @@ class PaperTransform:
 def pen_up(sock: socket.socket, z_travel: float, z_feedrate: float) -> None:
     """Retract pen to travel height."""
     z = max(Z_MIN_SAFE, min(z_travel, Z_MAX_SAFE))
-    _raw_gcode(sock, f"G1 Z{z:.2f} F{z_feedrate:.0f}")
+    _raw_gcode(sock, f"G1 Z{z:.3f} F{z_feedrate:.0f}")
 
 
 def pen_down(sock: socket.socket, z_contact: float, z_feedrate: float) -> None:
     """Lower pen to contact height."""
     z = max(Z_MIN_SAFE, min(z_contact, Z_MAX_SAFE))
-    _raw_gcode(sock, f"G1 Z{z:.2f} F{z_feedrate:.0f}")
+    _raw_gcode(sock, f"G1 Z{z:.3f} F{z_feedrate:.0f}")
 
 
 def travel_to(
@@ -2024,7 +2116,7 @@ def execute_on_robot(
     travel_to(sock, first_cx, first_cy, travel_fr)
     _raw_gcode(sock, "M400")
 
-    print(f"  Lowering Z to contact ({z_contact:.1f} mm)...")
+    print(f"  Lowering Z to contact ({z_contact:.3f} mm)...")
     pen_down(sock, z_contact, z_down_fr)
     _raw_gcode(sock, "M400")
 
@@ -2125,9 +2217,9 @@ def execute_on_robot(
         x0 = max(0.0, min(mpts[0][0], WORKSPACE_X_MM))
         y0 = max(0.0, min(mpts[0][1], WORKSPACE_Y_MM))
         transition = (
-            f"G1 Z{z_travel_c:.2f} F{z_up_fr:.0f}\n"
+            f"G1 Z{z_travel_c:.3f} F{z_up_fr:.0f}\n"
             f"G1 X{x0:.2f} Y{y0:.2f} F{travel_fr:.0f}\n"
-            f"G1 Z{z_contact_c:.2f} F{z_down_fr:.0f}"
+            f"G1 Z{z_contact_c:.3f} F{z_down_fr:.0f}"
         )
         _raw_gcode(sock, transition)
 
@@ -2793,28 +2885,31 @@ def main() -> None:
         print("  [OK] Klipper is ready")
         print()
 
-        print("  Homing X, Y...")
-        if not _raw_gcode(sock, "G28 X Y", timeout=60.0):
-            print("  ERROR: XY homing failed!")
-            sock.close()
-            sys.exit(1)
-        print("    Homed OK  X=0  Y=0")
+        # Extend idle timeout so motors stay energised during
+        # interactive phases (pen check, corner alignment, etc.)
+        _raw_gcode(sock, "SET_IDLE_TIMEOUT TIMEOUT=3600", timeout=5.0)
 
-        print("  Homing Z...")
-        if not _raw_gcode(sock, "G28 Z", timeout=60.0):
-            print("  ERROR: Z homing failed!")
+        print("  Homing all axes...")
+        if not _raw_gcode(sock, "G28", timeout=60.0):
+            print("  ERROR: Homing failed!")
             sock.close()
             sys.exit(1)
-        print(f"    Homed OK  Z={WORKSPACE_Z_MM:.0f}")
+        print(f"    Homed OK  X=0  Y=0  Z={WORKSPACE_Z_MM:.0f}")
 
         z_travel_val = max(Z_MIN_SAFE, min(z_travel, Z_MAX_SAFE))
         pen_up(sock, z_travel_val, args.z_retract_speed * 60.0)
         _raw_gcode(sock, "M400")
         print(f"    Z retracted to {z_travel_val:.1f} mm")
 
-        # Load bed mesh profile for dynamic Z compensation (no-op if absent)
+        # Ensure absolute positioning mode
+        _raw_gcode(sock, "G90")
+
+        # Load bed mesh profile for dynamic Z compensation
         if _raw_gcode(sock, "BED_MESH_PROFILE LOAD=default"):
-            print("    Bed mesh profile loaded")
+            margin_corners = xform.get_margin_corners()
+            _verify_mesh_loaded(sock, margin_corners, args.z_contact)
+        else:
+            print("    WARNING: No bed mesh profile -- Z will be flat")
         print()
 
     # ---- Execute ----
@@ -2849,6 +2944,8 @@ def main() -> None:
 
         if not args.dry_run:
             assert sock is not None
+            # Restore default idle timeout before disabling motors
+            _raw_gcode(sock, "SET_IDLE_TIMEOUT TIMEOUT=30", timeout=5.0)
             _raw_gcode(sock, "M18")
 
             print()
@@ -2871,6 +2968,7 @@ def main() -> None:
             try:
                 pen_up(sock, z_travel_val, args.z_retract_speed * 60.0)
                 _raw_gcode(sock, "M400")
+                _raw_gcode(sock, "SET_IDLE_TIMEOUT TIMEOUT=30", timeout=5.0)
                 payload = (
                     json.dumps({
                         "id": 9999,
@@ -2885,6 +2983,10 @@ def main() -> None:
 
     finally:
         if sock:
+            try:
+                _raw_gcode(sock, "SET_IDLE_TIMEOUT TIMEOUT=30", timeout=2.0)
+            except Exception:
+                pass
             sock.close()
 
 

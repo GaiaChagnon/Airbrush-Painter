@@ -1056,6 +1056,14 @@ def calibrate_bed_mesh(
     print("  The pen will move to each point; adjust Z until it touches.\n")
     input("  Press ENTER to begin...")
 
+    # Ensure no bed mesh compensation is active during calibration.
+    # If a previous session loaded a mesh, it would shift the G-code Z
+    # values the user sees, contaminating the new offsets.
+    try:
+        client.send_gcode("BED_MESH_CLEAR", timeout=5.0)
+    except Exception:
+        pass  # OK if no mesh was loaded
+
     print("\n  Homing all axes...")
     client.send_gcode("G28\nM400", timeout=60.0)
 

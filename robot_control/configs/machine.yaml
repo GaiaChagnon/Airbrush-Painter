@@ -21,7 +21,7 @@ canvas:
   height_mm: 300.0
 z_states:
   travel_mm: 40.0
-  pen_work_mm: 80.5
+  pen_work_mm: 80.211
   airbrush_work_mm: 0.0
 tools:
   pen:
@@ -98,8 +98,8 @@ motion:
   square_corner_velocity_mm_s: 16.0
   homing_speed_mm_s: 32.0
   z_homing_speed_mm_s: 10.0
-  z_second_homing_speed_mm_s: 0.5     # Slower re-home for precision (mm/s)
-  z_homing_retract_mm: 3.0            # Back off this far before re-homing
+  z_second_homing_speed_mm_s: 0.5
+  z_homing_retract_mm: 3.0
   junction_deviation_mm: 0.05
   idle_timeout_s: 30
 interactive:
@@ -147,8 +147,8 @@ bed_mesh:
   - 25.0
   - 25.0
   mesh_max:
-  - 322.0
-  - 235.0
+  - 347.0
+  - 260.0
   probe_count:
   - 3
   - 3
@@ -159,22 +159,22 @@ bed_mesh:
   - 2
   algorithm: lagrange
   calibrated_points:
-  - - -0.09
-    - -0.14
-    - -0.19
-  - - 0.01
-    - 0.01
-    - 0.01
-  - - 0.13
-    - 0.13
-    - 0.13
+  - - -0.117778
+    - -0.167778
+    - -0.137778
+  - - 0.012222
+    - 0.012222
+    - 0.012222
+  - - 0.162222
+    - 0.112222
+    - 0.112222
 endstop_phase:
   enabled: true
 servos:
   enabled: true
   name: tool_servo
   pin: PB6
-  angle_range_deg: 270.0       # 0-270 degree travel
-  min_pulse_width_s: 0.0005    # 500 us at 0 deg
-  max_pulse_width_s: 0.0025    # 2500 us at 270 deg
-  neutral_pulse_width_s: 0.0015  # 1500 us (135 deg neutral)
+  angle_range_deg: 270.0
+  min_pulse_width_s: 0.0005
+  max_pulse_width_s: 0.0025
+  neutral_pulse_width_s: 0.0015

@@ -419,7 +419,7 @@ def pen_up(
 ) -> None:
     """Retract pen to travel height."""
     z = max(Z_MIN_SAFE, min(z_travel, Z_MAX_SAFE))
-    _raw_gcode(sock, f"G1 Z{z:.2f} F{z_feedrate:.0f}")
+    _raw_gcode(sock, f"G1 Z{z:.3f} F{z_feedrate:.0f}")
 
 
 def pen_down(
@@ -429,7 +429,7 @@ def pen_down(
 ) -> None:
     """Lower pen to contact height."""
     z = max(Z_MIN_SAFE, min(z_contact, Z_MAX_SAFE))
-    _raw_gcode(sock, f"G1 Z{z:.2f} F{z_feedrate:.0f}")
+    _raw_gcode(sock, f"G1 Z{z:.3f} F{z_feedrate:.0f}")
 
 
 def travel_to(
@@ -942,7 +942,7 @@ def trace_image(
     travel_to(sock, first_cx, first_cy, travel_feedrate)
     _raw_gcode(sock, "M400")
 
-    print(f"  Lowering Z to contact position ({z_contact:.1f} mm)...")
+    print(f"  Lowering Z to contact position ({z_contact:.3f} mm)...")
     pen_down(sock, z_contact, z_down_feedrate)
     _raw_gcode(sock, "M400")
 
@@ -1039,9 +1039,9 @@ def trace_image(
         x0 = max(0.0, min(mpts[0][0], WORKSPACE_X_MM))
         y0 = max(0.0, min(mpts[0][1], WORKSPACE_Y_MM))
         transition_gcode = (
-            f"G1 Z{z_travel_clamped:.2f} F{z_up_feedrate:.0f}\n"
+            f"G1 Z{z_travel_clamped:.3f} F{z_up_feedrate:.0f}\n"
             f"G1 X{x0:.2f} Y{y0:.2f} F{travel_feedrate:.0f}\n"
-            f"G1 Z{z_contact_clamped:.2f} F{z_down_feedrate:.0f}"
+            f"G1 Z{z_contact_clamped:.3f} F{z_down_feedrate:.0f}"
         )
         _raw_gcode(sock, transition_gcode)
 
@@ -1285,21 +1285,15 @@ def main() -> None:
         print("  [OK] Klipper is ready")
         print()
 
-        print("  Homing X, Y...")
-        ok_xy = _raw_gcode(sock, "G28 X Y", timeout=60.0)
-        if not ok_xy:
-            print("  ERROR: XY homing failed!")
-            sock.close()
-            sys.exit(1)
-        print("    Homed OK  X=0  Y=0")
+        # Extend idle timeout for interactive phases
+        _raw_gcode(sock, "SET_IDLE_TIMEOUT TIMEOUT=3600", timeout=5.0)
 
-        print("  Homing Z...")
-        ok_z = _raw_gcode(sock, "G28 Z", timeout=60.0)
-        if not ok_z:
-            print("  ERROR: Z homing failed!")
+        print("  Homing all axes...")
+        if not _raw_gcode(sock, "G28", timeout=60.0):
+            print("  ERROR: Homing failed!")
             sock.close()
             sys.exit(1)
-        print(f"    Homed OK  Z={WORKSPACE_Z_MM:.0f}")
+        print(f"    Homed OK  X=0  Y=0  Z={WORKSPACE_Z_MM:.0f}")
 
         z_travel_val = args.z_contact - args.z_retract
         z_travel_val = max(Z_MIN_SAFE, min(z_travel_val, Z_MAX_SAFE))
@@ -1307,6 +1301,12 @@ def main() -> None:
         pen_up(sock, z_travel_val, z_up_fr)
         _raw_gcode(sock, "M400")
         print(f"    Z retracted to {z_travel_val:.1f} mm")
+
+        _raw_gcode(sock, "G90")
+        if _raw_gcode(sock, "BED_MESH_PROFILE LOAD=default"):
+            print("    Bed mesh profile loaded")
+        else:
+            print("    WARNING: No bed mesh profile -- Z will be flat")
         print()
 
     # --- Wait for YAML loading to finish -----------------------------------
@@ -1454,6 +1454,7 @@ def main() -> None:
             skip_corners=args.skip_corners,
         )
 
+        _raw_gcode(sock, "SET_IDLE_TIMEOUT TIMEOUT=30", timeout=5.0)
         _raw_gcode(sock, "M18")
 
         print()
@@ -1477,6 +1478,7 @@ def main() -> None:
         try:
             pen_up(sock, z_travel_val, z_up_fr)
             _raw_gcode(sock, "M400")
+            _raw_gcode(sock, "SET_IDLE_TIMEOUT TIMEOUT=30", timeout=5.0)
             payload = (
                 json.dumps({
                     "id": 9999,
@@ -1490,6 +1492,10 @@ def main() -> None:
             pass
 
     finally:
+        try:
+            _raw_gcode(sock, "SET_IDLE_TIMEOUT TIMEOUT=30", timeout=2.0)
+        except Exception:
+            pass
         sock.close()
 
 
