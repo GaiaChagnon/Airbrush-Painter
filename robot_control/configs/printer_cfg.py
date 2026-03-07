@@ -510,14 +510,20 @@ def generate_pump_test_cfg(
         )
 
     # -- [manual_stepper] per pump ------------------------------------------
+    # Apply enable_pin_inverted from pump stepper config: when True, Klipper
+    # needs a ``!`` prefix so that ENABLE=1 drives the pin LOW (active-low
+    # driver like TMC2209 ENN or DM542TE common-anode ENA-).
+    enable_prefix = "!" if ps.enable_pin_inverted else ""
+
     for pid in pump_ids:
         pump = motors[pid]
+        raw_enable = pump.pins.enable.lstrip("!")
         lines.append(
             f"# --- Pump: {pid} ({pump.octopus_slot}) ---\n"
             f"[manual_stepper {pid}]\n"
             f"step_pin: {pump.pins.step}\n"
             f"dir_pin: {pump.pins.dir}\n"
-            f"enable_pin: {pump.pins.enable}\n"
+            f"enable_pin: {enable_prefix}{raw_enable}\n"
             f"microsteps: {ps.klipper_microsteps}\n"
             f"full_steps_per_rotation: {ps.full_steps_per_rotation}\n"
             f"rotation_distance: {ps.rotation_distance}\n"

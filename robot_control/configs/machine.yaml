@@ -144,7 +144,7 @@ pumps:
       homing_speed_mm_s: 2.0
       home_backoff_mm: 0.5
       max_dispense_speed_mm_s: 4.0
-      max_retract_speed_mm_s: 4.0
+      max_retract_speed_mm_s: 2.0
     pump_1:
       fluid: magenta
       octopus_slot: Motor 4
@@ -159,7 +159,7 @@ pumps:
       homing_speed_mm_s: 2.0
       home_backoff_mm: 0.5
       max_dispense_speed_mm_s: 4.0
-      max_retract_speed_mm_s: 4.0
+      max_retract_speed_mm_s: 2.0
     pump_2:
       fluid: yellow
       octopus_slot: Motor 5
@@ -174,7 +174,7 @@ pumps:
       homing_speed_mm_s: 2.0
       home_backoff_mm: 0.5
       max_dispense_speed_mm_s: 4.0
-      max_retract_speed_mm_s: 4.0
+      max_retract_speed_mm_s: 2.0
     pump_3:
       fluid: purge
       octopus_slot: Motor 6
@@ -189,7 +189,7 @@ pumps:
       homing_speed_mm_s: 2.0
       home_backoff_mm: 0.5
       max_dispense_speed_mm_s: 4.0
-      max_retract_speed_mm_s: 4.0
+      max_retract_speed_mm_s: 2.0
 bed_mesh:
   mesh_min:
   - 25.0

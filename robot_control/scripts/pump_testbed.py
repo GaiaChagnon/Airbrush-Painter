@@ -210,7 +210,12 @@ def _check_homing(
 ) -> bool:
     """Check if pumps are homed; offer to home if not.
 
-    Returns True if all requested pumps are homed after this call.
+    Returns
+    -------
+    bool
+        True if safe to proceed (all homed, or user chose to skip).
+        False **only** when homing was attempted and failed -- caller
+        must abort the current operation.
     """
     not_homed = [pid for pid in pump_ids if not state.homed[pid]]
     if not not_homed and not force_prompt:
@@ -219,9 +224,12 @@ def _check_homing(
         labels = ", ".join(state.pump_label(pid) for pid in not_homed)
         print(f"\n  Not homed: {labels}")
         if _input_bool("Home them now?"):
-            return _do_homing(state, not_homed)
+            ok = _do_homing(state, not_homed)
+            if not ok:
+                print("  Homing failed. Aborting operation.")
+                return False
+            return True
         print("  Proceeding without homing -- ensure enough travel space.")
-        return False
     return True
 
 
@@ -244,7 +252,10 @@ def _dispense_sign(pump_cfg: PumpMotorConfig) -> int:
 
 
 def _do_homing(state: SessionState, pump_ids: list[str]) -> bool:
-    """Home selected pumps with backlash purge."""
+    """Home selected pumps with backlash purge.
+
+    Motors are disabled after homing (both on success and failure).
+    """
     sock = state.ensure_connected()
     backlash = state.pumps_cfg.backlash_purge_mm
     all_ok = True
@@ -261,6 +272,7 @@ def _do_homing(state: SessionState, pump_ids: list[str]) -> bool:
         else:
             print(f"  !! {pid} homing FAILED")
             all_ok = False
+        pump_disable(sock, pid)
 
     return all_ok
 
@@ -271,7 +283,7 @@ def _do_dispense(
     volume_ml: float,
     speed: float,
 ) -> None:
-    """Dispense a volume and retract."""
+    """Dispense a volume, retract, then disable the motor."""
     sock = state.ensure_connected()
     m = state.motor(pid)
     sy = state.syringe(pid)
@@ -301,14 +313,25 @@ def _do_dispense(
     pump_move(sock, pid, position=0.0, speed=retract_speed)
     print(" done")
 
+    pump_disable(sock, pid)
+
 
 def _do_dispense_no_retract(
     state: SessionState,
     pid: str,
     volume_ml: float,
     speed: float,
+    disable_after: bool = True,
 ) -> float:
-    """Dispense a volume without retracting. Returns actual travel mm."""
+    """Dispense a volume without retracting. Returns actual travel mm.
+
+    Parameters
+    ----------
+    disable_after : bool
+        If True (default), disable the stepper after dispensing.
+        Set False when the caller will issue further moves on the
+        same pump before disabling.
+    """
     sock = state.ensure_connected()
     m = state.motor(pid)
     sy = state.syringe(pid)
@@ -327,6 +350,9 @@ def _do_dispense_no_retract(
           f"at {speed:.2f} mm/s ...", end="", flush=True)
     pump_move(sock, pid, position=pos, speed=speed)
     print(" done")
+
+    if disable_after:
+        pump_disable(sock, pid)
     return travel_mm
 
 
@@ -345,7 +371,8 @@ def test_pump_juggle(state: SessionState) -> None:
     distance = _input_float("Distance (mm)", 1.0)
     speed = _input_float("Speed (mm/s)", 2.0)
     reps = _input_int("Repetitions", 10)
-    _check_homing(state, selected)
+    if not _check_homing(state, selected):
+        return
 
     sock = state.ensure_connected()
 
@@ -380,7 +407,8 @@ def test_volume(state: SessionState) -> None:
     pid = _select_single_pump(state, "Which pump?")
     volume = _input_float("Volume (ml)", 0.5)
     speed = _input_float("Speed (mm/s)", state.motor(pid).max_dispense_speed_mm_s)
-    _check_homing(state, [pid])
+    if not _check_homing(state, [pid]):
+        return
 
     _do_dispense(state, pid, volume, speed)
     print("\n  Volume test complete.")
@@ -447,7 +475,8 @@ def test_speed_ramp(state: SessionState) -> None:
     print("=" * 60)
 
     selected = _select_pumps(state, "Which pumps?")
-    _check_homing(state, selected)
+    if not _check_homing(state, selected):
+        return
 
     sock = state.ensure_connected()
     dose_ml = 0.5
@@ -497,7 +526,8 @@ def test_repeatability(state: SessionState) -> None:
     selected = _select_pumps(state, "Which pumps?")
     cycles = _input_int("Cycles", 10)
     speed = _input_float("Dispense speed (mm/s)", 2.0)
-    _check_homing(state, selected)
+    if not _check_homing(state, selected):
+        return
 
     sock = state.ensure_connected()
 
@@ -532,6 +562,7 @@ def test_repeatability(state: SessionState) -> None:
             print("    Re-home OK. Same physical position = no step loss.")
         else:
             print("    !! Re-home failed -- manual inspection needed.")
+        pump_disable(sock, pid)
 
     print("\n  Repeatability test complete.")
 
@@ -544,7 +575,8 @@ def test_full_travel(state: SessionState) -> None:
 
     selected = _select_pumps(state, "Which pumps?")
     speed = _input_float("Speed (mm/s)", 2.0)
-    _check_homing(state, selected)
+    if not _check_homing(state, selected):
+        return
 
     sock = state.ensure_connected()
 
@@ -584,7 +616,8 @@ def test_volume_repeatability(state: SessionState) -> None:
     pid = _select_single_pump(state, "Which pump?")
     volume = _input_float("Volume per cycle (ml)", 0.5)
     speed = _input_float("Speed (mm/s)", state.motor(pid).max_dispense_speed_mm_s)
-    _check_homing(state, [pid])
+    if not _check_homing(state, [pid]):
+        return
 
     cycle = 0
     while True:
@@ -638,6 +671,7 @@ def control_setup(state: SessionState) -> None:
         pump_set_position(sock, pid, 0.0)
         pump_move(sock, pid, position=purge_pos, speed=1.0, accel=50.0)
         pump_set_position(sock, pid, 0.0)
+        pump_disable(sock, pid)
         print(f"  Done. Position reset to 0.0 mm.")
 
     print("\n  Backlash purge complete.")
@@ -652,7 +686,8 @@ def control_individual_pump(state: SessionState) -> None:
     pid = _select_single_pump(state, "Which pump?")
     volume = _input_float("Volume (ml)", 0.5)
     speed = _input_float("Speed (mm/s)", state.motor(pid).max_dispense_speed_mm_s)
-    _check_homing(state, [pid])
+    if not _check_homing(state, [pid]):
+        return
 
     _do_dispense(state, pid, volume, speed)
     print("\n  Individual pump run complete.")
@@ -665,7 +700,8 @@ def control_multi_pump(state: SessionState) -> None:
     print("=" * 60)
 
     selected = _select_pumps(state, "Which pumps?")
-    _check_homing(state, selected)
+    if not _check_homing(state, selected):
+        return
 
     volumes: dict[str, float] = {}
     for pid in selected:
@@ -738,7 +774,8 @@ def control_purge(state: SessionState) -> None:
         "Speed (mm/s)",
         state.motor(purge_pid).max_dispense_speed_mm_s,
     )
-    _check_homing(state, [purge_pid])
+    if not _check_homing(state, [purge_pid]):
+        return
 
     print(f"\n  Purging with {state.pump_label(purge_pid)} ...")
     _do_dispense(state, purge_pid, volume, speed)
@@ -767,8 +804,8 @@ def calibrate_volume(state: SessionState) -> None:
     selected = _select_pumps(
         state, "Which pumps to calibrate?", allow_all=True,
     )
-    # Only ink pumps make sense for volume cal, but allow user choice
-    _check_homing(state, selected)
+    if not _check_homing(state, selected):
+        return
 
     corrections: dict[str, dict[str, float]] = {}
 
@@ -871,7 +908,8 @@ def calibrate_mixing(state: SessionState) -> None:
     total_vol = _input_float("Total volume (ml)", 1.0)
     speed = _input_float("Speed (mm/s)", 2.0)
 
-    _check_homing(state, ink_ids)
+    if not _check_homing(state, ink_ids):
+        return
 
     # Compute per-pump volumes
     pump_volumes = {pid: ratios[pid] * total_vol for pid in ink_ids}
@@ -904,7 +942,7 @@ def calibrate_mixing(state: SessionState) -> None:
     print("  Dispensing complete.")
     _dwell(state)
 
-    # Retract all
+    # Retract all simultaneously, then disable
     for i, pid in enumerate(ink_ids):
         is_last = (i == len(ink_ids) - 1)
         retract_speed = state.motor(pid).max_retract_speed_mm_s
@@ -1094,6 +1132,10 @@ def main() -> None:
     print("  Waiting for Klipper ...")
     state.sock = wait_for_ready(state.socket_path, timeout=45.0)
     print("  [OK] Klipper is ready")
+
+    # Ensure all pumps start disabled (no holding current)
+    for pid in state.pump_ids:
+        pump_disable(state.sock, pid)
 
     _print_banner(state)
 
