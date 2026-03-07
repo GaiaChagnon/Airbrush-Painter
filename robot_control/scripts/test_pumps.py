@@ -33,10 +33,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import select
-import signal
-import socket
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -52,6 +48,22 @@ from robot_control.configs.loader import (
     load_config,
 )
 from robot_control.configs.printer_cfg import generate_pump_test_cfg
+from robot_control.hardware.pump_control import (
+    PRINTER_CFG_PATH,
+    emergency_disable,
+    pump_disable,
+    pump_enable,
+    pump_home,
+    pump_move,
+    pump_set_position,
+    query_pump_endstop,
+    raw_gcode,
+    restart_klipper,
+    stdin_has_data,
+    volume_to_mm,
+    mm_to_volume,
+    wait_for_ready,
+)
 
 # ---------------------------------------------------------------------------
 # Config -- loaded once at import time
@@ -60,409 +72,6 @@ from robot_control.configs.printer_cfg import generate_pump_test_cfg
 _CFG = load_config()
 
 SOCKET_PATH = _CFG.connection.socket_path
-PRINTER_CFG_PATH = Path.home() / "printer.cfg"
-ETX = b"\x03"
-
-# ---------------------------------------------------------------------------
-# Low-level Klipper comms (same pattern as test_motors.py)
-# ---------------------------------------------------------------------------
-
-_next_id = 1
-
-
-def _raw_send(
-    sock: socket.socket,
-    method: str,
-    params: dict,
-    timeout: float = 10.0,
-) -> dict:
-    """Send one JSON request and return the matching response dict."""
-    global _next_id
-    req_id = _next_id
-    _next_id += 1
-
-    payload = (
-        json.dumps({"id": req_id, "method": method, "params": params}).encode()
-        + ETX
-    )
-    sock.sendall(payload)
-    sock.settimeout(timeout)
-
-    buf = b""
-    deadline = time.monotonic() + timeout
-
-    while time.monotonic() < deadline:
-        while ETX not in buf and time.monotonic() < deadline:
-            remaining = max(0.05, deadline - time.monotonic())
-            sock.settimeout(remaining)
-            try:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-            except socket.timeout:
-                break
-
-        while ETX in buf:
-            idx = buf.index(ETX)
-            frame = buf[:idx]
-            buf = buf[idx + 1:]
-            try:
-                msg = json.loads(frame.decode())
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if msg.get("id") == req_id:
-                return msg
-
-        if ETX not in buf and time.monotonic() >= deadline:
-            break
-
-    return {}
-
-
-def _drain_socket(sock: socket.socket, duration: float = 0.2) -> None:
-    """Read and discard any pending data in the socket buffer."""
-    deadline = time.monotonic() + duration
-    while time.monotonic() < deadline:
-        sock.settimeout(max(0.05, deadline - time.monotonic()))
-        try:
-            data = sock.recv(4096)
-            if not data:
-                break
-        except socket.timeout:
-            break
-
-
-def _raw_gcode(
-    sock: socket.socket,
-    script: str,
-    timeout: float = 30.0,
-) -> bool:
-    """Send G-code and return True on success."""
-    resp = _raw_send(sock, "gcode/script", {"script": script}, timeout)
-    if "error" in resp:
-        err = resp["error"]
-        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-        print(f"  !! G-code error: {msg[:120]}")
-        return False
-    return True
-
-
-def _wait_for_ready(timeout: float = 30.0) -> socket.socket:
-    """Connect to Klipper UDS and wait until state is 'ready'."""
-    deadline = time.monotonic() + timeout
-    restart_attempted = False
-
-    while time.monotonic() < deadline:
-        try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            sock.connect(SOCKET_PATH)
-            resp = _raw_send(sock, "info", {})
-            result = resp.get("result", {})
-            state = result.get("state", "unknown")
-            state_msg = result.get("state_message", "")
-
-            if state == "ready":
-                return sock
-
-            if state in ("error", "shutdown") and not restart_attempted:
-                restart_attempted = True
-                print(f"  Klipper state: {state} -- {state_msg[:80]}")
-                print("  Attempting FIRMWARE_RESTART...")
-                try:
-                    _raw_gcode(sock, "FIRMWARE_RESTART")
-                except Exception:
-                    pass
-                sock.close()
-                time.sleep(5.0)
-                continue
-
-            sock.close()
-        except (OSError, json.JSONDecodeError, KeyError):
-            pass
-        time.sleep(1.0)
-
-    raise RuntimeError(f"Klipper did not become ready within {timeout}s")
-
-
-_KLIPPY_ENV = Path.home() / "klippy-env" / "bin" / "python"
-_KLIPPY_PY = Path.home() / "klipper" / "klippy" / "klippy.py"
-_KLIPPY_LOG = Path("/tmp/klippy.log")
-
-# Track a Klipper process we spawned so we can clean up on exit.
-_spawned_klipper_proc: subprocess.Popen | None = None
-
-
-def _klipper_is_alive() -> bool:
-    """Return True if a Klipper process owns the UDS socket."""
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(2.0)
-        s.connect(SOCKET_PATH)
-        s.close()
-        return True
-    except OSError:
-        return False
-
-
-def _launch_klipper() -> None:
-    """Spawn Klipper as a background subprocess.
-
-    The process reads ``~/printer.cfg`` and creates the UDS socket at
-    ``SOCKET_PATH``.  If a previous socket file is stale we remove it
-    before launching.
-    """
-    global _spawned_klipper_proc
-
-    sock_path = Path(SOCKET_PATH)
-    if sock_path.exists():
-        sock_path.unlink()
-
-    if not _KLIPPY_ENV.exists():
-        raise RuntimeError(
-            f"Klipper virtualenv not found at {_KLIPPY_ENV}. "
-            "Cannot auto-start Klipper."
-        )
-    if not _KLIPPY_PY.exists():
-        raise RuntimeError(
-            f"klippy.py not found at {_KLIPPY_PY}. "
-            "Cannot auto-start Klipper."
-        )
-
-    cmd = [
-        str(_KLIPPY_ENV),
-        str(_KLIPPY_PY),
-        str(PRINTER_CFG_PATH),
-        "-l", str(_KLIPPY_LOG),
-        "-a", str(SOCKET_PATH),
-    ]
-    print(f"  Launching Klipper: {' '.join(cmd)}")
-    _spawned_klipper_proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(3.0)
-
-
-def restart_klipper() -> None:
-    """Restart Klipper, launching it from scratch if not running.
-
-    First tries to send a ``RESTART`` command over the UDS socket.
-    If the socket is dead (e.g. after power loss), spawns a fresh
-    Klipper process instead.
-    """
-    if _klipper_is_alive():
-        try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            sock.connect(SOCKET_PATH)
-            _raw_gcode(sock, "RESTART")
-            sock.close()
-        except OSError:
-            pass
-        time.sleep(3.0)
-    else:
-        print("  Klipper is not running -- starting it fresh ...")
-        _launch_klipper()
-
-
-def _emergency_disable(pump_id: str) -> None:
-    """Fire-and-forget motor disable for emergency shutdown."""
-    try:
-        _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        _sock.settimeout(2.0)
-        _sock.connect(SOCKET_PATH)
-        payload = (
-            json.dumps({
-                "id": 9999,
-                "method": "gcode/script",
-                "params": {
-                    "script": f"MANUAL_STEPPER STEPPER={pump_id} ENABLE=0",
-                },
-            }).encode()
-            + ETX
-        )
-        _sock.sendall(payload)
-        _sock.close()
-    except OSError:
-        pass
-
-
-def _stdin_has_data() -> bool:
-    """Check if stdin has data ready (non-blocking)."""
-    try:
-        return bool(select.select([sys.stdin], [], [], 0.0)[0])
-    except Exception:
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Pump control helpers
-# ---------------------------------------------------------------------------
-
-
-def pump_enable(sock: socket.socket, pump_id: str) -> None:
-    """Enable the pump stepper driver."""
-    _raw_gcode(sock, f"MANUAL_STEPPER STEPPER={pump_id} ENABLE=1")
-
-
-def pump_disable(sock: socket.socket, pump_id: str) -> None:
-    """Disable the pump stepper driver."""
-    _raw_gcode(sock, f"MANUAL_STEPPER STEPPER={pump_id} ENABLE=0")
-
-
-def pump_set_position(sock: socket.socket, pump_id: str, pos: float) -> None:
-    """Set the pump's logical position without moving."""
-    _raw_gcode(
-        sock,
-        f"MANUAL_STEPPER STEPPER={pump_id} SET_POSITION={pos:.4f}",
-    )
-
-
-def pump_move(
-    sock: socket.socket,
-    pump_id: str,
-    position: float,
-    speed: float,
-    accel: float = 100.0,
-    stop_on_endstop: int = 0,
-    timeout: float = 60.0,
-) -> bool:
-    """Move the pump to an absolute position.
-
-    Parameters
-    ----------
-    position : float
-        Target position in mm.
-    speed : float
-        Travel speed in mm/s.
-    accel : float
-        Acceleration in mm/s^2.
-    stop_on_endstop : int
-        0 = ignore endstop, 1 = stop when triggered, -1 = stop when released.
-    timeout : float
-        G-code response timeout in seconds.
-
-    Returns
-    -------
-    bool
-        True if the command was accepted by Klipper.
-    """
-    cmd = (
-        f"MANUAL_STEPPER STEPPER={pump_id} "
-        f"MOVE={position:.4f} SPEED={speed:.4f} ACCEL={accel:.1f}"
-    )
-    if stop_on_endstop != 0:
-        cmd += f" STOP_ON_ENDSTOP={stop_on_endstop}"
-    return _raw_gcode(sock, cmd, timeout=timeout)
-
-
-def pump_home(
-    sock: socket.socket,
-    pump_id: str,
-    pump_cfg: PumpMotorConfig,
-    syringe: SyringeConfig,
-) -> bool:
-    """Home the pump to its limit switch and back off.
-
-    Uses ``homing_direction`` from config to determine which way to
-    move toward the switch (+1 = positive, -1 = negative).  After the
-    endstop triggers, sets position to 0 and backs off in the opposite
-    direction.
-
-    Returns True on success.
-    """
-    travel = syringe.plunger_travel_mm
-    homing_speed = pump_cfg.homing_speed_mm_s
-    backoff = pump_cfg.home_backoff_mm
-    h_dir = pump_cfg.homing_direction  # +1 or -1
-
-    # Move toward limit switch (overshoot by 5 mm beyond full travel)
-    homing_target = h_dir * (travel + 5.0)
-    dir_label = "positive" if h_dir > 0 else "negative"
-    print(f"    Homing: moving {dir_label} toward limit switch "
-          f"at {homing_speed} mm/s ...")
-    ok = pump_move(
-        sock, pump_id,
-        position=homing_target,
-        speed=homing_speed,
-        accel=50.0,
-        stop_on_endstop=1,
-        timeout=60.0,
-    )
-    if not ok:
-        print("    !! Homing move failed")
-        return False
-
-    pump_set_position(sock, pump_id, 0.0)
-    print("    Position set to 0.0 mm (at limit switch)")
-
-    # Back off AWAY from the switch (opposite of homing direction)
-    if backoff > 0:
-        backoff_pos = -h_dir * backoff
-        print(f"    Backing off {backoff:.1f} mm ...")
-        pump_move(sock, pump_id, position=backoff_pos, speed=1.0, accel=50.0)
-        pump_set_position(sock, pump_id, 0.0)
-        print("    Position reset to 0.0 mm (after backoff)")
-
-    return True
-
-
-def volume_to_mm(volume_ml: float, syringe: SyringeConfig) -> float:
-    """Convert a volume in ml to plunger travel in mm."""
-    return volume_ml * syringe.mm_per_ml
-
-
-def mm_to_volume(mm: float, syringe: SyringeConfig) -> float:
-    """Convert plunger travel in mm to volume in ml."""
-    return mm * syringe.volume_per_mm
-
-
-# ---------------------------------------------------------------------------
-# Endstop helpers
-# ---------------------------------------------------------------------------
-
-
-def query_pump_endstop(
-    sock: socket.socket,
-    pump_id: str,
-    debug: bool = False,
-) -> str:
-    """Query the endstop state for a manual_stepper pump.
-
-    Returns
-    -------
-    str
-        ``"open"``, ``"TRIGGERED"``, or ``"???"`` on failure.
-    """
-    _drain_socket(sock)
-    _raw_gcode(sock, "QUERY_ENDSTOPS")
-    time.sleep(0.3)
-    _drain_socket(sock)
-
-    resp = _raw_send(
-        sock,
-        "objects/query",
-        {"objects": {"query_endstops": ["last_query"]}},
-        timeout=3.0,
-    )
-
-    if debug:
-        print(f"\n  [DEBUG] raw response: {json.dumps(resp, indent=2)}")
-
-    status = resp.get("result", {}).get("status", {})
-    last_query = status.get("query_endstops", {}).get("last_query", {})
-
-    # manual_stepper endstop keys look like "manual_stepper pump_0"
-    for key, raw_state in last_query.items():
-        if pump_id in key:
-            if isinstance(raw_state, int):
-                return "TRIGGERED" if raw_state else "open"
-            return str(raw_state)
-
-    return "???"
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +113,7 @@ def phase_spin(
         pump_move(sock, pump_id, position=rot_dist, speed=speed)
         print(" done")
 
-        _raw_gcode(sock, f"G4 P{pause_ms}")
+        raw_gcode(sock, f"G4 P{pause_ms}")
 
         print(f"    Cycle {i}/{cycles}: reverse {rot_dist} mm "
               f"(1 rev) ...", end="", flush=True)
@@ -512,7 +121,7 @@ def phase_spin(
         print(" done")
 
         if i < cycles:
-            _raw_gcode(sock, f"G4 P{pause_ms}")
+            raw_gcode(sock, f"G4 P{pause_ms}")
 
     print()
     print("  Motor spin test complete.")
@@ -567,7 +176,7 @@ def phase_endstop(
             print()
             return True
 
-        if _stdin_has_data():
+        if stdin_has_data():
             sys.stdin.readline()
             print()
             if saw_open and not saw_triggered:
@@ -642,7 +251,7 @@ def phase_full_travel(
     pump_move(sock, pump_id, position=dispense_pos, speed=speed)
     print(" done")
 
-    _raw_gcode(sock, f"G4 P{pause_ms}")
+    raw_gcode(sock, f"G4 P{pause_ms}")
 
     print(f"    Retracting: {dispense_pos:.1f} -> 0 mm ({vol} ml) ...",
           end="", flush=True)
@@ -692,7 +301,7 @@ def phase_continuous_cycle(
         pump_move(sock, pump_id, position=dispense_pos, speed=speed)
         print(" done")
 
-        _raw_gcode(sock, f"G4 P{pause_ms}")
+        raw_gcode(sock, f"G4 P{pause_ms}")
 
         retract_speed = min(speed * 1.5, pump_cfg.max_retract_speed_mm_s)
         print(f"      Retracting {vol} ml ({travel} mm) at "
@@ -701,7 +310,7 @@ def phase_continuous_cycle(
         print(" done")
 
         if i < cycles:
-            _raw_gcode(sock, "G4 P1000")
+            raw_gcode(sock, "G4 P1000")
 
     print()
     print(f"  Continuous cycle test complete ({cycles} cycles).")
@@ -750,7 +359,7 @@ def phase_precise_volume(
     pause_ms = int(
         _CFG.pumps.stepper.direction_reversal_pause_s * 1000  # type: ignore[union-attr]
     )
-    _raw_gcode(sock, f"G4 P{pause_ms}")
+    raw_gcode(sock, f"G4 P{pause_ms}")
 
     retract_speed = pump_cfg.max_retract_speed_mm_s
     print(f"    Retracting to 0 at {retract_speed:.1f} mm/s ...",
@@ -802,13 +411,13 @@ def phase_microdose(
         pump_move(sock, pump_id, position=dispense_pos, speed=speed)
         print(" done")
 
-        _raw_gcode(sock, f"G4 P{pause_ms}")
+        raw_gcode(sock, f"G4 P{pause_ms}")
 
         print(f"      Retracting ...", end="", flush=True)
         pump_move(sock, pump_id, position=0.0, speed=speed)
         print(" done")
 
-        _raw_gcode(sock, f"G4 P{pause_ms}")
+        raw_gcode(sock, f"G4 P{pause_ms}")
 
     print()
     print("  Micro-dose test complete.")
@@ -858,13 +467,13 @@ def phase_speed_ramp(
         pump_move(sock, pump_id, position=dispense_pos, speed=spd)
         print(" done")
 
-        _raw_gcode(sock, f"G4 P{pause_ms}")
+        raw_gcode(sock, f"G4 P{pause_ms}")
 
         print(f"      Retracting ...", end="", flush=True)
         pump_move(sock, pump_id, position=0.0, speed=retract_speed)
         print(" done")
 
-        _raw_gcode(sock, f"G4 P{pause_ms}")
+        raw_gcode(sock, f"G4 P{pause_ms}")
 
     print()
     print("  Speed ramp test complete.")
@@ -911,11 +520,11 @@ def phase_repeatability(
         sys.stdout.flush()
 
         pump_move(sock, pump_id, position=dispense_pos, speed=speed)
-        _raw_gcode(sock, f"G4 P{pause_ms}")
+        raw_gcode(sock, f"G4 P{pause_ms}")
 
         pump_move(sock, pump_id, position=0.0, speed=retract_speed)
         if i < cycles:
-            _raw_gcode(sock, f"G4 P{pause_ms}")
+            raw_gcode(sock, f"G4 P{pause_ms}")
 
     print(" done")
     print()
@@ -1070,10 +679,10 @@ def main() -> None:
         print()
 
         print("  Restarting Klipper to load pump test config...")
-        restart_klipper()
+        restart_klipper(SOCKET_PATH)
 
     print("  Waiting for Klipper to become ready...")
-    sock = _wait_for_ready(timeout=45.0)
+    sock = wait_for_ready(SOCKET_PATH, timeout=45.0)
     print("  [OK] Klipper is ready")
     print()
 
@@ -1212,5 +821,5 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         print(f"\n  ERROR: {exc}")
-        _emergency_disable("pump_0")
+        emergency_disable(SOCKET_PATH, "pump_0")
         sys.exit(1)

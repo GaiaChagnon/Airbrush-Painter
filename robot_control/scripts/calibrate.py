@@ -69,6 +69,8 @@ def main() -> None:
     parser.add_argument("--full-canvas", action="store_true",
                         help="Probe the full canvas area instead of "
                         "paper bounds (only with --bed-mesh)")
+    parser.add_argument("--no-home", action="store_true",
+                        help="Skip homing (useful for servo-only tests)")
     args = parser.parse_args()
 
     selected = any([
@@ -133,10 +135,19 @@ def main() -> None:
         except Exception:
             pass  # OK if no mesh was loaded
 
-        # Home all axes before any calibration (Klipper rejects moves
-        # unless every axis in the kinematic chain has been homed).
-        print("\nHoming all axes before calibration...")
-        client.send_gcode("G28\nM400", timeout=60.0)
+        # Determine whether homing is needed.  Servo-only runs don't
+        # require homed axes, so skip automatically (or via --no-home).
+        needs_axes = any([
+            args.steps_x, args.steps_y, args.z_heights,
+            args.tool_offset, args.speed, args.endstops,
+            args.endstop_phase, args.bed_mesh,
+        ])
+        skip_home = args.no_home or not needs_axes
+        if skip_home:
+            logger.info("Skipping homing (servo-only or --no-home)")
+        else:
+            print("\nHoming all axes before calibration...")
+            client.send_gcode("G28\nM400", timeout=60.0)
 
         if args.steps_x:
             routines.calibrate_steps_per_mm(client, config, axis="X")

@@ -34,7 +34,7 @@ from robot_control.calibration.measurement import (
 )
 from robot_control.configs.loader import MachineConfig
 from robot_control.hardware.job_executor import JobExecutor
-from robot_control.hardware.klipper_client import KlipperClient
+from robot_control.hardware.klipper_client import GCodeError, KlipperClient
 from src.utils.fs import atomic_yaml_dump, load_yaml
 
 logger = logging.getLogger(__name__)
@@ -523,31 +523,67 @@ def calibrate_endstop_phase(
 # ---------------------------------------------------------------------------
 
 
+def _query_servo_status(
+    client: KlipperClient,
+    servo_name: str,
+) -> dict[str, Any] | None:
+    """Query Klipper for the live state of a ``[servo]`` object.
+
+    Returns
+    -------
+    dict or None
+        ``{"value": <duty>, "...": ...}`` if the object exists, else
+        ``None`` (object not loaded / Klipper doesn't expose it).
+    """
+    try:
+        result = client._send_request(
+            "objects/query",
+            {"objects": {f"servo {servo_name}": None}},
+            timeout=5.0,
+        )
+        return result.get("status", {}).get(f"servo {servo_name}")
+    except Exception:
+        return None
+
+
 def test_servo(
     client: KlipperClient,
     config: MachineConfig,
 ) -> dict[str, Any]:
-    """Exercise the servo through its full range (~30 seconds).
+    """Exercise the servo through its full range.
 
-    Runs five phases to test the servo at different speeds and positions:
+    Phases
+    ------
+    0. **Direct PWM diagnostic** -- sends raw pulse widths to the pin so
+       the user can confirm the hardware responds *before* the angle sweep.
+    1. **Slow sweep** 0 -> max in 10 steps.
+    2. **Slow sweep back** max -> 0 in 10 steps.
+    3. **Key positions** (0/45/90/135/180/225/270).
+    4. **Fast jumps** 0 <-> max (10 toggles).
+    5. **Return to neutral**.
 
-    1. **Slow sweep** -- 0 to max angle in 10 equal steps (8 s).
-    2. **Slow sweep back** -- max angle to 0 in 10 steps (8 s).
-    3. **Key positions** -- 0, 45, 90, 135, 180, 225, 270 (5 s).
-    4. **Fast jumps** -- rapid alternation between 0 and max (3 s).
-    5. **Return to neutral** -- settle at centre position (1 s).
+    Uses Klipper ``SET_SERVO SERVO=<name> ANGLE=<deg>`` and
+    ``SET_SERVO SERVO=<name> WIDTH=<seconds>``.
 
-    Uses Klipper's ``SET_SERVO SERVO=<name> ANGLE=<deg>`` command.
+    Parameters
+    ----------
+    client : KlipperClient
+        Connected Klipper API handle.
+    config : MachineConfig
+        Machine configuration (must have ``servo`` populated).
 
     Returns
     -------
     dict
-        Positions visited and timing.
+        ``servo_name``, ``angle_range_deg``, ``positions_visited``,
+        ``elapsed_s``, and ``phase0_passed`` (bool).
 
     Raises
     ------
     RuntimeError
         If no servo is configured in ``machine.yaml``.
+    GCodeError
+        If Klipper rejects a SET_SERVO command.
     """
     sv = config.servo
     if sv is None:
@@ -560,11 +596,23 @@ def test_servo(
     neutral = sv.neutral_angle_deg
     name = sv.name
 
-    def set_angle(angle: float) -> None:
-        client.send_gcode(
-            f"SET_SERVO SERVO={name} ANGLE={angle:.1f}", timeout=5.0,
-        )
+    def _send_servo(cmd: str) -> str:
+        """Send a SET_SERVO command and return any Klipper console output."""
+        try:
+            output = client.send_gcode_with_output(cmd, timeout=5.0)
+            logger.info("Servo cmd OK: %s", cmd)
+            return output.strip()
+        except GCodeError as exc:
+            logger.error("Servo cmd FAILED: %s -> %s", cmd, exc)
+            raise
 
+    def set_angle(angle: float) -> None:
+        _send_servo(f"SET_SERVO SERVO={name} ANGLE={angle:.1f}")
+
+    def set_width(width_s: float) -> None:
+        _send_servo(f"SET_SERVO SERVO={name} WIDTH={width_s:.6f}")
+
+    # -- Header ------------------------------------------------------------
     logger.info("Starting servo test (%s, %.0f deg range)", name, max_angle)
     print(f"\n{'='*60}")
     print(f"  SERVO TEST  ({name}, 0-{max_angle:.0f} deg)")
@@ -576,10 +624,64 @@ def test_servo(
           f"({sv.neutral_pulse_width_s*1e6:.0f} us)")
     print()
 
+    # -- Phase 0: direct PWM diagnostic -----------------------------------
+    # Bypasses angle mapping; sends exact pulse widths so we can confirm
+    # that the MCU is actually toggling the pin and the servo hardware
+    # responds.
+    print("  Phase 0: Direct PWM diagnostic (raw pulse widths)")
+
+    servo_status = _query_servo_status(client, name)
+    if servo_status is not None:
+        logger.info("Klipper servo object found: %s", servo_status)
+        print(f"    Servo object loaded in Klipper: YES  "
+              f"(value={servo_status.get('value', '?')})")
+    else:
+        print("    Servo object loaded in Klipper: "
+              "could not query (non-fatal)")
+
+    phase0_passed = True
+    test_widths = [
+        (sv.neutral_pulse_width_s, "neutral"),
+        (sv.min_pulse_width_s, "min (0 deg)"),
+        (sv.max_pulse_width_s, "max ({:.0f} deg)".format(max_angle)),
+        (sv.neutral_pulse_width_s, "neutral (return)"),
+    ]
+    for pw_s, label in test_widths:
+        pw_us = pw_s * 1e6
+        print(f"    -> WIDTH={pw_s:.6f} ({pw_us:.0f} us, {label})")
+        try:
+            set_width(pw_s)
+        except GCodeError as exc:
+            print(f"       FAILED: {exc}")
+            phase0_passed = False
+            break
+        time.sleep(2.0)
+
+    if phase0_passed:
+        print("    Phase 0 OK -- if servo did NOT move, check:")
+        print(f"      1. Wiring: signal wire on pin {sv.pin}")
+        print("      2. Power: 5V/6V to servo VCC (not just signal)")
+        print("      3. Pin mapping: verify PB6 matches your board rev "
+              "(STM32H723 Octopus)")
+        print("      4. Klipper log (/tmp/klippy.log) for PWM errors")
+    else:
+        print("    Phase 0 FAILED -- Klipper rejected the command.")
+        print("    Aborting remaining phases.")
+        summary: dict[str, Any] = {
+            "servo_name": name,
+            "angle_range_deg": max_angle,
+            "positions_visited": 0,
+            "elapsed_s": 0.0,
+            "phase0_passed": False,
+        }
+        print(format_calibration_summary(summary))
+        return summary
+
+    print()
     positions_visited: list[float] = []
     t_start = time.monotonic()
 
-    # Phase 1: slow sweep 0 -> max (10 steps, 0.8s each = 8s)
+    # -- Phase 1: slow sweep 0 -> max (10 steps, 0.8 s each) --------------
     print("  Phase 1: Slow sweep 0 -> max...")
     steps = 10
     for i in range(steps + 1):
@@ -588,7 +690,7 @@ def test_servo(
         positions_visited.append(angle)
         time.sleep(0.8)
 
-    # Phase 2: slow sweep max -> 0 (10 steps, 0.8s each = 8s)
+    # -- Phase 2: slow sweep max -> 0 (10 steps, 0.8 s each) --------------
     print("  Phase 2: Slow sweep max -> 0...")
     for i in range(steps + 1):
         angle = max_angle * (1.0 - i / steps)
@@ -596,7 +698,7 @@ def test_servo(
         positions_visited.append(angle)
         time.sleep(0.8)
 
-    # Phase 3: key positions (7 positions, 0.7s each ~ 5s)
+    # -- Phase 3: key positions (7 angles, 0.7 s each) --------------------
     print("  Phase 3: Key positions (0/45/90/135/180/225/270)...")
     key_angles = [a for a in [0, 45, 90, 135, 180, 225, 270]
                   if a <= max_angle]
@@ -605,7 +707,7 @@ def test_servo(
         positions_visited.append(angle)
         time.sleep(0.7)
 
-    # Phase 4: fast jumps between extremes (10 jumps, 0.3s each = 3s)
+    # -- Phase 4: fast jumps (10 toggles, 0.3 s each) ---------------------
     print("  Phase 4: Fast jumps (0 <-> max)...")
     for i in range(10):
         angle = 0.0 if i % 2 == 0 else max_angle
@@ -613,7 +715,7 @@ def test_servo(
         positions_visited.append(angle)
         time.sleep(0.3)
 
-    # Phase 5: return to neutral
+    # -- Phase 5: return to neutral ----------------------------------------
     print("  Phase 5: Return to neutral...")
     set_angle(neutral)
     positions_visited.append(neutral)
@@ -623,11 +725,12 @@ def test_servo(
     print(f"\n  Servo test complete.  {len(positions_visited)} moves "
           f"in {elapsed:.1f} s")
 
-    summary: dict[str, Any] = {
+    summary = {
         "servo_name": name,
         "angle_range_deg": max_angle,
         "positions_visited": len(positions_visited),
         "elapsed_s": round(elapsed, 1),
+        "phase0_passed": phase0_passed,
     }
     print(format_calibration_summary(summary))
     return summary

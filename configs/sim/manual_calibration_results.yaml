@@ -41,6 +41,18 @@ layering_measurements:
     overlap_rgb_linear_measured: [0.xx, 0.xx, 0.xx]
   # ... (operator fills in 9 entries)
 
+# Ink mixing measurements (pump testbed calibration)
+# Written by: robot_control/scripts/pump_testbed.py (mixing test)
+# Each entry keyed by user label or auto-generated timestamp
+ink_mixing_measurements: {}
+  # MIX_001:
+  #   cmy_ratio: [0.33, 0.33, 0.34]    # Cyan, Magenta, Yellow fractions (sum=1)
+  #   total_volume_ml: 1.0               # Total dispensed volume
+  #   speed_mm_s: 2.0                    # Dispense speed
+  #   rgb_measured: [0.0, 0.0, 0.0]     # Measured linear RGB from scanned sample
+  #   date: "2026-03-07 14:30"
+  #   notes: ""
+
 # Metadata
 calibration_date: "YYYY-MM-DD"
 operator: "Operator Name"

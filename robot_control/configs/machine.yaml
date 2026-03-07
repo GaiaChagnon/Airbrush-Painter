@@ -21,7 +21,7 @@ canvas:
   height_mm: 300.0
 z_states:
   travel_mm: 40.0
-  pen_work_mm: 80.211
+  pen_work_mm: 80.194
   airbrush_work_mm: 0.0
 tools:
   pen:
@@ -114,6 +114,8 @@ file_execution:
   gcode_directory: /home/klipper/gcode_files
 pumps:
   enabled: true
+  backlash_purge_mm: 0.5          # mm, plunger advance after homing to eliminate backlash
+  manifold_purge_volume_ml: 0.5   # ml, IPA volume to flush mixing manifold (tune after testing)
   stepper:
     motor_type: 1.8deg
     full_steps_per_rotation: 200
@@ -129,6 +131,7 @@ pumps:
     plunger_travel_mm: 16.0
   motors:
     pump_0:
+      fluid: cyan
       octopus_slot: Motor 3
       pins:
         step: PF9
@@ -142,12 +145,57 @@ pumps:
       home_backoff_mm: 0.5
       max_dispense_speed_mm_s: 4.0
       max_retract_speed_mm_s: 4.0
+    pump_1:
+      fluid: magenta
+      octopus_slot: Motor 4
+      pins:
+        step: PC13
+        dir: PF0
+        enable: PF1
+      endstop_pin: PG12
+      endstop_polarity: ^!
+      endstop_type: NO_to_GND
+      homing_direction: 1
+      homing_speed_mm_s: 2.0
+      home_backoff_mm: 0.5
+      max_dispense_speed_mm_s: 4.0
+      max_retract_speed_mm_s: 4.0
+    pump_2:
+      fluid: yellow
+      octopus_slot: Motor 5
+      pins:
+        step: PE2
+        dir: PE3
+        enable: PD4
+      endstop_pin: PG13
+      endstop_polarity: ^!
+      endstop_type: NO_to_GND
+      homing_direction: 1
+      homing_speed_mm_s: 2.0
+      home_backoff_mm: 0.5
+      max_dispense_speed_mm_s: 4.0
+      max_retract_speed_mm_s: 4.0
+    pump_3:
+      fluid: purge
+      octopus_slot: Motor 6
+      pins:
+        step: PE6
+        dir: PA14
+        enable: PE0
+      endstop_pin: PG14
+      endstop_polarity: ^!
+      endstop_type: NO_to_GND
+      homing_direction: 1
+      homing_speed_mm_s: 2.0
+      home_backoff_mm: 0.5
+      max_dispense_speed_mm_s: 4.0
+      max_retract_speed_mm_s: 4.0
 bed_mesh:
   mesh_min:
   - 25.0
   - 25.0
   mesh_max:
-  - 347.0
+  - 370.0
   - 260.0
   probe_count:
   - 3
@@ -159,15 +207,15 @@ bed_mesh:
   - 2
   algorithm: lagrange
   calibrated_points:
-  - - -0.117778
-    - -0.167778
-    - -0.137778
-  - - 0.012222
-    - 0.012222
-    - 0.012222
-  - - 0.162222
-    - 0.112222
-    - 0.112222
+  - - -0.094444
+    - -0.094444
+    - -0.094444
+  - - 0.005556
+    - 0.005556
+    - -0.044444
+  - - 0.105556
+    - 0.105556
+    - 0.105556
 endstop_phase:
   enabled: true
 servos:

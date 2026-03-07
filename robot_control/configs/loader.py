@@ -297,12 +297,18 @@ class SyringeConfig:
         return self.plunger_travel_mm / self.volume_ml
 
 
+_VALID_PUMP_FLUIDS = ("cyan", "magenta", "yellow", "purge")
+
+
 @dataclass(frozen=True)
 class PumpMotorConfig:
     """Per-pump motor wiring, endstop, homing, and speed config.
 
     Parameters
     ----------
+    fluid : str
+        Fluid type: ``"cyan"``, ``"magenta"``, ``"yellow"``, or
+        ``"purge"`` (isopropyl alcohol).
     octopus_slot : str
         Board connector label, e.g. ``"Motor 3"``.
     pins : PinConfig
@@ -328,6 +334,7 @@ class PumpMotorConfig:
         Syringe geometry (may override the shared default).
     """
 
+    fluid: str
     octopus_slot: str
     pins: PinConfig
     endstop_pin: str
@@ -355,12 +362,19 @@ class PumpsConfig:
         Default syringe geometry (overridable per pump).
     motors : dict[str, PumpMotorConfig]
         Per-pump motor configs keyed by pump identifier.
+    backlash_purge_mm : float
+        Plunger advance after homing to eliminate lead-screw backlash,
+        in mm.  Applied to every pump equally.
+    manifold_purge_volume_ml : float
+        IPA volume used to flush the mixing manifold, in ml.
     """
 
     enabled: bool
     stepper: PumpStepperConfig
     syringe_defaults: SyringeConfig
     motors: dict[str, PumpMotorConfig]
+    backlash_purge_mm: float = 0.5
+    manifold_purge_volume_ml: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -605,7 +619,14 @@ def _parse_pump_motor(
         if syringe_override
         else syringe_defaults
     )
+    fluid = str(data.get("fluid", ""))
+    if fluid not in _VALID_PUMP_FLUIDS:
+        raise ConfigError(
+            f"Pump '{name}' fluid must be one of {_VALID_PUMP_FLUIDS}, "
+            f"got '{fluid}'"
+        )
     return PumpMotorConfig(
+        fluid=fluid,
         octopus_slot=str(data["octopus_slot"]),
         pins=pins,
         endstop_pin=str(data["endstop_pin"]),
@@ -641,11 +662,25 @@ def _parse_pumps(data: dict[str, Any]) -> PumpsConfig | None:
         for name, motor_data in motors_data.items()
     }
 
+    # Validate: no duplicate fluid assignments
+    fluids_seen: dict[str, str] = {}
+    for pump_name, pump_motor in motors.items():
+        if pump_motor.fluid in fluids_seen:
+            raise ConfigError(
+                f"Duplicate fluid '{pump_motor.fluid}': assigned to both "
+                f"'{fluids_seen[pump_motor.fluid]}' and '{pump_name}'"
+            )
+        fluids_seen[pump_motor.fluid] = pump_name
+
     return PumpsConfig(
         enabled=True,
         stepper=stepper,
         syringe_defaults=syringe_defaults,
         motors=motors,
+        backlash_purge_mm=float(data.get("backlash_purge_mm", 0.5)),
+        manifold_purge_volume_ml=float(
+            data.get("manifold_purge_volume_ml", 0.5)
+        ),
     )
 
 
