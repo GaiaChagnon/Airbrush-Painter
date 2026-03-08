@@ -356,6 +356,82 @@ def _do_dispense_no_retract(
     return travel_mm
 
 
+def _do_simultaneous_dispense(
+    state: SessionState,
+    pump_ids: list[str],
+    volumes: dict[str, float],
+    speed: float,
+    retract: bool = True,
+) -> None:
+    """Dispense multiple pumps so they all start and finish together.
+
+    Each pump dispenses a different volume.  To finish simultaneously
+    the per-pump speed is scaled so every pump takes the same duration
+    (governed by the pump with the longest travel at the given speed).
+
+    Parameters
+    ----------
+    pump_ids : list[str]
+        Pumps to run.
+    volumes : dict[str, float]
+        Target volume per pump in ml.
+    speed : float
+        Reference speed in mm/s.  The slowest pump (longest travel)
+        runs at this speed; faster pumps are slowed proportionally.
+    retract : bool
+        If True, retract all pumps simultaneously after dispensing.
+    """
+    sock = state.ensure_connected()
+
+    travels: dict[str, float] = {}
+    for pid in pump_ids:
+        sy = state.syringe(pid)
+        t = volume_to_mm(volumes[pid], sy)
+        if t > sy.plunger_travel_mm:
+            t = sy.plunger_travel_mm
+        travels[pid] = t
+
+    max_travel = max(travels.values())
+    if max_travel <= 0:
+        return
+    duration_s = max_travel / speed
+
+    print(f"\n  Running pumps simultaneously ({duration_s:.1f} s) ...")
+    for pid in pump_ids:
+        pump_enable(sock, pid)
+        pump_set_position(sock, pid, 0.0)
+
+    for i, pid in enumerate(pump_ids):
+        m = state.motor(pid)
+        dsign = _dispense_sign(m)
+        pos = dsign * travels[pid]
+        pump_speed = travels[pid] / duration_s if duration_s > 0 else speed
+        is_last = (i == len(pump_ids) - 1)
+
+        print(f"    {state.pump_label(pid)}: "
+              f"{volumes[pid]:.3f} ml at {pump_speed:.3f} mm/s",
+              end="", flush=True)
+        pump_move(sock, pid, position=pos, speed=pump_speed, sync=is_last)
+        if is_last:
+            print("  done (all)")
+        else:
+            print("")
+
+    if not retract:
+        return
+
+    _dwell(state)
+
+    max_retract = max(travels.values())
+    retract_duration = max_retract / speed if speed > 0 else 1.0
+    for i, pid in enumerate(pump_ids):
+        retract_speed = travels[pid] / retract_duration if retract_duration > 0 else speed
+        is_last = (i == len(pump_ids) - 1)
+        pump_move(sock, pid, position=0.0, speed=retract_speed, sync=is_last)
+
+    print("  Retract complete.")
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -369,7 +445,7 @@ def test_pump_juggle(state: SessionState) -> None:
 
     selected = _select_pumps(state, "Which pumps to juggle?")
     distance = _input_float("Distance (mm)", 1.0)
-    speed = _input_float("Speed (mm/s)", 2.0)
+    speed = _input_float("Speed (mm/s)", 0.5)
     reps = _input_int("Repetitions", 10)
     if not _check_homing(state, selected):
         return
@@ -406,7 +482,7 @@ def test_volume(state: SessionState) -> None:
 
     pid = _select_single_pump(state, "Which pump?")
     volume = _input_float("Volume (ml)", 0.5)
-    speed = _input_float("Speed (mm/s)", state.motor(pid).max_dispense_speed_mm_s)
+    speed = _input_float("Speed (mm/s)", 0.5)
     if not _check_homing(state, [pid]):
         return
 
@@ -525,7 +601,7 @@ def test_repeatability(state: SessionState) -> None:
 
     selected = _select_pumps(state, "Which pumps?")
     cycles = _input_int("Cycles", 10)
-    speed = _input_float("Dispense speed (mm/s)", 2.0)
+    speed = _input_float("Dispense speed (mm/s)", 0.5)
     if not _check_homing(state, selected):
         return
 
@@ -574,7 +650,7 @@ def test_full_travel(state: SessionState) -> None:
     print("=" * 60)
 
     selected = _select_pumps(state, "Which pumps?")
-    speed = _input_float("Speed (mm/s)", 2.0)
+    speed = _input_float("Speed (mm/s)", 0.5)
     if not _check_homing(state, selected):
         return
 
@@ -615,7 +691,7 @@ def test_volume_repeatability(state: SessionState) -> None:
 
     pid = _select_single_pump(state, "Which pump?")
     volume = _input_float("Volume per cycle (ml)", 0.5)
-    speed = _input_float("Speed (mm/s)", state.motor(pid).max_dispense_speed_mm_s)
+    speed = _input_float("Speed (mm/s)", 0.5)
     if not _check_homing(state, [pid]):
         return
 
@@ -678,18 +754,18 @@ def control_setup(state: SessionState) -> None:
 
 
 def control_individual_pump(state: SessionState) -> None:
-    """Control 3: run a single pump."""
+    """Control 3: run a single pump (dispense only, no auto-retract)."""
     print("\n" + "=" * 60)
     print("  CONTROL: INDIVIDUAL PUMP")
     print("=" * 60)
 
     pid = _select_single_pump(state, "Which pump?")
     volume = _input_float("Volume (ml)", 0.5)
-    speed = _input_float("Speed (mm/s)", state.motor(pid).max_dispense_speed_mm_s)
+    speed = _input_float("Speed (mm/s)", 0.5)
     if not _check_homing(state, [pid]):
         return
 
-    _do_dispense(state, pid, volume, speed)
+    _do_dispense_no_retract(state, pid, volume, speed)
     print("\n  Individual pump run complete.")
 
 
@@ -708,44 +784,13 @@ def control_multi_pump(state: SessionState) -> None:
         volumes[pid] = _input_float(
             f"Volume for {state.pump_label(pid)} (ml)", 0.5
         )
-    speed = _input_float("Speed (mm/s)", 2.0)
+    speed = _input_float("Speed (mm/s)", 0.5)
     simultaneous = _input_bool("Run simultaneously?", default=False)
 
     sock = state.ensure_connected()
 
     if simultaneous:
-        print("\n  Running pumps simultaneously ...")
-        for pid in selected:
-            pump_enable(sock, pid)
-            pump_set_position(sock, pid, 0.0)
-
-        # Issue SYNC=0 for all but the last pump
-        for i, pid in enumerate(selected):
-            m = state.motor(pid)
-            sy = state.syringe(pid)
-            travel_mm = volume_to_mm(volumes[pid], sy)
-            dsign = _dispense_sign(m)
-            pos = dsign * travel_mm
-            is_last = (i == len(selected) - 1)
-
-            print(f"    {state.pump_label(pid)}: "
-                  f"{volumes[pid]:.3f} ml ...", end="", flush=True)
-            pump_move(sock, pid, position=pos, speed=speed,
-                      sync=is_last)
-            if is_last:
-                print(" done (all pumps)")
-            else:
-                print(" started")
-
-        _dwell(state)
-
-        # Retract all
-        for i, pid in enumerate(selected):
-            is_last = (i == len(selected) - 1)
-            retract_speed = state.motor(pid).max_retract_speed_mm_s
-            pump_move(sock, pid, position=0.0, speed=retract_speed,
-                      sync=is_last)
-
+        _do_simultaneous_dispense(state, selected, volumes, speed)
         for pid in selected:
             pump_disable(sock, pid)
     else:
@@ -758,7 +803,7 @@ def control_multi_pump(state: SessionState) -> None:
 
 
 def control_purge(state: SessionState) -> None:
-    """Control 5: flush the mixing manifold with IPA."""
+    """Control 5: flush the mixing manifold with IPA (full syringe)."""
     print("\n" + "=" * 60)
     print("  CONTROL: PURGE (manifold flush)")
     print("=" * 60)
@@ -768,18 +813,41 @@ def control_purge(state: SessionState) -> None:
         print("  !! No pump with fluid='purge' found in config.")
         return
 
-    default_vol = state.pumps_cfg.manifold_purge_volume_ml
-    volume = _input_float("Purge volume (ml)", default_vol)
-    speed = _input_float(
-        "Speed (mm/s)",
-        state.motor(purge_pid).max_dispense_speed_mm_s,
-    )
+    sy = state.syringe(purge_pid)
+    volume = sy.volume_ml
+    speed = _input_float("Speed (mm/s)", 0.5)
     if not _check_homing(state, [purge_pid]):
         return
 
-    print(f"\n  Purging with {state.pump_label(purge_pid)} ...")
+    print(f"\n  Purging full syringe ({volume:.2f} ml) "
+          f"with {state.pump_label(purge_pid)} ...")
     _do_dispense(state, purge_pid, volume, speed)
     print("\n  Purge complete.")
+
+
+def control_fill(state: SessionState) -> None:
+    """Control 6: retract plunger(s) fully to fill syringes."""
+    print("\n" + "=" * 60)
+    print("  CONTROL: FILL (retract plunger)")
+    print("=" * 60)
+
+    selected = _select_pumps(state, "Which pumps to fill?")
+    speed = _input_float("Retract speed (mm/s)", 2.0)
+    if not _check_homing(state, selected):
+        return
+
+    sock = state.ensure_connected()
+    for pid in selected:
+        m = state.motor(pid)
+        sy = state.syringe(pid)
+        print(f"\n  Filling {state.pump_label(pid)} "
+              f"({sy.volume_ml:.2f} ml) ...", end="", flush=True)
+        pump_enable(sock, pid)
+        pump_move(sock, pid, position=0.0, speed=speed)
+        print(" done")
+        pump_disable(sock, pid)
+
+    print("\n  Fill complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -799,7 +867,7 @@ def calibrate_volume(state: SessionState) -> None:
     print("=" * 60)
 
     target_vol = _input_float("Target volume to dispense (ml)", 0.5)
-    speed = _input_float("Speed (mm/s)", 2.0)
+    speed = _input_float("Speed (mm/s)", 0.5)
 
     selected = _select_pumps(
         state, "Which pumps to calibrate?", allow_all=True,
@@ -815,7 +883,11 @@ def calibrate_volume(state: SessionState) -> None:
         print(f"  Current: {sy.volume_ml} ml / {sy.plunger_travel_mm} mm "
               f"({sy.mm_per_ml:.2f} mm/ml)")
 
-        _do_dispense(state, pid, target_vol, speed)
+        _do_dispense_no_retract(state, pid, target_vol, speed)
+
+        if not _input_bool("Enter measured volume?", default=True):
+            print("  Skipped measurement.")
+            continue
 
         measured = _input_float(
             "Measured volume output (ml)", target_vol
@@ -824,10 +896,6 @@ def calibrate_volume(state: SessionState) -> None:
             print("  !! Measured volume must be > 0. Skipping.")
             continue
 
-        # Correction: if we asked for target_vol but got measured,
-        # the effective mm_per_ml is different from config.
-        # current mm_per_ml = plunger_travel_mm / volume_ml
-        # actual mm_per_ml = (travel_used_mm) / measured
         travel_used = volume_to_mm(target_vol, sy)
         actual_mm_per_ml = travel_used / measured
         corrected_travel = actual_mm_per_ml * sy.volume_ml
@@ -906,7 +974,7 @@ def calibrate_mixing(state: SessionState) -> None:
         ratios = {k: v / ratio_sum for k, v in ratios.items()}
 
     total_vol = _input_float("Total volume (ml)", 1.0)
-    speed = _input_float("Speed (mm/s)", 2.0)
+    speed = _input_float("Speed (mm/s)", 0.5)
 
     if not _check_homing(state, ink_ids):
         return
@@ -921,36 +989,9 @@ def calibrate_mixing(state: SessionState) -> None:
     if not _input_bool("Proceed with dispensing?"):
         return
 
-    sock = state.ensure_connected()
-
-    # Dispense simultaneously
-    print("\n  Dispensing simultaneously ...")
+    _do_simultaneous_dispense(state, ink_ids, pump_volumes, speed, retract=False)
     for pid in ink_ids:
-        pump_enable(sock, pid)
-        pump_set_position(sock, pid, 0.0)
-
-    for i, pid in enumerate(ink_ids):
-        m = state.motor(pid)
-        sy = state.syringe(pid)
-        travel_mm = volume_to_mm(pump_volumes[pid], sy)
-        dsign = _dispense_sign(m)
-        pos = dsign * travel_mm
-        is_last = (i == len(ink_ids) - 1)
-
-        pump_move(sock, pid, position=pos, speed=speed, sync=is_last)
-
-    print("  Dispensing complete.")
-    _dwell(state)
-
-    # Retract all simultaneously, then disable
-    for i, pid in enumerate(ink_ids):
-        is_last = (i == len(ink_ids) - 1)
-        retract_speed = state.motor(pid).max_retract_speed_mm_s
-        pump_move(sock, pid, position=0.0, speed=retract_speed,
-                  sync=is_last)
-
-    for pid in ink_ids:
-        pump_disable(sock, pid)
+        pump_disable(state.ensure_connected(), pid)
 
     # Record result
     label = _input("Label for this mix (e.g. MIX_001)", "")
@@ -1026,6 +1067,7 @@ _CONTROLS = [
     ("3", "Individual pump",  control_individual_pump),
     ("4", "Multi-pump",       control_multi_pump),
     ("5", "Purge",            control_purge),
+    ("6", "Fill",             control_fill),
 ]
 
 _CALIBRATIONS = [

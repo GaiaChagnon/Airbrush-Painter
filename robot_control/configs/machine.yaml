@@ -114,8 +114,8 @@ file_execution:
   gcode_directory: /home/klipper/gcode_files
 pumps:
   enabled: true
-  backlash_purge_mm: 0.5          # mm, plunger advance after homing to eliminate backlash
-  manifold_purge_volume_ml: 0.5   # ml, IPA volume to flush mixing manifold (tune after testing)
+  backlash_purge_mm: 0.5
+  manifold_purge_volume_ml: 0.5
   stepper:
     motor_type: 1.8deg
     full_steps_per_rotation: 200
@@ -128,7 +128,7 @@ pumps:
     direction_reversal_pause_s: 0.3
   syringe:
     volume_ml: 1.0
-    plunger_travel_mm: 16.0
+    plunger_travel_mm: 16.5
   motors:
     pump_0:
       fluid: cyan
@@ -145,6 +145,9 @@ pumps:
       home_backoff_mm: 0.5
       max_dispense_speed_mm_s: 4.0
       max_retract_speed_mm_s: 2.0
+      syringe:
+        plunger_travel_mm: 18.0636
+        volume_ml: 1.0
     pump_1:
       fluid: magenta
       octopus_slot: Motor 4
