@@ -22,17 +22,18 @@ Phases
 
 Usage::
 
-    python robot_control/scripts/test_motors.pypython robot_control/scripts/test_motors.py
-    python robot_control/scripts/test_pumps.py --test spin
-    python robot_control/scripts/test_pumps.py --test cycle --cycles 10
-    python robot_control/scripts/test_pumps.py --test dispense --volume 0.25
-    python robot_control/scripts/test_pumps.py --pump pump_0 --speed 3
+    .venv/bin/python robot_control/scripts/test_pumps.py
+    .venv/bin/python robot_control/scripts/test_pumps.py --test spin
+    .venv/bin/python robot_control/scripts/test_pumps.py --test cycle --cycles 10
+    .venv/bin/python robot_control/scripts/test_pumps.py --test dispense --volume 0.25
+    .venv/bin/python robot_control/scripts/test_pumps.py --pump pump_0 --speed 3
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import socket
 import sys
 import time
 from pathlib import Path
@@ -49,8 +50,10 @@ from robot_control.configs.loader import (
 )
 from robot_control.configs.printer_cfg import generate_pump_test_cfg
 from robot_control.hardware.pump_control import (
+    ETX,
     PRINTER_CFG_PATH,
     emergency_disable,
+    mm_to_volume,
     pump_disable,
     pump_enable,
     pump_home,
@@ -61,7 +64,6 @@ from robot_control.hardware.pump_control import (
     restart_klipper,
     stdin_has_data,
     volume_to_mm,
-    mm_to_volume,
     wait_for_ready,
 )
 

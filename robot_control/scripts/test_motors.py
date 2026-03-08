@@ -28,10 +28,10 @@ Motor parameters (read from machine.yaml at startup)
 
 Usage::
 
-    python robot_control/scripts/test_motors.py
-    python robot_control/scripts/test_motors.py --skip-motor1
-    python robot_control/scripts/test_motors.py --endstops-only
-    python robot_control/scripts/test_motors.py --speed 60
+    .venv/bin/python robot_control/scripts/test_motors.py
+    .venv/bin/python robot_control/scripts/test_motors.py --skip-motor1
+    .venv/bin/python robot_control/scripts/test_motors.py --endstops-only
+    .venv/bin/python robot_control/scripts/test_motors.py --speed 60
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ from pathlib import Path
 
 # Ensure the project root is on sys.path so `robot_control` and `src`
 # are importable when this script is invoked directly
-# (e.g. `python robot_control/scripts/test_motors.py`).
+# (e.g. `.venv/bin/python robot_control/scripts/test_motors.py`).
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)

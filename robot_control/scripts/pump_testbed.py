@@ -9,8 +9,8 @@ All machine parameters come from ``machine.yaml``; nothing is hardcoded.
 
 Usage::
 
-    python robot_control/scripts/pump_testbed.py
-    python robot_control/scripts/pump_testbed.py --no-config-write
+    .venv/bin/python robot_control/scripts/pump_testbed.py
+    .venv/bin/python robot_control/scripts/pump_testbed.py --no-config-write
 """
 
 from __future__ import annotations

@@ -519,218 +519,123 @@ def calibrate_endstop_phase(
 
 
 # ---------------------------------------------------------------------------
-# Servo test / calibration
+# Digital output tests (Arduino servos + solenoid valve)
 # ---------------------------------------------------------------------------
 
 
-def _query_servo_status(
+def _set_pin(
     client: KlipperClient,
-    servo_name: str,
-) -> dict[str, Any] | None:
-    """Query Klipper for the live state of a ``[servo]`` object.
+    pin_name: str,
+    value: int,
+) -> None:
+    """Set a Klipper ``[output_pin]`` HIGH (1) or LOW (0).
 
-    Returns
-    -------
-    dict or None
-        ``{"value": <duty>, "...": ...}`` if the object exists, else
-        ``None`` (object not loaded / Klipper doesn't expose it).
+    Parameters
+    ----------
+    pin_name : str
+        Name of the output pin as defined in ``printer.cfg``
+        (e.g. ``"servo_pump_refill"``).
+    value : int
+        ``1`` for HIGH, ``0`` for LOW.
+
+    Raises
+    ------
+    GCodeError
+        If Klipper rejects the command.
     """
-    try:
-        result = client._send_request(
-            "objects/query",
-            {"objects": {f"servo {servo_name}": None}},
-            timeout=5.0,
+    client.send_gcode(f"SET_PIN PIN={pin_name} VALUE={value}", timeout=5.0)
+    logger.info("SET_PIN %s VALUE=%d", pin_name, value)
+
+
+def _get_digital_output(
+    config: MachineConfig,
+    name: str,
+) -> Any:
+    """Look up a digital output by name from the config.
+
+    Raises
+    ------
+    RuntimeError
+        If digital_outputs is not configured or *name* is missing.
+    """
+    if not config.digital_outputs or name not in config.digital_outputs:
+        raise RuntimeError(
+            f"Digital output '{name}' not found in machine.yaml.  "
+            f"Available: {list((config.digital_outputs or {}).keys())}"
         )
-        return result.get("status", {}).get(f"servo {servo_name}")
-    except Exception:
-        return None
+    return config.digital_outputs[name]
 
 
-def test_servo(
+def test_digital_output(
     client: KlipperClient,
     config: MachineConfig,
+    output_name: str,
+    cycles: int = 3,
+    on_time_s: float = 2.0,
+    off_time_s: float = 1.0,
 ) -> dict[str, Any]:
-    """Exercise the servo through its full range.
+    """Toggle a digital output on/off for *cycles* repetitions.
 
-    Phases
-    ------
-    0. **Direct PWM diagnostic** -- sends raw pulse widths to the pin so
-       the user can confirm the hardware responds *before* the angle sweep.
-    1. **Slow sweep** 0 -> max in 10 steps.
-    2. **Slow sweep back** max -> 0 in 10 steps.
-    3. **Key positions** (0/45/90/135/180/225/270).
-    4. **Fast jumps** 0 <-> max (10 toggles).
-    5. **Return to neutral**.
-
-    Uses Klipper ``SET_SERVO SERVO=<name> ANGLE=<deg>`` and
-    ``SET_SERVO SERVO=<name> WIDTH=<seconds>``.
+    Useful for verifying that an Arduino-controlled servo responds
+    to its input pin, or that a solenoid valve actuates.
 
     Parameters
     ----------
     client : KlipperClient
         Connected Klipper API handle.
     config : MachineConfig
-        Machine configuration (must have ``servo`` populated).
+        Machine configuration with ``digital_outputs`` populated.
+    output_name : str
+        Key in ``digital_outputs`` (e.g. ``"servo_pump_refill"``).
+    cycles : int
+        Number of ON/OFF toggle cycles.
+    on_time_s : float
+        Seconds to hold the output HIGH per cycle.
+    off_time_s : float
+        Seconds to hold the output LOW between cycles.
 
     Returns
     -------
     dict
-        ``servo_name``, ``angle_range_deg``, ``positions_visited``,
-        ``elapsed_s``, and ``phase0_passed`` (bool).
+        ``output_name``, ``pin``, ``cycles``, ``elapsed_s``.
 
     Raises
     ------
     RuntimeError
-        If no servo is configured in ``machine.yaml``.
-    GCodeError
-        If Klipper rejects a SET_SERVO command.
+        If the requested output is not configured.
     """
-    sv = config.servo
-    if sv is None:
-        raise RuntimeError(
-            "No servo configured in machine.yaml.  "
-            "Enable 'servos' and set pin/pulse parameters."
-        )
+    out_cfg = _get_digital_output(config, output_name)
 
-    max_angle = sv.angle_range_deg
-    neutral = sv.neutral_angle_deg
-    name = sv.name
-
-    def _send_servo(cmd: str) -> str:
-        """Send a SET_SERVO command and return any Klipper console output."""
-        try:
-            output = client.send_gcode_with_output(cmd, timeout=5.0)
-            logger.info("Servo cmd OK: %s", cmd)
-            return output.strip()
-        except GCodeError as exc:
-            logger.error("Servo cmd FAILED: %s -> %s", cmd, exc)
-            raise
-
-    def set_angle(angle: float) -> None:
-        _send_servo(f"SET_SERVO SERVO={name} ANGLE={angle:.1f}")
-
-    def set_width(width_s: float) -> None:
-        _send_servo(f"SET_SERVO SERVO={name} WIDTH={width_s:.6f}")
-
-    # -- Header ------------------------------------------------------------
-    logger.info("Starting servo test (%s, %.0f deg range)", name, max_angle)
+    logger.info("Testing digital output: %s (pin %s)", output_name, out_cfg.pin)
     print(f"\n{'='*60}")
-    print(f"  SERVO TEST  ({name}, 0-{max_angle:.0f} deg)")
+    print(f"  DIGITAL OUTPUT TEST: {output_name}")
     print(f"{'='*60}")
-    print(f"  Pin:     {sv.pin}")
-    print(f"  Pulse:   {sv.min_pulse_width_s*1e6:.0f} - "
-          f"{sv.max_pulse_width_s*1e6:.0f} us")
-    print(f"  Neutral: {neutral:.1f} deg "
-          f"({sv.neutral_pulse_width_s*1e6:.0f} us)")
+    print(f"  Pin:         {out_cfg.pin}")
+    print(f"  Description: {out_cfg.description}")
+    print(f"  Cycles:      {cycles}  (ON {on_time_s}s / OFF {off_time_s}s)")
     print()
 
-    # -- Phase 0: direct PWM diagnostic -----------------------------------
-    # Bypasses angle mapping; sends exact pulse widths so we can confirm
-    # that the MCU is actually toggling the pin and the servo hardware
-    # responds.
-    print("  Phase 0: Direct PWM diagnostic (raw pulse widths)")
-
-    servo_status = _query_servo_status(client, name)
-    if servo_status is not None:
-        logger.info("Klipper servo object found: %s", servo_status)
-        print(f"    Servo object loaded in Klipper: YES  "
-              f"(value={servo_status.get('value', '?')})")
-    else:
-        print("    Servo object loaded in Klipper: "
-              "could not query (non-fatal)")
-
-    phase0_passed = True
-    test_widths = [
-        (sv.neutral_pulse_width_s, "neutral"),
-        (sv.min_pulse_width_s, "min (0 deg)"),
-        (sv.max_pulse_width_s, "max ({:.0f} deg)".format(max_angle)),
-        (sv.neutral_pulse_width_s, "neutral (return)"),
-    ]
-    for pw_s, label in test_widths:
-        pw_us = pw_s * 1e6
-        print(f"    -> WIDTH={pw_s:.6f} ({pw_us:.0f} us, {label})")
-        try:
-            set_width(pw_s)
-        except GCodeError as exc:
-            print(f"       FAILED: {exc}")
-            phase0_passed = False
-            break
-        time.sleep(2.0)
-
-    if phase0_passed:
-        print("    Phase 0 OK -- if servo did NOT move, check:")
-        print(f"      1. Wiring: signal wire on pin {sv.pin}")
-        print("      2. Power: 5V/6V to servo VCC (not just signal)")
-        print("      3. Pin mapping: verify PB6 matches your board rev "
-              "(STM32H723 Octopus)")
-        print("      4. Klipper log (/tmp/klippy.log) for PWM errors")
-    else:
-        print("    Phase 0 FAILED -- Klipper rejected the command.")
-        print("    Aborting remaining phases.")
-        summary: dict[str, Any] = {
-            "servo_name": name,
-            "angle_range_deg": max_angle,
-            "positions_visited": 0,
-            "elapsed_s": 0.0,
-            "phase0_passed": False,
-        }
-        print(format_calibration_summary(summary))
-        return summary
-
-    print()
-    positions_visited: list[float] = []
+    _set_pin(client, output_name, 0)
     t_start = time.monotonic()
 
-    # -- Phase 1: slow sweep 0 -> max (10 steps, 0.8 s each) --------------
-    print("  Phase 1: Slow sweep 0 -> max...")
-    steps = 10
-    for i in range(steps + 1):
-        angle = max_angle * i / steps
-        set_angle(angle)
-        positions_visited.append(angle)
-        time.sleep(0.8)
+    for i in range(cycles):
+        print(f"  Cycle {i + 1}/{cycles}: ON  ...", end="", flush=True)
+        _set_pin(client, output_name, 1)
+        time.sleep(on_time_s)
 
-    # -- Phase 2: slow sweep max -> 0 (10 steps, 0.8 s each) --------------
-    print("  Phase 2: Slow sweep max -> 0...")
-    for i in range(steps + 1):
-        angle = max_angle * (1.0 - i / steps)
-        set_angle(angle)
-        positions_visited.append(angle)
-        time.sleep(0.8)
-
-    # -- Phase 3: key positions (7 angles, 0.7 s each) --------------------
-    print("  Phase 3: Key positions (0/45/90/135/180/225/270)...")
-    key_angles = [a for a in [0, 45, 90, 135, 180, 225, 270]
-                  if a <= max_angle]
-    for angle in key_angles:
-        set_angle(angle)
-        positions_visited.append(angle)
-        time.sleep(0.7)
-
-    # -- Phase 4: fast jumps (10 toggles, 0.3 s each) ---------------------
-    print("  Phase 4: Fast jumps (0 <-> max)...")
-    for i in range(10):
-        angle = 0.0 if i % 2 == 0 else max_angle
-        set_angle(angle)
-        positions_visited.append(angle)
-        time.sleep(0.3)
-
-    # -- Phase 5: return to neutral ----------------------------------------
-    print("  Phase 5: Return to neutral...")
-    set_angle(neutral)
-    positions_visited.append(neutral)
-    time.sleep(1.0)
+        print(f"  OFF", flush=True)
+        _set_pin(client, output_name, 0)
+        if i < cycles - 1:
+            time.sleep(off_time_s)
 
     elapsed = time.monotonic() - t_start
-    print(f"\n  Servo test complete.  {len(positions_visited)} moves "
-          f"in {elapsed:.1f} s")
+    print(f"\n  Test complete.  {cycles} cycles in {elapsed:.1f} s")
 
-    summary = {
-        "servo_name": name,
-        "angle_range_deg": max_angle,
-        "positions_visited": len(positions_visited),
+    summary: dict[str, Any] = {
+        "output_name": output_name,
+        "pin": out_cfg.pin,
+        "cycles": cycles,
         "elapsed_s": round(elapsed, 1),
-        "phase0_passed": phase0_passed,
     }
     print(format_calibration_summary(summary))
     return summary

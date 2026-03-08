@@ -296,18 +296,35 @@ def generate_printer_cfg(config: MachineConfig) -> str:
                     f"[endstop_phase stepper_{axis_name}]\n"
                 )
 
-    # -- [servo] (optional) ------------------------------------------------
-    if config.servo is not None:
-        sv = config.servo
-        lines.append(
-            f"# --- Servo ({sv.name}, {sv.angle_range_deg:.0f} deg) ---\n"
-            f"[servo {sv.name}]\n"
-            f"pin: {sv.pin}\n"
-            f"maximum_servo_angle: {sv.angle_range_deg:g}\n"
-            f"minimum_pulse_width: {sv.min_pulse_width_s:.6f}\n"
-            f"maximum_pulse_width: {sv.max_pulse_width_s:.6f}\n"
-            f"initial_angle: {sv.neutral_angle_deg:.1f}\n"
-        )
+    # -- [output_pin] for digital outputs (optional) -----------------------
+    if config.digital_outputs:
+        for out_name, out_cfg in config.digital_outputs.items():
+            lines.append(
+                f"# --- {out_cfg.description or out_name} ---\n"
+                f"[output_pin {out_name}]\n"
+                f"pin: {out_cfg.pin}\n"
+                f"value: 0\n"
+            )
+
+    # -- [manual_stepper] for pumps (optional) ------------------------------
+    if config.pumps is not None:
+        ps = config.pumps.stepper
+        enable_prefix = "!" if ps.enable_pin_inverted else ""
+        for pid, pump in config.pumps.motors.items():
+            raw_enable = pump.pins.enable.lstrip("!")
+            lines.append(
+                f"# --- Pump: {pid} ({pump.fluid}, {pump.octopus_slot}) ---\n"
+                f"[manual_stepper {pid}]\n"
+                f"step_pin: {pump.pins.step}\n"
+                f"dir_pin: {pump.pins.dir}\n"
+                f"enable_pin: {enable_prefix}{raw_enable}\n"
+                f"microsteps: {ps.klipper_microsteps}\n"
+                f"full_steps_per_rotation: {ps.full_steps_per_rotation}\n"
+                f"rotation_distance: {ps.rotation_distance}\n"
+                f"step_pulse_duration: "
+                f"{_fmt_pulse_duration(ps.step_pulse_duration_s)}\n"
+                f"endstop_pin: {_pump_endstop_pin_str(pump)}\n"
+            )
 
     # -- [bed_mesh] (optional) ---------------------------------------------
     if config.bed_mesh is not None:

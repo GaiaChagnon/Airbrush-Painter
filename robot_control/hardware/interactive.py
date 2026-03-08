@@ -1,8 +1,8 @@
 """Interactive controller -- keyboard-driven manual control.
 
 Provides a terminal UI (Python ``curses``) for jog control, tool
-selection, homing, and single-stroke execution.  This is the primary
-interface during machine setup and calibration.
+selection, pump operation, and digital output toggling.  This is the
+primary interface during machine setup and calibration.
 
 Key map (configurable increments via ``machine.yaml``):
 
@@ -15,13 +15,22 @@ Key map (configurable increments via ``machine.yaml``):
     U            -- tool up (raise)
     D            -- tool down (lower)
     O            -- move to canvas origin
-    Space        -- execute next stroke (step mode)
+    G            -- go to absolute X Y Z
+    1            -- toggle pump refill servo (PB6)
+    2            -- toggle airbrush needle servo (PB7)
+    V            -- toggle air supply valve (PG15)
+    F            -- cycle active pump (pump_0 .. pump_3)
+    [            -- pump dispense (push plunger by jog step mm)
+    ]            -- pump retract (pull plunger by jog step mm)
+    \\            -- home selected pump
     Esc          -- EMERGENCY STOP
     Q            -- quit
 
 Safety:
+    - Motors are NOT enabled on startup.  Press H to home first.
     - Every jog command checks soft limits before sending.
     - Tool-down requires homed state.
+    - Pump steppers are disabled immediately after each move.
     - E-stop via Esc calls ``emergency_stop()`` (bypasses G-code queue).
     - All jog moves use ``wait=True`` (one move at a time, no pile-up).
 """
@@ -32,7 +41,7 @@ import curses
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from robot_control.configs.loader import MachineConfig
@@ -55,6 +64,8 @@ class ControllerState:
     jog_increment: float
     homed: bool
     status: str
+    output_states: dict[str, bool] = field(default_factory=dict)
+    active_pump: str = ""
 
 
 class InteractiveController:
@@ -80,9 +91,22 @@ class InteractiveController:
         self._tool: Literal["pen", "airbrush"] = "pen"
         self._tool_up = True
         self._homed = False
-        self._status = "Ready"
+        self._status = "Ready -- press H to home"
         self._position: Position | None = None
         self._running = False
+
+        # Digital output toggle states
+        self._output_states: dict[str, bool] = {}
+        if config.digital_outputs:
+            for name in config.digital_outputs:
+                self._output_states[name] = False
+
+        # Pump selection
+        self._pump_ids: list[str] = []
+        if config.pumps:
+            self._pump_ids = list(config.pumps.motors.keys())
+        self._pump_idx = 0
+        self._active_pump: str = self._pump_ids[0] if self._pump_ids else ""
 
         # Jog increments from config
         self._increments = list(config.interactive.jog_increments_mm)
@@ -116,12 +140,6 @@ class InteractiveController:
             target=self._poll_position, args=(poll_stop,), daemon=True,
         )
         poll_thread.start()
-
-        # Auto-home on startup
-        if not self._homed:
-            self._status = "Homing on startup..."
-            self._draw(stdscr)
-            self._home()
 
         try:
             while self._running:
@@ -170,6 +188,20 @@ class InteractiveController:
             self._tool_down_cmd()
         elif key == ord("o") or key == ord("O"):
             self._goto_origin()
+        elif key == ord("1"):
+            self._toggle_output("servo_pump_refill")
+        elif key == ord("2"):
+            self._toggle_output("servo_airbrush_needle")
+        elif key == ord("v") or key == ord("V"):
+            self._toggle_output("air_valve")
+        elif key == ord("f") or key == ord("F"):
+            self._cycle_pump()
+        elif key == ord("["):
+            self._pump_dispense()
+        elif key == ord("]"):
+            self._pump_retract()
+        elif key == ord("\\"):
+            self._pump_home()
         elif key == ord("+") or key == ord("="):
             self._cycle_increment(1)
         elif key == ord("-") or key == ord("_"):
@@ -201,7 +233,6 @@ class InteractiveController:
             return True
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
-            # Trim long error messages for the status bar
             if len(msg) > 80:
                 msg = msg[:77] + "..."
             self._status = f"ERR: {msg}"
@@ -282,6 +313,131 @@ class InteractiveController:
             self._tool_up = False
             self._status = "Tool DOWN"
 
+    def _toggle_output(self, name: str) -> None:
+        """Toggle a digital output pin between HIGH and LOW."""
+        if not self._cfg.digital_outputs:
+            self._status = "No digital outputs configured"
+            return
+        if name not in self._cfg.digital_outputs:
+            self._status = f"Unknown output: {name}"
+            return
+
+        new_state = not self._output_states.get(name, False)
+        value = 1 if new_state else 0
+        if self._safe_gcode(
+            f"SET_PIN PIN={name} VALUE={value}", timeout=5.0,
+        ):
+            self._output_states[name] = new_state
+            label = "ON" if new_state else "OFF"
+            self._status = f"{name}: {label}"
+
+    # ------------------------------------------------------------------
+    # Pump controls
+    # ------------------------------------------------------------------
+
+    def _cycle_pump(self) -> None:
+        """Cycle the active pump selection."""
+        if not self._pump_ids:
+            self._status = "No pumps configured"
+            return
+        self._pump_idx = (self._pump_idx + 1) % len(self._pump_ids)
+        self._active_pump = self._pump_ids[self._pump_idx]
+        fluid = ""
+        if self._cfg.pumps:
+            motor = self._cfg.pumps.motors.get(self._active_pump)
+            if motor:
+                fluid = f" ({motor.fluid})"
+        self._status = f"Pump: {self._active_pump}{fluid}"
+
+    def _pump_move(self, distance_mm: float) -> None:
+        """Move the active pump by *distance_mm*, then disable the stepper.
+
+        Positive = dispense direction (away from home).
+        Negative = retract direction (toward home).
+        """
+        if not self._active_pump:
+            self._status = "No pumps configured"
+            return
+        if not self._cfg.pumps:
+            return
+
+        motor = self._cfg.pumps.motors.get(self._active_pump)
+        if not motor:
+            self._status = f"Pump {self._active_pump} not in config"
+            return
+
+        speed = motor.max_dispense_speed_mm_s
+        pid = self._active_pump
+
+        cmd = (
+            f"MANUAL_STEPPER STEPPER={pid} ENABLE=1\n"
+            f"MANUAL_STEPPER STEPPER={pid}"
+            f" MOVE={distance_mm:.4f} SPEED={speed}\n"
+            f"MANUAL_STEPPER STEPPER={pid} ENABLE=0"
+        )
+        direction = "dispense" if distance_mm > 0 else "retract"
+        if self._safe_gcode(cmd, timeout=30.0):
+            self._status = (
+                f"{pid} {direction} {abs(distance_mm):.3f} mm"
+            )
+
+    def _pump_dispense(self) -> None:
+        """Dispense from the active pump by the current jog increment."""
+        if not self._cfg.pumps:
+            self._status = "No pumps configured"
+            return
+        motor = self._cfg.pumps.motors.get(self._active_pump)
+        if not motor:
+            return
+        # Dispense direction is opposite to homing direction
+        sign = -motor.homing_direction
+        self._pump_move(sign * self.jog_increment)
+
+    def _pump_retract(self) -> None:
+        """Retract the active pump by the current jog increment."""
+        if not self._cfg.pumps:
+            self._status = "No pumps configured"
+            return
+        motor = self._cfg.pumps.motors.get(self._active_pump)
+        if not motor:
+            return
+        sign = motor.homing_direction
+        self._pump_move(sign * self.jog_increment)
+
+    def _pump_home(self) -> None:
+        """Home the active pump to its endstop, then disable."""
+        if not self._active_pump:
+            self._status = "No pumps configured"
+            return
+        if not self._cfg.pumps:
+            return
+
+        motor = self._cfg.pumps.motors.get(self._active_pump)
+        if not motor:
+            return
+
+        pid = self._active_pump
+        speed = motor.homing_speed_mm_s
+        # Homing direction: +1 or -1, determines STOP_ON_ENDSTOP polarity
+        stop_on = motor.homing_direction
+
+        self._status = f"Homing {pid}..."
+        cmd = (
+            f"MANUAL_STEPPER STEPPER={pid} ENABLE=1\n"
+            f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0\n"
+            f"MANUAL_STEPPER STEPPER={pid}"
+            f" MOVE={stop_on * 50} SPEED={speed}"
+            f" STOP_ON_ENDSTOP={stop_on}\n"
+            f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0\n"
+            f"MANUAL_STEPPER STEPPER={pid} ENABLE=0"
+        )
+        if self._safe_gcode(cmd, timeout=60.0):
+            self._status = f"{pid} homed"
+
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
+
     def _goto_position(self, stdscr: curses.window) -> None:
         """Prompt user for absolute X Y Z coordinates and move there.
 
@@ -293,7 +449,7 @@ class InteractiveController:
         stdscr.timeout(-1)
 
         h, _ = stdscr.getmaxyx()
-        row = min(13, h - 2)
+        row = min(18, h - 2)
         stdscr.addstr(row, 1, "Go to (e.g. x200 y150 z10): ")
         stdscr.clrtoeol()
         stdscr.refresh()
@@ -311,7 +467,6 @@ class InteractiveController:
             self._status = "Goto cancelled"
             return
 
-        # Parse tokens like "x200", "y150.5", "z10"
         wa = self._cfg.work_area
         parts = raw.lower().replace(",", " ").replace("=", "").split()
         gcode_parts = []
@@ -338,7 +493,6 @@ class InteractiveController:
                 self._status = f"Bad value: {token}"
                 return
 
-            # Bounds check
             limit = {"X": wa.x, "Y": wa.y, "Z": wa.z}.get(axis, 0)
             if val < 0 or val > limit:
                 self._status = f"Out of range: {axis}={val:.1f} (0..{limit:.0f})"
@@ -387,7 +541,7 @@ class InteractiveController:
         """Render the terminal UI."""
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        cw = min(w - 2, 60)  # content width
+        cw = min(w - 2, 68)
 
         pos = self._position
         px = f"{pos.x:.3f}" if pos else "---"
@@ -396,18 +550,36 @@ class InteractiveController:
 
         tool_state = "up" if self._tool_up else "DOWN"
 
+        # Build output status string
+        out_parts: list[str] = []
+        for name, state in self._output_states.items():
+            short = name.replace("servo_", "").replace("_", " ")
+            out_parts.append(f"{short}={'ON' if state else 'off'}")
+        out_line = "  ".join(out_parts) if out_parts else "none"
+
+        # Pump info
+        pump_info = self._active_pump or "none"
+        if self._active_pump and self._cfg.pumps:
+            motor = self._cfg.pumps.motors.get(self._active_pump)
+            if motor:
+                pump_info = f"{self._active_pump} ({motor.fluid})"
+
         lines = [
             f"{'INTERACTIVE CONTROL':^{cw}}",
             "-" * cw,
             f"  Position:  X: {px:>10}   Y: {py:>10}   Z: {pz:>10}",
             f"  Tool:      {self._tool.upper()} ({tool_state})",
             f"  Jog Step:  {self.jog_increment} mm",
+            f"  Pump:      {pump_info}",
+            f"  Outputs:   {out_line}",
             f"  State:     {self._status}",
             "-" * cw,
             "  [Arrows] Jog XY   [PgUp/Dn] Jog Z   [+/-] Step size",
             "  [H] Home XYZ      [P] Pen       [A] Airbrush",
             "  [U] Up            [D] Down      [O] Canvas origin",
             "  [G] Go to X Y Z   [Esc] E-STOP  [Q] Quit",
+            "  [1] Pump refill   [2] Needle    [V] Air valve",
+            "  [F] Cycle pump    [[] Dispense  []] Retract  [\\] Home pump",
         ]
 
         for row, line in enumerate(lines):

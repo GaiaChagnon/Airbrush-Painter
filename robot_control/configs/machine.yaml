@@ -221,11 +221,13 @@ bed_mesh:
     - 0.105556
 endstop_phase:
   enabled: true
-servos:
-  enabled: true
-  name: tool_servo
-  pin: PB6
-  angle_range_deg: 270.0
-  min_pulse_width_s: 0.0005
-  max_pulse_width_s: 0.0025
-  neutral_pulse_width_s: 0.0015
+digital_outputs:
+  servo_pump_refill:
+    pin: PB6
+    description: "Pump input refill enable (Arduino servo 1)"
+  servo_airbrush_needle:
+    pin: PB7
+    description: "Airbrush needle retract / spray enable (Arduino servo 2)"
+  air_valve:
+    pin: PG15
+    description: "Air supply solenoid valve (open/close)"

@@ -18,21 +18,21 @@ Three operating modes:
 Usage::
 
     # Line-tracing dry-run:
-    python robot_control/scripts/run_lineart_tracer.py \\
+    .venv/bin/python robot_control/scripts/run_lineart_tracer.py \\
         --image "Syringe Pump Drawing v1.png" --dry-run --save-preview
 
     # Hatched mode with gradient fill:
-    python robot_control/scripts/run_lineart_tracer.py \\
+    .venv/bin/python robot_control/scripts/run_lineart_tracer.py \\
         --mode hatched --image-path data/raw_images/hard/peakpx.jpg \\
         --dry-run --save-preview
 
     # Flow-imager mode:
-    python robot_control/scripts/run_lineart_tracer.py \\
+    .venv/bin/python robot_control/scripts/run_lineart_tracer.py \\
         --mode flow_imager --image-path data/raw_images/hard/peakpx.jpg \\
         --dry-run --save-preview
 
     # Execute on robot:
-    python robot_control/scripts/run_lineart_tracer.py \\
+    .venv/bin/python robot_control/scripts/run_lineart_tracer.py \\
         --image "Syringe Pump Drawing v1.png"
 """
 
@@ -47,13 +47,13 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import cv2
+import cv2  # type: ignore[import-not-found]
 import numpy as np
-import potrace
-import vpype
-from hatched.hatched import _build_hatch, _load_image
+import potrace  # type: ignore[import-not-found]
+import vpype  # type: ignore[import-not-found]
+from hatched.hatched import _build_hatch, _load_image  # type: ignore[import-not-found]
 from PIL import Image
-from vpype_flow_imager.vpype_flow_imager import draw_image as flow_draw_image
+from vpype_flow_imager.vpype_flow_imager import draw_image as flow_draw_image  # type: ignore[import-not-found]
 
 # ---------------------------------------------------------------------------
 # Project root and config loading
@@ -1321,10 +1321,10 @@ def _process_flow_imager(
 
     print("  [2/4] Generating flow-field streamlines...")
     try:
-        from vpype_flow_imager.vpype_flow_imager import HNSWSearcher
+        from vpype_flow_imager.vpype_flow_imager import HNSWSearcher  # type: ignore[import-not-found]
         searcher_class = HNSWSearcher
     except ImportError:
-        from vpype_flow_imager.kdtree import KDTSearcher
+        from vpype_flow_imager.kdtree import KDTSearcher  # type: ignore[import-not-found]
         searcher_class = KDTSearcher
 
     numpy_paths = flow_draw_image(

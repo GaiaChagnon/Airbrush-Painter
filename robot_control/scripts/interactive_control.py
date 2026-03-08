@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Launch the interactive terminal controller.
 
-Provides keyboard jog, tool control, and real-time position display.
+Provides keyboard jog, tool control, digital output toggling,
+and real-time position display.
 
 Usage::
 
-    python robot_control/scripts/interactive_control.py
-    python robot_control/scripts/interactive_control.py --socket /path/to/klippy_uds
+    .venv/bin/python robot_control/scripts/interactive_control.py
+    .venv/bin/python robot_control/scripts/interactive_control.py --socket /path/to/klippy_uds
 
 Controls::
 
@@ -15,7 +16,11 @@ Controls::
     G            Go to position    P              Select pen
     A            Select airbrush   U              Tool up
     D            Tool down         O              Canvas origin
-    Esc          E-STOP            Q              Quit
+    1            Pump refill servo  2             Needle servo
+    V            Air supply valve
+    F            Cycle pump         [              Dispense pump
+    ]            Retract pump       \\             Home pump
+    Esc          E-STOP             Q              Quit
 """
 
 from __future__ import annotations

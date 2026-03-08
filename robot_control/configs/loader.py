@@ -378,42 +378,27 @@ class PumpsConfig:
 
 
 @dataclass(frozen=True)
-class ServoConfig:
-    """Servo motor hardware parameters.
+class DigitalOutputConfig:
+    """A simple digital output pin (HIGH/LOW).
+
+    Used for Arduino-controlled servos (the STM32 drives a digital
+    input on the Arduino, which in turn drives the servo PWM) and
+    for solenoid valves controlled directly from the MCU.
 
     Parameters
     ----------
     name : str
-        Klipper servo identifier (used in ``SET_SERVO SERVO=<name>``).
+        Klipper output_pin identifier (used in
+        ``SET_PIN PIN=<name> VALUE=0|1``).
     pin : str
-        MCU output pin (PWM-capable), e.g. ``"PB6"``.
-    angle_range_deg : float
-        Total mechanical travel in degrees (e.g. 270 for a 270-degree servo).
-    min_pulse_width_s : float
-        Pulse width at 0 degrees, in seconds (e.g. 0.0005 = 500 us).
-    max_pulse_width_s : float
-        Pulse width at max angle, in seconds (e.g. 0.0025 = 2500 us).
-    neutral_pulse_width_s : float
-        Pulse width for the neutral / centre position, in seconds
-        (e.g. 0.0015 = 1500 us).
+        MCU output pin, e.g. ``"PB6"``, ``"PG15"``.
+    description : str
+        Human-readable purpose of this output.
     """
 
     name: str
     pin: str
-    angle_range_deg: float
-    min_pulse_width_s: float
-    max_pulse_width_s: float
-    neutral_pulse_width_s: float
-
-    @property
-    def neutral_angle_deg(self) -> float:
-        """Angle corresponding to the neutral pulse width."""
-        pulse_range = self.max_pulse_width_s - self.min_pulse_width_s
-        frac = (
-            (self.neutral_pulse_width_s - self.min_pulse_width_s)
-            / pulse_range
-        )
-        return frac * self.angle_range_deg
+    description: str
 
 
 @dataclass(frozen=True)
@@ -436,7 +421,7 @@ class MachineConfig:
     file_execution: FileExecutionConfig
     pumps: PumpsConfig | None = None
     bed_mesh: BedMeshConfig | None = None
-    servo: ServoConfig | None = None
+    digital_outputs: dict[str, DigitalOutputConfig] | None = None
     endstop_phase_enabled: bool = False
 
     # -- Convenience helpers ------------------------------------------------
@@ -751,43 +736,48 @@ def _parse_bed_mesh(data: dict[str, Any]) -> BedMeshConfig | None:
     )
 
 
-def _parse_servo(data: dict[str, Any]) -> ServoConfig | None:
-    """Parse the optional ``servos`` section.
+def _parse_digital_outputs(
+    data: dict[str, Any],
+) -> dict[str, DigitalOutputConfig] | None:
+    """Parse the optional ``digital_outputs`` section.
 
-    Returns ``None`` when servos are disabled or absent.
+    Each key is an output name; value must contain ``pin`` and
+    optionally ``description``.
+
+    Returns
+    -------
+    dict[str, DigitalOutputConfig] | None
+        Mapping of output name to config, or ``None`` when the
+        section is absent or empty.
+
+    Raises
+    ------
+    ConfigError
+        If any entry is missing a ``pin`` field.
     """
-    if not data or not data.get("enabled", False):
+    if not data:
         return None
 
-    name = str(data.get("name", "tool_servo"))
-    pin = data.get("pin")
-    if not pin:
-        raise ConfigError("servos.pin is required when servos are enabled")
-
-    angle_range = float(data.get("angle_range_deg", 180.0))
-    if angle_range <= 0 or angle_range > 360:
-        raise ConfigError(
-            f"servos.angle_range_deg must be in (0, 360], got {angle_range}"
+    outputs: dict[str, DigitalOutputConfig] = {}
+    for name, entry in data.items():
+        if not isinstance(entry, dict):
+            raise ConfigError(
+                f"digital_outputs.{name} must be a mapping, "
+                f"got {type(entry).__name__}"
+            )
+        pin = entry.get("pin")
+        if not pin:
+            raise ConfigError(
+                f"digital_outputs.{name}.pin is required"
+            )
+        description = str(entry.get("description", ""))
+        outputs[name] = DigitalOutputConfig(
+            name=name,
+            pin=str(pin),
+            description=description,
         )
 
-    min_pw = float(data.get("min_pulse_width_s", 0.0005))
-    max_pw = float(data.get("max_pulse_width_s", 0.0025))
-    neutral_pw = float(data.get("neutral_pulse_width_s", 0.0015))
-
-    if not (min_pw < neutral_pw < max_pw):
-        raise ConfigError(
-            f"Servo pulse widths must satisfy min < neutral < max: "
-            f"{min_pw} < {neutral_pw} < {max_pw}"
-        )
-
-    return ServoConfig(
-        name=name,
-        pin=str(pin),
-        angle_range_deg=angle_range,
-        min_pulse_width_s=min_pw,
-        max_pulse_width_s=max_pw,
-        neutral_pulse_width_s=neutral_pw,
-    )
+    return outputs if outputs else None
 
 
 def _parse_axis(name: str, data: dict[str, Any]) -> AxisConfig:
@@ -1107,8 +1097,10 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
         # -- bed mesh (optional) --------------------------------------------
         bed_mesh = _parse_bed_mesh(data.get("bed_mesh", {}))
 
-        # -- servo (optional) -----------------------------------------------
-        servo = _parse_servo(data.get("servos", {}))
+        # -- digital outputs (optional) -------------------------------------
+        digital_outputs = _parse_digital_outputs(
+            data.get("digital_outputs", {}),
+        )
 
         # -- endstop phase (optional) ---------------------------------------
         ep_data = data.get("endstop_phase", {})
@@ -1129,7 +1121,7 @@ def load_config(path: str | Path | None = None) -> MachineConfig:
             file_execution=file_execution,
             pumps=pumps,
             bed_mesh=bed_mesh,
-            servo=servo,
+            digital_outputs=digital_outputs,
             endstop_phase_enabled=endstop_phase_enabled,
         )
 

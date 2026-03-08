@@ -24,16 +24,16 @@ Alignment workflow:
 Usage::
 
     # List available traced images:
-    python robot_control/scripts/run_tracer.py --list
+    .venv/bin/python robot_control/scripts/run_tracer.py --list
 
     # Trace a specific image:
-    python robot_control/scripts/run_tracer.py --image "peakpx (4)"
+    .venv/bin/python robot_control/scripts/run_tracer.py --image "peakpx (4)"
 
     # Dry-run (no robot, just stats):
-    python robot_control/scripts/run_tracer.py --image "peakpx (4)" --dry-run
+    .venv/bin/python robot_control/scripts/run_tracer.py --image "peakpx (4)" --dry-run
 
     # Custom Z and speeds:
-    python robot_control/scripts/run_tracer.py --image "peakpx (4)" \\
+    .venv/bin/python robot_control/scripts/run_tracer.py --image "peakpx (4)" \\
         --z-contact 70.0 --z-retract 1.5 --draw-speed 400
 """
 

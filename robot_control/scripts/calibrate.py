@@ -3,17 +3,36 @@
 
 Usage::
 
-    python robot_control/scripts/calibrate.py --steps-x       # X axis only
-    python robot_control/scripts/calibrate.py --steps-y       # Y axis only
-    python robot_control/scripts/calibrate.py --z-heights     # Z seesaw
-    python robot_control/scripts/calibrate.py --tool-offset   # Tool offset
-    python robot_control/scripts/calibrate.py --speed         # Speed calibration
-    python robot_control/scripts/calibrate.py --endstops      # Multi-cycle endstop test
-    python robot_control/scripts/calibrate.py --endstops --cycles 20
-    python robot_control/scripts/calibrate.py --endstop-phase # Klipper endstop phase cal
-    python robot_control/scripts/calibrate.py --servo         # Servo exercise (~30 s)
-    python robot_control/scripts/calibrate.py --bed-mesh      # Surface leveling
-    python robot_control/scripts/calibrate.py --bed-mesh --full-canvas
+    .venv/bin/python robot_control/scripts/calibrate.py --steps-x       # X axis only
+    .venv/bin/python robot_control/scripts/calibrate.py --steps-y       # Y axis only
+    .venv/bin/python robot_control/scripts/calibrate.py --z-heights     # Z seesaw
+    .venv/bin/python robot_control/scripts/calibrate.py --tool-offset   # Tool offset
+    .venv/bin/python robot_control/scripts/calibrate.py --speed         # Speed calibration
+    .venv/bin/python robot_control/scripts/calibrate.py --endstops      # Multi-cycle endstop test
+    .venv/bin/python robot_control/scripts/calibrate.py --endstops --cycles 20
+    .venv/bin/python robot_control/scripts/calibrate.py --endstop-phase # Klipper endstop phase cal
+    .venv/bin/python robot_control/scripts/calibrate.py --servo-refill  # Pump refill servo (PB6)
+    .venv/bin/python robot_control/scripts/calibrate.py --servo-needle  # Airbrush needle servo (PB7)
+    .venv/bin/python robot_control/scripts/calibrate.py --air-valve     # Air supply solenoid (PG15)
+    .venv/bin/python robot_control/scripts/calibrate.py --bed-mesh      # Surface leveling
+    .venv/bin/python robot_control/scripts/calibrate.py --bed-mesh --full-canvas
+
+CLI arguments::
+
+    --steps-x          Calibrate X steps/mm (rotation_distance)
+    --steps-y          Calibrate Y steps/mm (rotation_distance)
+    --z-heights        Calibrate Z heights (pen/airbrush work Z)
+    --tool-offset      Calibrate tool XY offset (pen vs airbrush)
+    --speed            Calibrate drawing speed (draw lines at increasing speeds)
+    --endstops         Multi-cycle endstop repeatability test
+    --cycles N         Number of home cycles for --endstops (default: 10)
+    --endstop-phase    Klipper ENDSTOP_PHASE_CALIBRATE
+    --servo-refill     Test pump refill servo (PB6, Arduino servo 1)
+    --servo-needle     Test airbrush needle retract servo (PB7, Arduino servo 2)
+    --air-valve        Test air supply solenoid valve (PG15)
+    --bed-mesh         Calibrate bed mesh (surface leveling)
+    --full-canvas      Probe full canvas area instead of paper bounds
+    --no-home          Skip homing (useful for output-only tests)
 """
 
 from __future__ import annotations
@@ -62,21 +81,28 @@ def main() -> None:
     parser.add_argument("--endstop-phase", action="store_true",
                         help="Run Klipper ENDSTOP_PHASE_CALIBRATE "
                         "(requires endstop_phase.enabled in config)")
-    parser.add_argument("--servo", action="store_true",
-                        help="Exercise servo through full range (~30 s)")
+    parser.add_argument("--servo-refill", action="store_true",
+                        help="Test pump refill servo "
+                        "(PB6, Arduino servo 1)")
+    parser.add_argument("--servo-needle", action="store_true",
+                        help="Test airbrush needle retract servo "
+                        "(PB7, Arduino servo 2)")
+    parser.add_argument("--air-valve", action="store_true",
+                        help="Test air supply solenoid valve (PG15)")
     parser.add_argument("--bed-mesh", action="store_true",
                         help="Calibrate bed mesh (surface leveling)")
     parser.add_argument("--full-canvas", action="store_true",
                         help="Probe the full canvas area instead of "
                         "paper bounds (only with --bed-mesh)")
     parser.add_argument("--no-home", action="store_true",
-                        help="Skip homing (useful for servo-only tests)")
+                        help="Skip homing (useful for output-only tests)")
     args = parser.parse_args()
 
     selected = any([
         args.steps_x, args.steps_y, args.z_heights,
         args.tool_offset, args.speed, args.endstops,
-        args.endstop_phase, args.servo, args.bed_mesh,
+        args.endstop_phase, args.servo_refill, args.servo_needle,
+        args.air_valve, args.bed_mesh,
     ])
     if not selected:
         parser.print_help()
@@ -135,8 +161,8 @@ def main() -> None:
         except Exception:
             pass  # OK if no mesh was loaded
 
-        # Determine whether homing is needed.  Servo-only runs don't
-        # require homed axes, so skip automatically (or via --no-home).
+        # Determine whether homing is needed.  Digital-output-only runs
+        # don't require homed axes, so skip automatically (or via --no-home).
         needs_axes = any([
             args.steps_x, args.steps_y, args.z_heights,
             args.tool_offset, args.speed, args.endstops,
@@ -144,7 +170,7 @@ def main() -> None:
         ])
         skip_home = args.no_home or not needs_axes
         if skip_home:
-            logger.info("Skipping homing (servo-only or --no-home)")
+            logger.info("Skipping homing (output-only or --no-home)")
         else:
             print("\nHoming all axes before calibration...")
             client.send_gcode("G28\nM400", timeout=60.0)
@@ -170,8 +196,20 @@ def main() -> None:
         if args.endstop_phase:
             routines.calibrate_endstop_phase(client, config)
 
-        if args.servo:
-            routines.test_servo(client, config)
+        if args.servo_refill:
+            routines.test_digital_output(
+                client, config, "servo_pump_refill",
+            )
+
+        if args.servo_needle:
+            routines.test_digital_output(
+                client, config, "servo_airbrush_needle",
+            )
+
+        if args.air_valve:
+            routines.test_digital_output(
+                client, config, "air_valve",
+            )
 
         if args.bed_mesh:
             config_path = Path(args.config) if args.config else None
