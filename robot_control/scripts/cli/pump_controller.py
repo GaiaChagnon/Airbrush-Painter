@@ -162,19 +162,25 @@ class _PumpSession:
             }
         return pump_diagram(states, self.valve_open_flag, self.needle_retracted)
 
-    def _build_log_panel(self) -> Panel:
+    def _build_log_panel(self, max_lines: int = 0) -> Panel:
         """Build the activity-log panel from the ring buffer.
 
-        Height adapts to terminal size so panels + log fill the screen
-        without overflow.
+        Parameters
+        ----------
+        max_lines : int
+            If > 0, cap at this many lines (used by ``render_screen``
+            for a compact view).  Otherwise, adapts to terminal height.
         """
-        term_h = self.console.height or 40
-        overhead = 12 + len(self.pump_ids)
-        if self._summary_panel:
-            overhead += 8
-        if self._progress_text:
-            overhead += 3
-        n_visible = max(4, term_h - overhead)
+        if max_lines > 0:
+            n_visible = max_lines
+        else:
+            term_h = self.console.height or 40
+            overhead = 12 + len(self.pump_ids)
+            if self._summary_panel:
+                overhead += 8
+            if self._progress_text:
+                overhead += 3
+            n_visible = max(4, term_h - overhead)
         lines = self._log_lines[-n_visible:]
 
         if not lines:
@@ -207,11 +213,10 @@ class _PumpSession:
         return Group(*parts)
 
     def render_screen(self) -> None:
-        """Clear terminal and render pump panel + compact recent log.
+        """Clear terminal and render pump panel + compact activity log.
 
-        The pump panel stays at the top.  Only the last few log lines
-        are shown as plain text so the prompt sits close to the panel.
-        The full scrollable log is reserved for Live mode.
+        Pump status stays at the top, a small log panel follows, and
+        the questionary prompt appears right below.
         """
         self.console.clear()
         self.console.print(self._build_pump_panel())
@@ -225,13 +230,7 @@ class _PumpSession:
             )
         if self._summary_panel:
             self.console.print(self._summary_panel)
-        recent = self._log_lines[-5:]
-        if recent:
-            for line in recent:
-                try:
-                    self.console.print(Text.from_markup(line))
-                except Exception:
-                    self.console.print(line)
+        self.console.print(self._build_log_panel(max_lines=6))
 
     # ------------------------------------------------------------------
     # Valve & safety (output to log buffer)
@@ -358,6 +357,75 @@ def _dispense_sign(m: PumpMotorConfig) -> int:
 
 
 # ======================================================================
+# Animated pump movement helper
+# ======================================================================
+
+
+def _run_animated_moves(
+    s: _PumpSession,
+    sock: socket.socket,
+    moves: list[tuple[str, float, float]],
+    live: Live,
+    accel: float = 100.0,
+) -> None:
+    """Run one or more pump moves with real-time position animation.
+
+    Parameters
+    ----------
+    moves : list of (pump_id, klipper_target, speed_mm_s)
+        Pumps to move.  Multiple entries run simultaneously (sync=False).
+    live : Live
+        Active Rich Live context for display updates.
+    accel : float
+        Stepper acceleration in mm/s^2.
+    """
+    if not moves:
+        return
+
+    starts: dict[str, float] = {}
+    ends: dict[str, float] = {}
+    durations: dict[str, float] = {}
+
+    for pid, target, speed in moves:
+        starts[pid] = s.pump_positions.get(pid, 0.0)
+        ends[pid] = abs(target)
+        dist = abs(ends[pid] - starts[pid])
+        # Overestimate by 10 % to cover accel/decel; M400 is the real sync
+        durations[pid] = (dist / speed * 1.1) if speed > 0 else 0.0
+        s.current_speeds[pid] = speed
+
+    simultaneous = len(moves) > 1
+    for i, (pid, target, speed) in enumerate(moves):
+        is_last = (i == len(moves) - 1) and not simultaneous
+        pump_move(sock, pid, target, speed, accel=accel, sync=is_last)
+
+    max_dur = max(durations.values(), default=0.0)
+    if max_dur < 0.05:
+        raw_gcode(sock, "M400")
+        for pid, target, speed in moves:
+            s.pump_positions[pid] = abs(target)
+            s.current_speeds[pid] = 0.0
+        live.update(s.build_live_renderable())
+        return
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < max_dur:
+        elapsed = time.monotonic() - t0
+        for pid, target, speed in moves:
+            dur = durations[pid]
+            frac = min(1.0, elapsed / dur) if dur > 0 else 1.0
+            s.pump_positions[pid] = starts[pid] + (ends[pid] - starts[pid]) * frac
+        live.update(s.build_live_renderable())
+        time.sleep(0.05)
+
+    raw_gcode(sock, "M400")
+    for pid, target, speed in moves:
+        s.pump_positions[pid] = abs(target)
+        s.current_speeds[pid] = 0.0
+    live.update(s.build_live_renderable())
+
+
+# ======================================================================
 # Core actions (unchanged logic, output to log buffer)
 # ======================================================================
 
@@ -407,7 +475,7 @@ def _check_homing(s: _PumpSession, pump_ids: list[str]) -> bool:
 
 
 def _do_dispense(s: _PumpSession, pid: str, volume_ml: float, speed: float) -> None:
-    """Dispense a volume and prompt before retracting."""
+    """Dispense a volume with animated progress and prompt before retract."""
     sock = s.ensure_connected()
     m, sy = s.motor(pid), s.syringe(pid)
     travel_mm = volume_to_mm(volume_ml, sy)
@@ -420,25 +488,30 @@ def _do_dispense(s: _PumpSession, pid: str, volume_ml: float, speed: float) -> N
         return
     pump_enable(sock, pid)
     pump_set_position(sock, pid, 0.0)
+    s.pump_positions[pid] = 0.0
 
-    s.current_speeds[pid] = speed
     s.log(
         f"  Dispensing {volume_ml:.3f} ml ({travel_mm:.4f} mm) at {speed:.2f} mm/s..."
     )
-    pump_move(sock, pid, position=pos, speed=speed)
-    s.pump_positions[pid] = abs(pos)
-    s.current_speeds[pid] = 0.0
+    s.console.clear()
+    with Live(
+        s.build_live_renderable(), console=s.console, refresh_per_second=10
+    ) as live:
+        _run_animated_moves(s, sock, [(pid, pos, speed)], live)
     s.log("  [green]Dispense complete.[/]")
     _dwell(s)
 
     s.render_screen()
     if _ask_confirm("Retract plunger?"):
         retract_speed = m.max_retract_speed_mm_s
-        s.current_speeds[pid] = retract_speed
         s.log(f"  Retracting at {retract_speed:.1f} mm/s...")
-        pump_move(sock, pid, position=0.0, speed=retract_speed)
-        s.pump_positions[pid] = 0.0
-        s.current_speeds[pid] = 0.0
+        s.console.clear()
+        with Live(
+            s.build_live_renderable(), console=s.console, refresh_per_second=10
+        ) as live:
+            _run_animated_moves(
+                s, sock, [(pid, 0.0, retract_speed)], live
+            )
         s.log("  [green]Retract complete.[/]")
 
     pump_disable(sock, pid)
@@ -463,14 +536,16 @@ def _do_dispense_no_retract(
         return 0.0
     pump_enable(sock, pid)
     pump_set_position(sock, pid, 0.0)
+    s.pump_positions[pid] = 0.0
 
-    s.current_speeds[pid] = speed
     s.log(
         f"  Dispensing {volume_ml:.3f} ml ({travel_mm:.4f} mm) at {speed:.2f} mm/s..."
     )
-    pump_move(sock, pid, position=pos, speed=speed)
-    s.pump_positions[pid] = abs(pos)
-    s.current_speeds[pid] = 0.0
+    s.console.clear()
+    with Live(
+        s.build_live_renderable(), console=s.console, refresh_per_second=10
+    ) as live:
+        _run_animated_moves(s, sock, [(pid, pos, speed)], live)
     s.log("  [green]Dispense complete (no retract).[/]")
 
     if disable_after:
@@ -507,20 +582,24 @@ def _do_simultaneous_dispense(
     for pid in pump_ids:
         pump_enable(sock, pid)
         pump_set_position(sock, pid, 0.0)
+        s.pump_positions[pid] = 0.0
 
-    for i, pid in enumerate(pump_ids):
+    dispense_moves: list[tuple[str, float, float]] = []
+    for pid in pump_ids:
         m = s.motor(pid)
         dsign = _dispense_sign(m)
         pos = dsign * travels[pid]
         pump_speed = travels[pid] / duration_s if duration_s > 0 else speed
-        is_last = i == len(pump_ids) - 1
-        s.current_speeds[pid] = pump_speed
         s.log(
             f"    {s.pump_label(pid)}: {volumes[pid]:.3f} ml at {pump_speed:.3f} mm/s"
         )
-        pump_move(sock, pid, position=pos, speed=pump_speed, sync=is_last)
-        s.pump_positions[pid] = abs(pos)
-        s.current_speeds[pid] = 0.0
+        dispense_moves.append((pid, pos, pump_speed))
+
+    s.console.clear()
+    with Live(
+        s.build_live_renderable(), console=s.console, refresh_per_second=10
+    ) as live:
+        _run_animated_moves(s, sock, dispense_moves, live)
 
     if not retract:
         return
@@ -530,14 +609,16 @@ def _do_simultaneous_dispense(
     if not _ask_confirm("Retract all plungers?"):
         return
 
-    retract_duration = max_travel / speed if speed > 0 else 1.0
-    for i, pid in enumerate(pump_ids):
-        retract_speed = travels[pid] / retract_duration if retract_duration > 0 else speed
-        is_last = i == len(pump_ids) - 1
-        s.current_speeds[pid] = retract_speed
-        pump_move(sock, pid, position=0.0, speed=retract_speed, sync=is_last)
-        s.pump_positions[pid] = 0.0
-        s.current_speeds[pid] = 0.0
+    retract_moves: list[tuple[str, float, float]] = []
+    for pid in pump_ids:
+        retract_speed = travels[pid] / duration_s if duration_s > 0 else speed
+        retract_moves.append((pid, 0.0, retract_speed))
+
+    s.console.clear()
+    with Live(
+        s.build_live_renderable(), console=s.console, refresh_per_second=10
+    ) as live:
+        _run_animated_moves(s, sock, retract_moves, live)
     s.log("  [green]Retract complete.[/]")
 
 
@@ -580,13 +661,8 @@ def _test_pump_juggle(s: _PumpSession) -> None:
                 s.set_progress(
                     f"  Juggling {pid} [bold][{i + 1}/{reps}][/]"
                 )
-                s.current_speeds[pid] = speed
-                pump_move(sock, pid, position=pos, speed=speed)
-                s.pump_positions[pid] = abs(pos)
-                pump_move(sock, pid, position=0.0, speed=speed)
-                s.pump_positions[pid] = 0.0
-                s.current_speeds[pid] = 0.0
-                live.update(s.build_live_renderable())
+                _run_animated_moves(s, sock, [(pid, pos, speed)], live)
+                _run_animated_moves(s, sock, [(pid, 0.0, speed)], live)
 
             pump_disable(sock, pid)
             s.set_progress("")
@@ -698,15 +774,12 @@ def _test_speed_ramp(s: _PumpSession) -> None:
                     f"  {pid}: [cyan]{spd} mm/s[/] (~{duration_s:.1f} s)"
                 )
                 pump_set_position(sock, pid, 0.0)
-                s.current_speeds[pid] = spd
-                pump_move(sock, pid, position=dispense_pos, speed=spd)
-                s.pump_positions[pid] = abs(dispense_pos)
-                s.current_speeds[pid] = 0.0
-                _dwell(s)
-                s.current_speeds[pid] = retract_speed
-                pump_move(sock, pid, position=0.0, speed=retract_speed)
                 s.pump_positions[pid] = 0.0
-                s.current_speeds[pid] = 0.0
+                _run_animated_moves(s, sock, [(pid, dispense_pos, spd)], live)
+                _dwell(s)
+                _run_animated_moves(
+                    s, sock, [(pid, 0.0, retract_speed)], live
+                )
                 _dwell(s)
                 s.log(f"    [cyan]{spd} mm/s[/] [green]OK[/]")
                 live.update(s.build_live_renderable())
@@ -751,15 +824,13 @@ def _test_repeatability(s: _PumpSession) -> None:
                 s.set_progress(
                     f"  Cycling {pid} [bold][{i + 1}/{cycles}][/]"
                 )
-                s.current_speeds[pid] = speed
-                pump_move(sock, pid, position=dispense_pos, speed=speed)
-                s.pump_positions[pid] = abs(dispense_pos)
-                s.current_speeds[pid] = 0.0
+                _run_animated_moves(
+                    s, sock, [(pid, dispense_pos, speed)], live
+                )
                 _dwell(s)
-                s.current_speeds[pid] = retract_speed
-                pump_move(sock, pid, position=0.0, speed=retract_speed)
-                s.pump_positions[pid] = 0.0
-                s.current_speeds[pid] = 0.0
+                _run_animated_moves(
+                    s, sock, [(pid, 0.0, retract_speed)], live
+                )
                 if i < cycles - 1:
                     _dwell(s)
                 live.update(s.build_live_renderable())
@@ -809,19 +880,13 @@ def _test_full_travel(s: _PumpSession) -> None:
             )
             pump_enable(sock, pid)
             s.set_progress(f"  {pid}: dispensing...")
-            s.current_speeds[pid] = speed
-            live.update(s.build_live_renderable())
-            pump_move(sock, pid, position=dispense_pos, speed=speed)
-            s.pump_positions[pid] = abs(dispense_pos)
-            s.current_speeds[pid] = 0.0
+            _run_animated_moves(
+                s, sock, [(pid, dispense_pos, speed)], live
+            )
             s.log(f"  {pid} dispense [green]done[/]")
             _dwell(s)
             s.set_progress(f"  {pid}: retracting...")
-            s.current_speeds[pid] = speed
-            live.update(s.build_live_renderable())
-            pump_move(sock, pid, position=0.0, speed=speed)
-            s.pump_positions[pid] = 0.0
-            s.current_speeds[pid] = 0.0
+            _run_animated_moves(s, sock, [(pid, 0.0, speed)], live)
             s.log(f"  {pid} retract [green]done[/]")
             pump_disable(sock, pid)
             s.set_progress("")
@@ -866,24 +931,10 @@ def _control_homing(s: _PumpSession) -> None:
 
 
 def _control_setup(s: _PumpSession) -> None:
-    s.log("[bold cyan]── Control: Backlash Purge ──[/]")
-    backlash = s.pumps_cfg.backlash_purge_mm
-    s.log(f"  Backlash purge distance: {backlash} mm (from config)")
+    s.log("[bold cyan]── Control: Home + Backlash Purge ──[/]")
     s.render_screen()
-    selected = _select_pumps(s, "Pumps to purge")
-    sock = s.ensure_connected()
-
-    for pid in selected:
-        m = s.motor(pid)
-        dsign = _dispense_sign(m)
-        purge_pos = dsign * backlash
-        s.log(f"  Purging backlash on [bold]{s.pump_label(pid)}[/]...")
-        pump_enable(sock, pid)
-        pump_set_position(sock, pid, 0.0)
-        pump_move(sock, pid, position=purge_pos, speed=1.0, accel=50.0)
-        pump_set_position(sock, pid, 0.0)
-        pump_disable(sock, pid)
-        s.log("  [green]Done. Position reset to 0.0 mm.[/]")
+    selected = _select_pumps(s, "Pumps to home + purge")
+    _do_homing(s, selected)
 
 
 def _control_individual_pump(s: _PumpSession) -> None:
@@ -935,6 +986,39 @@ def _control_purge(s: _PumpSession) -> None:
     _do_dispense(s, purge_pid, sy.volume_ml, speed)
 
 
+def _control_toggle_valve(s: _PumpSession) -> None:
+    """Toggle the refill valve open/closed."""
+    name = s.pumps_cfg.refill_valve_output
+    if not name:
+        s.log("  [red]No refill_valve_output configured.[/]")
+        return
+    if s.valve_open_flag:
+        s.close_valve()
+    else:
+        s.open_valve()
+
+
+def _control_toggle_needle(s: _PumpSession) -> None:
+    """Toggle the airbrush needle servo retracted/extended."""
+    name = s.pumps_cfg.needle_output if hasattr(s.pumps_cfg, "needle_output") else None
+    if not name:
+        outputs = s.cfg.digital_outputs or {}
+        for oname in outputs:
+            if "needle" in oname.lower():
+                name = oname
+                break
+    if not name:
+        s.log("  [red]No needle output configured.[/]")
+        return
+    sock = s.ensure_connected()
+    new_state = not s.needle_retracted
+    set_pin(sock, name, 1 if new_state else 0)
+    s.needle_retracted = new_state
+    label = "RETRACTED" if new_state else "EXTENDED"
+    s.log(f"  Needle [bold]{label}[/]")
+    s.app.session_log.log_action("pump", "needle", label)
+
+
 def _control_fill(s: _PumpSession) -> None:
     s.log("[bold cyan]── Control: Fill ──[/]")
     s.render_screen()
@@ -946,15 +1030,19 @@ def _control_fill(s: _PumpSession) -> None:
     s.open_valve()
     try:
         for pid in selected:
-            sy = s.syringe(pid)
-            s.log(
-                f"  Filling [bold]{s.pump_label(pid)}[/] ({sy.volume_ml:.2f} ml)..."
-            )
+            s.log(f"  Filling [bold]{s.pump_label(pid)}[/]...")
             pump_enable(sock, pid)
-            s.current_speeds[pid] = speed
-            pump_move(sock, pid, position=0.0, speed=speed)
-            s.pump_positions[pid] = 0.0
-            s.current_speeds[pid] = 0.0
+
+        fill_moves: list[tuple[str, float, float]] = [
+            (pid, 0.0, speed) for pid in selected
+        ]
+        s.console.clear()
+        with Live(
+            s.build_live_renderable(), console=s.console, refresh_per_second=10
+        ) as live:
+            _run_animated_moves(s, sock, fill_moves, live)
+
+        for pid in selected:
             s.log(f"  {pid} fill [green]done[/]")
             pump_disable(sock, pid)
     finally:
@@ -973,22 +1061,31 @@ def _control_valve_cycle(s: _PumpSession) -> None:
         return
     sock = s.ensure_connected()
 
+    # Fill all simultaneously
     s.open_valve()
     try:
         for pid in selected:
-            sy = s.syringe(pid)
             s.log(f"  Filling [bold]{s.pump_label(pid)}[/]...")
             pump_enable(sock, pid)
-            s.current_speeds[pid] = speed
-            pump_move(sock, pid, position=0.0, speed=speed)
-            s.pump_positions[pid] = 0.0
-            s.current_speeds[pid] = 0.0
+
+        fill_moves: list[tuple[str, float, float]] = [
+            (pid, 0.0, speed) for pid in selected
+        ]
+        s.console.clear()
+        with Live(
+            s.build_live_renderable(), console=s.console, refresh_per_second=10
+        ) as live:
+            _run_animated_moves(s, sock, fill_moves, live)
+
+        for pid in selected:
             s.log(f"  {pid} fill [green]done[/]")
             pump_disable(sock, pid)
     finally:
         s.close_valve()
     _dwell(s)
 
+    # Empty all simultaneously
+    empty_moves: list[tuple[str, float, float]] = []
     for pid in selected:
         m, sy = s.motor(pid), s.syringe(pid)
         dsign = _dispense_sign(m)
@@ -997,12 +1094,18 @@ def _control_valve_cycle(s: _PumpSession) -> None:
             continue
         s.log(f"  Emptying [bold]{s.pump_label(pid)}[/]...")
         pump_enable(sock, pid)
-        s.current_speeds[pid] = speed
-        pump_move(sock, pid, position=dispense_pos, speed=speed)
-        s.pump_positions[pid] = abs(dispense_pos)
-        s.current_speeds[pid] = 0.0
-        s.log(f"  {pid} empty [green]done[/]")
-        pump_disable(sock, pid)
+        empty_moves.append((pid, dispense_pos, speed))
+
+    if empty_moves:
+        s.console.clear()
+        with Live(
+            s.build_live_renderable(), console=s.console, refresh_per_second=10
+        ) as live:
+            _run_animated_moves(s, sock, empty_moves, live)
+
+        for pid, _, _ in empty_moves:
+            s.log(f"  {pid} empty [green]done[/]")
+            pump_disable(sock, pid)
 
     s.log("[green]Valve cycle complete.[/]")
 
@@ -1091,10 +1194,18 @@ def _calibrate_volume(s: _PumpSession) -> None:
             s.open_valve()
             try:
                 pump_enable(sock, pid)
-                s.current_speeds[pid] = m.max_retract_speed_mm_s
-                pump_move(sock, pid, position=0.0, speed=m.max_retract_speed_mm_s)
-                s.pump_positions[pid] = 0.0
-                s.current_speeds[pid] = 0.0
+                s.console.clear()
+                with Live(
+                    s.build_live_renderable(),
+                    console=s.console,
+                    refresh_per_second=10,
+                ) as live:
+                    _run_animated_moves(
+                        s,
+                        sock,
+                        [(pid, 0.0, m.max_retract_speed_mm_s)],
+                        live,
+                    )
             finally:
                 s.close_valve()
 
@@ -1104,11 +1215,15 @@ def _calibrate_volume(s: _PumpSession) -> None:
             ).ask()
 
             pump_set_position(sock, pid, 0.0)
-            s.current_speeds[pid] = speed
+            s.pump_positions[pid] = 0.0
             s.log(f"  Dispensing {target:.3f} ml...")
-            pump_move(sock, pid, position=pos, speed=speed)
-            s.pump_positions[pid] = abs(pos)
-            s.current_speeds[pid] = 0.0
+            s.console.clear()
+            with Live(
+                s.build_live_renderable(),
+                console=s.console,
+                refresh_per_second=10,
+            ) as live:
+                _run_animated_moves(s, sock, [(pid, pos, speed)], live)
             s.log("  [green]Dispense complete.[/]")
 
             s.render_screen()
@@ -1418,12 +1533,14 @@ _TESTS_MENU = [
 
 _CONTROLS_MENU = [
     ("Homing", _control_homing),
-    ("Setup (backlash purge)", _control_setup),
+    ("Home + Backlash purge", _control_setup),
     ("Individual pump", _control_individual_pump),
     ("Multi-pump", _control_multi_pump),
     ("Purge (manifold flush)", _control_purge),
     ("Fill (retract plunger)", _control_fill),
     ("Valve cycle (fill + empty)", _control_valve_cycle),
+    ("Toggle refill valve", _control_toggle_valve),
+    ("Toggle needle servo", _control_toggle_needle),
 ]
 
 _CALIBRATIONS_MENU = [

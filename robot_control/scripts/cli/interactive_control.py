@@ -393,14 +393,16 @@ class _InteractiveJogController:
             return
         speed = motor.max_dispense_speed_mm_s
         pid = self._active_pump
+        current = self._pump_positions.get(pid, 0.0)
+        target = current + distance_mm
         cmd = (
             f"MANUAL_STEPPER STEPPER={pid} ENABLE=1\n"
-            f"MANUAL_STEPPER STEPPER={pid} MOVE={distance_mm:.4f} SPEED={speed}\n"
+            f"MANUAL_STEPPER STEPPER={pid} MOVE={target:.4f} SPEED={speed}\n"
             f"MANUAL_STEPPER STEPPER={pid} ENABLE=0"
         )
         direction = "dispense" if distance_mm > 0 else "retract"
         if self._safe_gcode(cmd, timeout=30.0):
-            self._pump_positions[pid] = self._pump_positions.get(pid, 0.0) + distance_mm
+            self._pump_positions[pid] = target
             self._status = f"{pid} {direction} {abs(distance_mm):.3f} mm"
 
     def _pump_dispense(self) -> None:
@@ -432,17 +434,33 @@ class _InteractiveJogController:
             return
         pid = self._active_pump
         speed = motor.homing_speed_mm_s
-        stop_on = motor.homing_direction
+        h_dir = motor.homing_direction
+        backlash = self._cfg.pumps.backlash_purge_mm if self._cfg.pumps else 0.3
+        travel = motor.syringe.plunger_travel_mm
+
         self._status = f"Homing {pid}..."
-        cmd = (
+        home_cmd = (
             f"MANUAL_STEPPER STEPPER={pid} ENABLE=1\n"
             f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0\n"
-            f"MANUAL_STEPPER STEPPER={pid} MOVE={stop_on * 50} SPEED={speed}"
-            f" STOP_ON_ENDSTOP={stop_on}\n"
+            f"MANUAL_STEPPER STEPPER={pid} MOVE={h_dir * (travel + 5):.4f}"
+            f" SPEED={speed} STOP_ON_ENDSTOP=1\n"
+            f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0"
+        )
+        if not self._safe_gcode(home_cmd, timeout=60.0):
+            return
+
+        backoff = motor.home_backoff_mm
+        dsign = -h_dir
+        purge_cmd = (
+            f"MANUAL_STEPPER STEPPER={pid}"
+            f" MOVE={-h_dir * backoff:.4f} SPEED=1.0\n"
+            f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0\n"
+            f"MANUAL_STEPPER STEPPER={pid}"
+            f" MOVE={dsign * backlash:.4f} SPEED=1.0\n"
             f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0\n"
             f"MANUAL_STEPPER STEPPER={pid} ENABLE=0"
         )
-        if self._safe_gcode(cmd, timeout=60.0):
+        if self._safe_gcode(purge_cmd, timeout=60.0):
             self._pump_positions[pid] = 0.0
             self._pump_homed[pid] = True
             self._status = f"{pid} homed"
