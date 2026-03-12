@@ -116,6 +116,9 @@ pumps:
   enabled: true
   backlash_purge_mm: 0.5
   manifold_purge_volume_ml: 0.5
+  refill_valve_output: servo_pump_refill   # digital_outputs key for the refill valve servo
+  refill_valve_delay_s: 1.0                # seconds to wait after opening/closing the valve (servo transit time)
+  enforce_travel_limits: true              # when true, reject pump moves beyond plunger_travel_mm on homed pumps
   stepper:
     motor_type: 1.8deg
     full_steps_per_rotation: 200

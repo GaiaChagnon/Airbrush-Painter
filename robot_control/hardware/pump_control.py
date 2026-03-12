@@ -287,6 +287,29 @@ def emergency_disable(socket_path: str, pump_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Digital output control
+# ---------------------------------------------------------------------------
+
+
+def set_pin(sock: socket.socket, pin_name: str, value: int) -> bool:
+    """Set a Klipper ``[output_pin]`` to 0 or 1.
+
+    Parameters
+    ----------
+    pin_name : str
+        Klipper output_pin identifier (e.g. ``"servo_pump_refill"``).
+    value : int
+        0 (off/closed) or 1 (on/open).
+
+    Returns
+    -------
+    bool
+        True if the command was accepted by Klipper.
+    """
+    return raw_gcode(sock, f"SET_PIN PIN={pin_name} VALUE={value}")
+
+
+# ---------------------------------------------------------------------------
 # Pump control primitives
 # ---------------------------------------------------------------------------
 

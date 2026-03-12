@@ -50,6 +50,7 @@ from robot_control.hardware.pump_control import (
     query_pump_endstop,
     raw_gcode,
     restart_klipper,
+    set_pin,
     stdin_has_data,
     volume_to_mm,
     wait_for_ready,
@@ -69,7 +70,7 @@ _MANUAL_CAL_PATH = (
 
 
 class SessionState:
-    """Tracks per-pump homing state and the active socket."""
+    """Tracks per-pump homing state, valve state, and the active socket."""
 
     def __init__(self, cfg: MachineConfig) -> None:
         self.cfg = cfg
@@ -79,6 +80,7 @@ class SessionState:
         self.homed: dict[str, bool] = {
             pid: False for pid in self.pumps_cfg.motors
         }
+        self.valve_open_flag: bool = False
 
     @property
     def pump_ids(self) -> list[str]:
@@ -113,6 +115,62 @@ class SessionState:
         if self.sock is None:
             raise RuntimeError("Not connected to Klipper")
         return self.sock
+
+    @property
+    def _valve_output(self) -> str:
+        return self.pumps_cfg.refill_valve_output
+
+    @property
+    def _valve_delay(self) -> float:
+        return self.pumps_cfg.refill_valve_delay_s
+
+    def open_valve(self) -> None:
+        """Open the refill valve and wait for the servo to transit."""
+        name = self._valve_output
+        if not name:
+            return
+        sock = self.ensure_connected()
+        print(f"  Opening refill valve ({name}) ...", end="", flush=True)
+        set_pin(sock, name, 1)
+        time.sleep(self._valve_delay)
+        self.valve_open_flag = True
+        print(" done")
+
+    def close_valve(self) -> None:
+        """Close the refill valve and wait for the servo to transit."""
+        name = self._valve_output
+        if not name:
+            return
+        sock = self.ensure_connected()
+        print(f"  Closing refill valve ({name}) ...", end="", flush=True)
+        set_pin(sock, name, 0)
+        time.sleep(self._valve_delay)
+        self.valve_open_flag = False
+        print(" done")
+
+    def check_travel_limit(
+        self,
+        pid: str,
+        target_position: float,
+    ) -> bool:
+        """Return True if *target_position* is within plunger travel.
+
+        When ``enforce_travel_limits`` is False or the pump is not homed,
+        always returns True (no enforcement).
+        """
+        if not self.pumps_cfg.enforce_travel_limits:
+            return True
+        if not self.homed[pid]:
+            return True
+        sy = self.syringe(pid)
+        if abs(target_position) > sy.plunger_travel_mm:
+            print(
+                f"  !! LIMIT VIOLATION: {pid} target {target_position:.4f} mm "
+                f"exceeds plunger travel {sy.plunger_travel_mm:.4f} mm. "
+                f"Move rejected."
+            )
+            return False
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -254,25 +312,33 @@ def _dispense_sign(pump_cfg: PumpMotorConfig) -> int:
 def _do_homing(state: SessionState, pump_ids: list[str]) -> bool:
     """Home selected pumps with backlash purge.
 
-    Motors are disabled after homing (both on success and failure).
+    The refill valve is opened before homing starts so that fluid can
+    enter the syringe during plunger retraction (backoff).  It is
+    closed again after all pumps are done.  Motors are disabled after
+    homing (both on success and failure).
     """
     sock = state.ensure_connected()
     backlash = state.pumps_cfg.backlash_purge_mm
     all_ok = True
 
-    for pid in pump_ids:
-        m = state.motor(pid)
-        sy = state.syringe(pid)
-        print(f"\n  Homing {state.pump_label(pid)} ...")
-        pump_enable(sock, pid)
-        ok = pump_home_with_backlash(sock, pid, m, sy, backlash)
-        if ok:
-            state.homed[pid] = True
-            print(f"  {pid} homed successfully.")
-        else:
-            print(f"  !! {pid} homing FAILED")
-            all_ok = False
-        pump_disable(sock, pid)
+    state.open_valve()
+
+    try:
+        for pid in pump_ids:
+            m = state.motor(pid)
+            sy = state.syringe(pid)
+            print(f"\n  Homing {state.pump_label(pid)} ...")
+            pump_enable(sock, pid)
+            ok = pump_home_with_backlash(sock, pid, m, sy, backlash)
+            if ok:
+                state.homed[pid] = True
+                print(f"  {pid} homed successfully.")
+            else:
+                print(f"  !! {pid} homing FAILED")
+                all_ok = False
+            pump_disable(sock, pid)
+    finally:
+        state.close_valve()
 
     return all_ok
 
@@ -297,6 +363,9 @@ def _do_dispense(
 
     dsign = _dispense_sign(m)
     pos = dsign * travel_mm
+
+    if not state.check_travel_limit(pid, pos):
+        return
 
     pump_enable(sock, pid)
     pump_set_position(sock, pid, 0.0)
@@ -331,6 +400,8 @@ def _do_dispense_no_retract(
         If True (default), disable the stepper after dispensing.
         Set False when the caller will issue further moves on the
         same pump before disabling.
+
+    Returns 0.0 if the move was rejected by the travel limit check.
     """
     sock = state.ensure_connected()
     m = state.motor(pid)
@@ -343,6 +414,9 @@ def _do_dispense_no_retract(
 
     dsign = _dispense_sign(m)
     pos = dsign * travel_mm
+
+    if not state.check_travel_limit(pid, pos):
+        return 0.0
 
     pump_enable(sock, pid)
     pump_set_position(sock, pid, 0.0)
@@ -389,6 +463,10 @@ def _do_simultaneous_dispense(
         t = volume_to_mm(volumes[pid], sy)
         if t > sy.plunger_travel_mm:
             t = sy.plunger_travel_mm
+        m = state.motor(pid)
+        dsign = _dispense_sign(m)
+        if not state.check_travel_limit(pid, dsign * t):
+            return
         travels[pid] = t
 
     max_travel = max(travels.values())
@@ -455,6 +533,9 @@ def test_pump_juggle(state: SessionState) -> None:
     for pid in selected:
         m = state.motor(pid)
         dsign = _dispense_sign(m)
+        pos = dsign * distance
+        if not state.check_travel_limit(pid, pos):
+            continue
         pump_enable(sock, pid)
         pump_set_position(sock, pid, 0.0)
 
@@ -462,7 +543,6 @@ def test_pump_juggle(state: SessionState) -> None:
               f"{distance} mm x {reps} reps at {speed} mm/s")
 
         for i in range(1, reps + 1):
-            pos = dsign * distance
             pump_move(sock, pid, position=pos, speed=speed)
             pump_move(sock, pid, position=0.0, speed=speed)
             sys.stdout.write(f"\r    Rep {i}/{reps}")
@@ -567,6 +647,9 @@ def test_speed_ramp(state: SessionState) -> None:
         speeds = [s for s in [0.25, 0.5, 1.0, 2.0, 3.0, 4.0] if s <= max_spd]
         retract_speed = m.max_retract_speed_mm_s
 
+        if not state.check_travel_limit(pid, dispense_pos):
+            continue
+
         print(f"\n  Speed ramp for {state.pump_label(pid)}")
         print(f"  Dose: {dose_ml} ml = {travel_mm:.2f} mm")
         print(f"  Speeds: {speeds} mm/s")
@@ -615,6 +698,9 @@ def test_repeatability(state: SessionState) -> None:
         dispense_pos = dsign * travel
         retract_speed = min(speed * 1.5, m.max_retract_speed_mm_s)
 
+        if not state.check_travel_limit(pid, dispense_pos):
+            continue
+
         print(f"\n  Repeatability for {state.pump_label(pid)}")
         print(f"  {cycles} cycles, {speed} mm/s dispense, "
               f"{retract_speed:.1f} mm/s retract")
@@ -662,6 +748,9 @@ def test_full_travel(state: SessionState) -> None:
         travel = sy.plunger_travel_mm
         dsign = _dispense_sign(m)
         dispense_pos = dsign * travel
+
+        if not state.check_travel_limit(pid, dispense_pos):
+            continue
 
         print(f"\n  Full travel for {state.pump_label(pid)}")
         print(f"  Stroke: {travel} mm = {sy.volume_ml} ml")
@@ -826,7 +915,11 @@ def control_purge(state: SessionState) -> None:
 
 
 def control_fill(state: SessionState) -> None:
-    """Control 6: retract plunger(s) fully to fill syringes."""
+    """Control 6: retract plunger(s) fully to fill syringes.
+
+    The refill valve is opened automatically so fluid can enter the
+    syringe during plunger retraction.
+    """
     print("\n" + "=" * 60)
     print("  CONTROL: FILL (retract plunger)")
     print("=" * 60)
@@ -837,17 +930,78 @@ def control_fill(state: SessionState) -> None:
         return
 
     sock = state.ensure_connected()
+    state.open_valve()
+    try:
+        for pid in selected:
+            sy = state.syringe(pid)
+            print(f"\n  Filling {state.pump_label(pid)} "
+                  f"({sy.volume_ml:.2f} ml) ...", end="", flush=True)
+            pump_enable(sock, pid)
+            pump_move(sock, pid, position=0.0, speed=speed)
+            print(" done")
+            pump_disable(sock, pid)
+    finally:
+        state.close_valve()
+
+    print("\n  Fill complete.")
+
+
+def control_valve_cycle(state: SessionState) -> None:
+    """Control 7: full fill/empty cycle with automatic valve control.
+
+    Sequence:
+      1. Open refill valve (wait for servo transit)
+      2. Retract plungers fully (fill syringes from reservoir)
+      3. Close refill valve (wait for servo transit)
+      4. Extend plungers fully (empty syringes into manifold)
+    """
+    print("\n" + "=" * 60)
+    print("  CONTROL: VALVE CYCLE (fill + empty)")
+    print("=" * 60)
+
+    if not state._valve_output:
+        print("  !! No refill_valve_output configured in pumps section.")
+        return
+
+    selected = _select_pumps(state, "Which pumps to cycle?")
+    speed = _input_float("Speed (mm/s)", 2.0)
+    if not _check_homing(state, selected):
+        return
+
+    sock = state.ensure_connected()
+
+    # Phase 1: open valve and fill
+    state.open_valve()
+    try:
+        for pid in selected:
+            sy = state.syringe(pid)
+            print(f"\n  Filling {state.pump_label(pid)} "
+                  f"({sy.volume_ml:.2f} ml) ...", end="", flush=True)
+            pump_enable(sock, pid)
+            pump_move(sock, pid, position=0.0, speed=speed)
+            print(" done")
+            pump_disable(sock, pid)
+    finally:
+        state.close_valve()
+
+    _dwell(state)
+
+    # Phase 2: empty (valve closed, fluid exits through nozzle)
     for pid in selected:
         m = state.motor(pid)
         sy = state.syringe(pid)
-        print(f"\n  Filling {state.pump_label(pid)} "
+        dsign = _dispense_sign(m)
+        dispense_pos = dsign * sy.plunger_travel_mm
+        if not state.check_travel_limit(pid, dispense_pos):
+            continue
+        print(f"\n  Emptying {state.pump_label(pid)} "
               f"({sy.volume_ml:.2f} ml) ...", end="", flush=True)
         pump_enable(sock, pid)
-        pump_move(sock, pid, position=0.0, speed=speed)
+        pump_move(sock, pid, position=dispense_pos, speed=speed)
         print(" done")
         pump_disable(sock, pid)
 
-    print("\n  Fill complete.")
+    print("\n  Valve cycle complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -856,69 +1010,275 @@ def control_fill(state: SessionState) -> None:
 
 
 def calibrate_volume(state: SessionState) -> None:
-    """Calibration 1: volume accuracy per pump.
+    """Calibration 1: volume accuracy with automated valve cycling and CSV log.
 
-    Dispenses a target volume, user measures the actual output, and
-    the script computes a corrected ``plunger_travel_mm`` so that
-    ``mm_per_ml`` matches reality.
+    Two modes:
+
+    * **Fixed volume** -- dispense the same volume N times to measure
+      repeatability and systematic bias.
+    * **Volume sweep** -- dispense 0.1 ml to 1.0 ml (10 steps) to
+      characterise linearity across the operating range.
+
+    Each cycle:
+      1. Open valve, retract plunger fully (fill syringe), close valve.
+      2. Wait for user to press Enter.
+      3. Dispense the target volume.
+      4. Wait for user to measure and record.
+
+    Results are saved incrementally to
+    ``robot_control/data/<pump>_volume_cal_<timestamp>.csv`` and a
+    corrected ``plunger_travel_mm`` is offered at the end.
     """
     print("\n" + "=" * 60)
-    print("  CALIBRATION: VOLUME")
+    print("  CALIBRATION: VOLUME ACCURACY")
     print("=" * 60)
 
-    target_vol = _input_float("Target volume to dispense (ml)", 0.5)
-    speed = _input_float("Speed (mm/s)", 0.5)
-
-    selected = _select_pumps(
-        state, "Which pumps to calibrate?", allow_all=True,
-    )
-    if not _check_homing(state, selected):
+    pid = _select_single_pump(state, "Which pump to calibrate?")
+    if not _check_homing(state, [pid]):
         return
 
-    corrections: dict[str, dict[str, float]] = {}
+    sy = state.syringe(pid)
+    m = state.motor(pid)
+    dsign = _dispense_sign(m)
 
-    for pid in selected:
-        sy = state.syringe(pid)
-        print(f"\n  --- {state.pump_label(pid)} ---")
-        print(f"  Current: {sy.volume_ml} ml / {sy.plunger_travel_mm} mm "
-              f"({sy.mm_per_ml:.2f} mm/ml)")
+    print(f"\n  {state.pump_label(pid)}")
+    print(f"  Syringe: {sy.volume_ml} ml / {sy.plunger_travel_mm} mm "
+          f"({sy.mm_per_ml:.4f} mm/ml)")
 
-        _do_dispense_no_retract(state, pid, target_vol, speed)
+    # -- mode selection -----------------------------------------------------
+    print("\n  Calibration modes:")
+    print("    [1] Fixed volume -- repeat the same volume N times")
+    print("    [2] Volume sweep -- 0.1 to 1.0 ml in 10 steps")
+    mode = _input("Mode", "1")
 
-        if not _input_bool("Enter measured volume?", default=True):
-            print("  Skipped measurement.")
-            continue
+    if mode == "2":
+        volumes = [round(0.1 * i, 1) for i in range(1, 11)]
+        volumes = [v for v in volumes if v <= sy.volume_ml]
+        if not volumes:
+            print("  !! Syringe capacity too small for sweep. Aborting.")
+            return
+        cycles = len(volumes)
+        print(f"\n  Sweep: {volumes[0]:.1f} -> {volumes[-1]:.1f} ml "
+              f"({cycles} steps)")
+    else:
+        target_vol = _input_float("Target volume (ml)", 0.5)
+        if target_vol > sy.volume_ml:
+            print(f"  !! Volume exceeds syringe capacity "
+                  f"({sy.volume_ml:.2f} ml). Clamping.")
+            target_vol = sy.volume_ml
+        cycles = _input_int("Number of cycles", 5)
+        volumes = [target_vol] * cycles
 
-        measured = _input_float(
-            "Measured volume output (ml)", target_vol
-        )
-        if measured <= 0:
-            print("  !! Measured volume must be > 0. Skipping.")
-            continue
+    speed = _input_float("Dispense speed (mm/s)", 0.5)
 
-        travel_used = volume_to_mm(target_vol, sy)
-        actual_mm_per_ml = travel_used / measured
-        corrected_travel = actual_mm_per_ml * sy.volume_ml
+    # -- prepare CSV --------------------------------------------------------
+    data_dir = Path(__file__).resolve().parents[1] / "data"
+    data_dir.mkdir(exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = data_dir / f"{pid}_volume_cal_{timestamp}.csv"
+    _CSV_HEADER = (
+        "cycle,target_ml,measured_ml,error_ml,error_pct,"
+        "travel_mm,speed_mm_s,mm_per_ml_nominal,mm_per_ml_actual"
+    )
+    csv_lines: list[str] = [_CSV_HEADER]
 
-        print(f"  Nominal mm/ml:   {sy.mm_per_ml:.4f}")
-        print(f"  Actual mm/ml:    {actual_mm_per_ml:.4f}")
-        print(f"  Corrected plunger_travel_mm: {corrected_travel:.4f}")
+    sock = state.ensure_connected()
+    results: list[dict[str, float]] = []
 
-        corrections[pid] = {
-            "plunger_travel_mm": round(corrected_travel, 4),
-            "volume_ml": sy.volume_ml,
-        }
+    print(f"\n  Starting {cycles} calibration cycle(s)")
+    print(f"  CSV: {csv_path}")
+    print(f"  Speed: {speed} mm/s\n")
 
-    if corrections:
-        print("\n  Summary of corrections:")
-        for pid, corr in corrections.items():
-            print(f"    {pid}: plunger_travel_mm = {corr['plunger_travel_mm']}")
+    try:
+        for i, target in enumerate(volumes):
+            cycle_num = i + 1
+            travel_mm = volume_to_mm(target, sy)
+            pos = dsign * travel_mm
 
-        if _input_bool("Save corrected values to machine.yaml?"):
-            _save_volume_calibration(corrections)
-            print("  Saved. Reload config to apply.")
+            if not state.check_travel_limit(pid, pos):
+                print("  Aborting calibration due to travel limit.")
+                break
+
+            print(f"  === Cycle {cycle_num}/{cycles}: "
+                  f"target = {target:.3f} ml ({travel_mm:.4f} mm) ===")
+
+            # Fill: open valve -> retract plunger to 0 -> close valve
+            state.open_valve()
+            try:
+                pump_enable(sock, pid)
+                pump_move(
+                    sock, pid, position=0.0,
+                    speed=m.max_retract_speed_mm_s,
+                )
+            finally:
+                state.close_valve()
+
+            input("\n  Ready to dispense. Press ENTER ...")
+
+            # Dispense
+            pump_set_position(sock, pid, 0.0)
+            print(f"    Dispensing {target:.3f} ml ...", end="", flush=True)
+            pump_move(sock, pid, position=pos, speed=speed)
+            print(" done")
+
+            input("  Measure the output. Press ENTER to record ...")
+
+            measured = _input_float("Measured volume (ml)", target)
+            if measured <= 0:
+                print("  !! Must be > 0. Recording as target value.")
+                measured = target
+
+            error_ml = measured - target
+            error_pct = (error_ml / target * 100.0) if target > 0 else 0.0
+            actual_mm_per_ml = (
+                travel_mm / measured if measured > 0 else 0.0
+            )
+
+            result: dict[str, float] = {
+                "cycle": cycle_num,
+                "target_ml": target,
+                "measured_ml": measured,
+                "error_ml": error_ml,
+                "error_pct": error_pct,
+                "travel_mm": travel_mm,
+                "speed_mm_s": speed,
+                "mm_per_ml_nominal": sy.mm_per_ml,
+                "mm_per_ml_actual": actual_mm_per_ml,
+            }
+            results.append(result)
+
+            csv_lines.append(
+                f"{cycle_num},{target:.4f},{measured:.4f},{error_ml:.4f},"
+                f"{error_pct:.2f},{travel_mm:.4f},{speed:.4f},"
+                f"{sy.mm_per_ml:.4f},{actual_mm_per_ml:.4f}"
+            )
+            csv_path.write_text("\n".join(csv_lines) + "\n")
+
+            print(f"    Error: {error_ml:+.4f} ml ({error_pct:+.2f}%)")
+            print(f"    Actual mm/ml: {actual_mm_per_ml:.4f} "
+                  f"(nominal {sy.mm_per_ml:.4f})\n")
+
+        pump_disable(sock, pid)
+
+    except KeyboardInterrupt:
+        print("\n\n  Calibration interrupted.")
+        pump_disable(sock, pid)
+        if state.valve_open_flag:
+            state.close_valve()
+
+    if not results:
+        print("  No data collected.")
+        return
+
+    # -- statistics ---------------------------------------------------------
+    _print_cal_statistics(pid, state, results, csv_path)
+
+    # -- correction ---------------------------------------------------------
+    total_travel = sum(r["travel_mm"] for r in results)
+    total_measured = sum(r["measured_ml"] for r in results)
+    if total_measured > 0 and total_travel > 0:
+        avg_mm_per_ml = total_travel / total_measured
+        corrected_travel = avg_mm_per_ml * sy.volume_ml
+
+        print(f"\n  Recommended plunger_travel_mm: {corrected_travel:.4f}")
+        print(f"  (currently {sy.plunger_travel_mm:.4f})")
+
+        if _input_bool("Save corrected value to machine.yaml?"):
+            _save_volume_calibration({
+                pid: {
+                    "plunger_travel_mm": round(corrected_travel, 4),
+                    "volume_ml": sy.volume_ml,
+                },
+            })
+            print("  Saved. Restart the testbed to apply.")
         else:
             print("  Not saved.")
+
+
+def _print_cal_statistics(
+    pid: str,
+    state: SessionState,
+    results: list[dict[str, float]],
+    csv_path: Path,
+) -> None:
+    """Print a formatted statistics summary for calibration results.
+
+    Parameters
+    ----------
+    pid : str
+        Pump identifier.
+    state : SessionState
+        Current session (used for pump label).
+    results : list[dict[str, float]]
+        Per-cycle measurement dicts produced by ``calibrate_volume``.
+    csv_path : Path
+        Path to the CSV file (shown in the summary header).
+    """
+    n = len(results)
+    errors_ml = [r["error_ml"] for r in results]
+    errors_pct = [r["error_pct"] for r in results]
+    measured = [r["measured_ml"] for r in results]
+    targets = [r["target_ml"] for r in results]
+    actual_ratios = [r["mm_per_ml_actual"] for r in results]
+
+    mean_err = sum(errors_ml) / n
+    mean_err_pct = sum(errors_pct) / n
+    max_abs_err = max(abs(e) for e in errors_ml)
+    max_abs_err_pct = max(abs(e) for e in errors_pct)
+    mean_mm_per_ml = sum(actual_ratios) / n
+
+    # Population std dev (we have the full dataset, not a sample)
+    var_ml = sum((e - mean_err) ** 2 for e in errors_ml) / n
+    std_ml = var_ml ** 0.5
+    var_pct = sum((e - mean_err_pct) ** 2 for e in errors_pct) / n
+    std_pct = var_pct ** 0.5
+
+    print("\n" + "=" * 60)
+    print(f"  CALIBRATION RESULTS: {state.pump_label(pid)}")
+    print("=" * 60)
+    print(f"  Cycles completed: {n}")
+    print(f"  CSV: {csv_path}")
+
+    # Per-cycle table
+    print(f"\n  {'#':>3s}  {'Target':>8s}  {'Measured':>9s}  "
+          f"{'Error':>8s}  {'Error%':>7s}  {'mm/ml':>8s}")
+    print(f"  {'---':>3s}  {'--------':>8s}  {'---------':>9s}  "
+          f"{'--------':>8s}  {'-------':>7s}  {'--------':>8s}")
+    for r in results:
+        print(f"  {r['cycle']:3.0f}  {r['target_ml']:8.4f}  "
+              f"{r['measured_ml']:9.4f}  {r['error_ml']:+8.4f}  "
+              f"{r['error_pct']:+7.2f}  {r['mm_per_ml_actual']:8.4f}")
+
+    # Aggregate stats
+    print(f"\n  Summary:")
+    print(f"    Mean error:     {mean_err:+.4f} ml  ({mean_err_pct:+.2f}%)")
+    print(f"    Std dev:        {std_ml:.4f} ml  ({std_pct:.2f}%)")
+    print(f"    Max |error|:    {max_abs_err:.4f} ml  "
+          f"({max_abs_err_pct:.2f}%)")
+    print(f"    Mean mm/ml:     {mean_mm_per_ml:.4f} "
+          f"(nominal {results[0]['mm_per_ml_nominal']:.4f})")
+
+    unique_targets = set(targets)
+    if len(unique_targets) == 1:
+        # Fixed-volume repeatability
+        mean_m = sum(measured) / n
+        var_rep = sum((m - mean_m) ** 2 for m in measured) / n
+        std_rep = var_rep ** 0.5
+        cv = (std_rep / mean_m * 100.0) if mean_m > 0 else 0.0
+        print(f"\n  Repeatability (fixed {targets[0]:.3f} ml):")
+        print(f"    Mean measured:  {mean_m:.4f} ml")
+        print(f"    Std dev:        {std_rep:.4f} ml")
+        print(f"    CV:             {cv:.2f}%")
+    else:
+        # Sweep linearity (R^2 between target and measured)
+        mean_t = sum(targets) / n
+        mean_m = sum(measured) / n
+        ss_res = sum((m - t) ** 2 for m, t in zip(measured, targets))
+        ss_tot = sum((m - mean_m) ** 2 for m in measured)
+        r_sq = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+        print(f"\n  Linearity (volume sweep):")
+        print(f"    R-squared:      {r_sq:.6f}")
+        print(f"    Best-fit mm/ml: {mean_mm_per_ml:.4f}")
 
 
 def _save_volume_calibration(
@@ -1068,10 +1428,11 @@ _CONTROLS = [
     ("4", "Multi-pump",       control_multi_pump),
     ("5", "Purge",            control_purge),
     ("6", "Fill",             control_fill),
+    ("7", "Valve cycle",      control_valve_cycle),
 ]
 
 _CALIBRATIONS = [
-    ("1", "Volume calibration",  calibrate_volume),
+    ("1", "Volume accuracy",     calibrate_volume),
     ("2", "Mixing test",         calibrate_mixing),
 ]
 
@@ -1136,6 +1497,11 @@ def _print_banner(state: SessionState) -> None:
     print(f"  Backlash purge: {state.pumps_cfg.backlash_purge_mm} mm")
     print(f"  Manifold purge: "
           f"{state.pumps_cfg.manifold_purge_volume_ml} ml")
+    valve = state.pumps_cfg.refill_valve_output or "(none)"
+    print(f"  Refill valve: {valve} "
+          f"(delay {state.pumps_cfg.refill_valve_delay_s:.1f} s)")
+    print(f"  Travel limits: "
+          f"{'ENFORCED' if state.pumps_cfg.enforce_travel_limits else 'disabled'}")
     print()
 
 
@@ -1212,8 +1578,14 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n\n  Interrupted.")
     finally:
-        # Disable all pump motors
         if state.sock is not None:
+            # Ensure valve is closed on exit
+            if state.valve_open_flag:
+                try:
+                    state.close_valve()
+                except Exception:
+                    pass
+            # Disable all pump motors
             for pid in state.pump_ids:
                 try:
                     pump_disable(state.sock, pid)

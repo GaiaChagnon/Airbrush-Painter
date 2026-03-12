@@ -375,6 +375,9 @@ class PumpsConfig:
     motors: dict[str, PumpMotorConfig]
     backlash_purge_mm: float = 0.5
     manifold_purge_volume_ml: float = 0.5
+    refill_valve_output: str = ""
+    refill_valve_delay_s: float = 1.0
+    enforce_travel_limits: bool = True
 
 
 @dataclass(frozen=True)
@@ -666,6 +669,9 @@ def _parse_pumps(data: dict[str, Any]) -> PumpsConfig | None:
         manifold_purge_volume_ml=float(
             data.get("manifold_purge_volume_ml", 0.5)
         ),
+        refill_valve_output=str(data.get("refill_valve_output", "")),
+        refill_valve_delay_s=float(data.get("refill_valve_delay_s", 1.0)),
+        enforce_travel_limits=bool(data.get("enforce_travel_limits", True)),
     )
 
 

@@ -54,6 +54,12 @@ hypothesis>=6.98.0
 tqdm>=4.66.0
 colorlog>=6.8.0
 
+# Robot CLI terminal interface
+rich>=13.7.0
+questionary>=2.0.0
+readchar>=4.0.0
+plotext>=5.2.0
+
 # Optional: CUDA rasterizer (build from source, see Dockerfile)
 # nvdiffrast (requires manual build)
 
