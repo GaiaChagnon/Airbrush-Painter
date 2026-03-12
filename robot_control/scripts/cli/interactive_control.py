@@ -393,16 +393,21 @@ class _InteractiveJogController:
             return
         speed = motor.max_dispense_speed_mm_s
         pid = self._active_pump
-        current = self._pump_positions.get(pid, 0.0)
-        target = current + distance_mm
+        # Zero the stepper position then move by distance (relative move).
+        # ACCEL is required for Klipper MANUAL_STEPPER, M400 waits for
+        # completion before the driver is disabled.
         cmd = (
             f"MANUAL_STEPPER STEPPER={pid} ENABLE=1\n"
-            f"MANUAL_STEPPER STEPPER={pid} MOVE={target:.4f} SPEED={speed}\n"
+            f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0\n"
+            f"MANUAL_STEPPER STEPPER={pid} MOVE={distance_mm:.4f}"
+            f" SPEED={speed:.4f} ACCEL=100.0\n"
+            f"M400\n"
             f"MANUAL_STEPPER STEPPER={pid} ENABLE=0"
         )
-        direction = "dispense" if distance_mm > 0 else "retract"
+        is_dispense = (distance_mm * motor.homing_direction) < 0
+        direction = "dispense" if is_dispense else "retract"
         if self._safe_gcode(cmd, timeout=30.0):
-            self._pump_positions[pid] = target
+            self._pump_positions[pid] = self._pump_positions.get(pid, 0.0) + distance_mm
             self._status = f"{pid} {direction} {abs(distance_mm):.3f} mm"
 
     def _pump_dispense(self) -> None:
@@ -443,7 +448,7 @@ class _InteractiveJogController:
             f"MANUAL_STEPPER STEPPER={pid} ENABLE=1\n"
             f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0\n"
             f"MANUAL_STEPPER STEPPER={pid} MOVE={h_dir * (travel + 5):.4f}"
-            f" SPEED={speed} STOP_ON_ENDSTOP=1\n"
+            f" SPEED={speed} ACCEL=100.0 STOP_ON_ENDSTOP=1\n"
             f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0"
         )
         if not self._safe_gcode(home_cmd, timeout=60.0):
@@ -453,10 +458,10 @@ class _InteractiveJogController:
         dsign = -h_dir
         purge_cmd = (
             f"MANUAL_STEPPER STEPPER={pid}"
-            f" MOVE={-h_dir * backoff:.4f} SPEED=1.0\n"
+            f" MOVE={-h_dir * backoff:.4f} SPEED=1.0 ACCEL=100.0\n"
             f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0\n"
             f"MANUAL_STEPPER STEPPER={pid}"
-            f" MOVE={dsign * backlash:.4f} SPEED=1.0\n"
+            f" MOVE={dsign * backlash:.4f} SPEED=1.0 ACCEL=100.0\n"
             f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0\n"
             f"MANUAL_STEPPER STEPPER={pid} ENABLE=0"
         )

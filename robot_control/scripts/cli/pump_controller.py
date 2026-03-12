@@ -11,9 +11,12 @@ panel updates while moves execute.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import io
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -62,6 +65,44 @@ _MANUAL_CAL_PATH = (
     Path(__file__).resolve().parents[3]
     / "configs" / "sim" / "manual_calibration_results.yaml"
 )
+
+_MAX_LOG_PANEL_LINES = 8
+
+
+# ======================================================================
+# stdout capture for low-level pump_control print() calls
+# ======================================================================
+
+
+class _LogRedirector(io.TextIOBase):
+    """Intercepts stdout and routes complete lines to a session's activity log.
+
+    Used by ``_PumpSession.capture_prints`` to prevent raw ``print()``
+    output from ``pump_control`` functions from appearing at the top of
+    the terminal.  Lines are escaped for Rich markup safety.
+    """
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+        self._buf = ""
+
+    def write(self, text: str) -> int:
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            stripped = line.strip()
+            if stripped:
+                from rich.markup import escape
+
+                self._session.log(f"  [dim]{escape(stripped)}[/]")
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buf.strip():
+            from rich.markup import escape
+
+            self._session.log(f"  [dim]{escape(self._buf.strip())}[/]")
+            self._buf = ""
 
 
 # ======================================================================
@@ -162,26 +203,13 @@ class _PumpSession:
             }
         return pump_diagram(states, self.valve_open_flag, self.needle_retracted)
 
-    def _build_log_panel(self, max_lines: int = 0) -> Panel:
-        """Build the activity-log panel from the ring buffer.
+    def _build_log_panel(self) -> Panel:
+        """Build the activity-log panel with a fixed height.
 
-        Parameters
-        ----------
-        max_lines : int
-            If > 0, cap at this many lines (used by ``render_screen``
-            for a compact view).  Otherwise, adapts to terminal height.
+        Uses ``_MAX_LOG_PANEL_LINES`` visible lines so the panel never
+        pushes other elements around during log growth.
         """
-        if max_lines > 0:
-            n_visible = max_lines
-        else:
-            term_h = self.console.height or 40
-            overhead = 12 + len(self.pump_ids)
-            if self._summary_panel:
-                overhead += 8
-            if self._progress_text:
-                overhead += 3
-            n_visible = max(4, term_h - overhead)
-        lines = self._log_lines[-n_visible:]
+        lines = self._log_lines[-_MAX_LOG_PANEL_LINES:]
 
         if not lines:
             content = Text.from_markup("[dim]No activity yet.[/]")
@@ -194,7 +222,12 @@ class _PumpSession:
                     parts.append(Text(line))
             content = Text("\n").join(parts)
 
-        return Panel(content, title="[bold]Activity Log[/]", border_style="dim")
+        return Panel(
+            content,
+            title="[bold]Activity Log[/]",
+            border_style="dim",
+            height=_MAX_LOG_PANEL_LINES + 2,
+        )
 
     def build_live_renderable(self) -> Group:
         """Compose the full layout for a ``Rich Live`` context."""
@@ -230,7 +263,7 @@ class _PumpSession:
             )
         if self._summary_panel:
             self.console.print(self._summary_panel)
-        self.console.print(self._build_log_panel(max_lines=6))
+        self.console.print(self._build_log_panel())
 
     # ------------------------------------------------------------------
     # Valve & safety (output to log buffer)
@@ -273,6 +306,23 @@ class _PumpSession:
             )
             return False
         return True
+
+    @contextlib.contextmanager
+    def capture_prints(self) -> Iterator[None]:
+        """Redirect ``print()`` output from hardware functions to the activity log.
+
+        Wraps ``sys.stdout`` so that low-level ``pump_control`` functions
+        that use ``print()`` have their output routed to the session's
+        ring-buffer activity log instead of the raw terminal.
+        """
+        redirector = _LogRedirector(self)
+        old_stdout = sys.stdout
+        sys.stdout = redirector  # type: ignore[assignment]
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
+            redirector.flush()
 
 
 # ======================================================================
@@ -394,10 +444,10 @@ def _run_animated_moves(
         durations[pid] = (dist / speed * 1.1) if speed > 0 else 0.0
         s.current_speeds[pid] = speed
 
-    simultaneous = len(moves) > 1
-    for i, (pid, target, speed) in enumerate(moves):
-        is_last = (i == len(moves) - 1) and not simultaneous
-        pump_move(sock, pid, target, speed, accel=accel, sync=is_last)
+    # Always non-blocking so the animation loop runs during the move;
+    # M400 after the animation ensures we wait for actual completion.
+    for pid, target, speed in moves:
+        pump_move(sock, pid, target, speed, accel=accel, sync=False)
 
     max_dur = max(durations.values(), default=0.0)
     if max_dur < 0.05:
@@ -445,7 +495,8 @@ def _do_homing(s: _PumpSession, pump_ids: list[str]) -> bool:
                 s.log(f"  Homing [bold]{s.pump_label(pid)}[/]...")
                 live.update(s.build_live_renderable())
                 pump_enable(sock, pid)
-                ok = pump_home_with_backlash(sock, pid, m, sy, backlash)
+                with s.capture_prints():
+                    ok = pump_home_with_backlash(sock, pid, m, sy, backlash)
                 if ok:
                     s.homed[pid] = True
                     s.pump_positions[pid] = 0.0
@@ -838,7 +889,8 @@ def _test_repeatability(s: _PumpSession) -> None:
             s.set_progress("")
             s.log("  Re-homing to check for step loss...")
             live.update(s.build_live_renderable())
-            ok = pump_home(sock, pid, m, sy)
+            with s.capture_prints():
+                ok = pump_home(sock, pid, m, sy)
             if ok:
                 s.homed[pid] = True
                 s.log("  [green]Re-home OK. No step loss.[/]")
@@ -1607,10 +1659,12 @@ def run(app: RobotApp) -> None:
         PRINTER_CFG_PATH.write_text(config_text)
         s.log(f"  Wrote pump test printer.cfg to {PRINTER_CFG_PATH}")
         s.log("  Restarting Klipper...")
-        restart_klipper(s.cfg.connection.socket_path)
+        with s.capture_prints():
+            restart_klipper(s.cfg.connection.socket_path)
 
     s.log("  Waiting for Klipper...")
-    s.sock = wait_for_ready(s.cfg.connection.socket_path, timeout=45.0)
+    with s.capture_prints():
+        s.sock = wait_for_ready(s.cfg.connection.socket_path, timeout=45.0)
     s.log("  [green]Klipper is ready[/]")
 
     for pid in s.pump_ids:
