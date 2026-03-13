@@ -1,8 +1,8 @@
 """Pump controller mode -- persistent Rich layout with real-time status.
 
-Provides all functionality of ``pump_testbed.py`` with a polished
-terminal UI: persistent pump status panels, a scrollable activity log,
-questionary menus, and ``plotext`` charts for volume calibration.
+Persistent Rich terminal UI with pump status panels, a scrollable
+activity log, questionary menus, and ``plotext`` charts for volume
+calibration.
 
 The rendering model uses ``render_screen()`` (clear + redraw) between
 prompts, and ``Rich Live`` during long operations so the pump-status

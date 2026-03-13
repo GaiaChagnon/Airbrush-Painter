@@ -1,8 +1,8 @@
 """Shared pump and Klipper communication helpers.
 
 Low-level UDS transport for Klipper API and pump-specific move/home/
-endstop operations.  Used by ``test_pumps.py``, ``pump_testbed.py``,
-and any future pump automation scripts.
+endstop operations.  Used by the CLI pump controller and any future
+pump automation scripts.
 
 All geometry is in **millimeters**.  Volumes are in **ml**.
 Speed in **mm/s**.

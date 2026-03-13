@@ -42,7 +42,7 @@ layering_measurements:
   # ... (operator fills in 9 entries)
 
 # Ink mixing measurements (pump testbed calibration)
-# Written by: robot_control/scripts/pump_testbed.py (mixing test)
+# Written by: CLI pump controller (mixing test)
 # Each entry keyed by user label or auto-generated timestamp
 ink_mixing_measurements: {}
   # MIX_001:

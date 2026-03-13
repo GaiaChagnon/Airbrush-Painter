@@ -114,22 +114,12 @@ python -m pytest robot_control/tests/ -v
 Full documentation in [`robot_control/README.md`](robot_control/README.md).
 
 ```bash
-# Verify Klipper connectivity
-python robot_control/scripts/test_connection.py
+# Launch the unified CLI (interactive control, pumps, tracer, calibration)
+python robot_control/scripts/robot_cli.py
 
-# Line-art tracing dry-run (B&W outlines, preview only)
+# Or run the line-art tracer directly
 python robot_control/scripts/run_lineart_tracer.py \
   --image "Syringe Pump Drawing v1.png" --dry-run --save-preview
-
-# Execute on the robot
-python robot_control/scripts/run_lineart_tracer.py \
-  --image "Syringe Pump Drawing v1.png"
-
-# Interactive keyboard jog controller
-python robot_control/scripts/interactive_control.py
-
-# Guided calibration (axes, endstops, servos, bed mesh)
-python robot_control/scripts/calibrate.py --steps-x
 ```
 
 ---

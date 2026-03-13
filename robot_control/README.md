@@ -11,7 +11,8 @@ Communicates with Klipper via its Unix Domain Socket (UDS) API using JSON + `0x0
 ```
 robot_control/
 ├── Arduino_Scripts/             Arduino firmware for servo control
-│   └── servo_control.ino        Reads PB6/PB7 from Octopus, drives servos
+│   ├── servo_control.ino        Reads PB6/PB7 from Octopus, drives servos
+│   └── servo_setup.ino          Minimal servo-position finder sketch
 │
 ├── configs/                     Configuration layer
 │   ├── machine.yaml             Single source of truth for all hardware params
@@ -23,7 +24,6 @@ robot_control/
 ├── hardware/                    Klipper communication layer
 │   ├── klipper_client.py        UDS client: connect, send G-code, query state
 │   ├── job_executor.py          Runs Job IR via client (file or interactive mode)
-│   ├── interactive.py           Curses TUI for keyboard jog / manual control
 │   └── pump_control.py          Syringe pump stepper helpers (home, move, volume)
 │
 ├── images/                      Input images for run_lineart_tracer.py
@@ -40,17 +40,21 @@ robot_control/
 │   ├── routines.py              Guided interactive calibration sequences
 │   └── measurement.py           User prompts and correction math
 │
-├── scripts/                     CLI entry points
-│   ├── run_lineart_tracer.py    Standalone line-art / hatched-fill tracer + robot execution
-│   ├── run_tracer.py            Execute pre-generated pen_vectors.yaml on the robot
-│   ├── test_motors.py           Hardware bring-up (motors, endstops, homing, circles)
-│   ├── test_connection.py       Verify Klipper API reachable
-│   ├── test_motion.py           Homing + coordinated XY move checks
-│   ├── test_pumps.py            Syringe pump hardware bring-up (motor, endstop, homing)
-│   ├── pump_testbed.py          Interactive CMY + purge pump testbed (menu-driven)
-│   ├── calibrate.py             Guided calibration entry point
-│   ├── run_job.py               Run patterns or job files
-│   └── interactive_control.py   Launch keyboard jog controller
+├── scripts/
+│   ├── robot_cli.py             Unified CLI entry point (Rich + questionary)
+│   ├── cli/                     CLI modes (interactive, pump, tracer, calibration)
+│   │   ├── app.py               Main app shell, mode registry, menu loop
+│   │   ├── connection.py        Klipper connection manager (connect, recover, poll)
+│   │   ├── interactive_control.py  Keyboard jog (readchar + Rich Live)
+│   │   ├── pump_controller.py   Pump tests, control, calibration
+│   │   ├── lineart_tracer.py    Interactive image → robot pipeline
+│   │   ├── calibration.py       Axes, endstops, servos, bed mesh
+│   │   ├── session_log.py       Timestamped session logging
+│   │   └── widgets.py           Reusable Rich panels and status bar
+│   ├── run_lineart_tracer.py    Standalone line-art tracer (also used by CLI)
+│   ├── run_tracer.py            Execute pre-generated pen_vectors.yaml
+│   ├── run_job.py               Run calibration patterns (square, grid, etc.)
+│   └── test_motors.py           Hardware bring-up (FORCE_MOVE, MCU diag, circles)
 │
 └── tests/                       pytest suite (runs without hardware)
     ├── test_config_and_printer_cfg.py
@@ -231,7 +235,43 @@ When `--dry-run` is used, two previews are generated:
 
 ---
 
-## Other scripts
+## Unified CLI (`robot_cli.py`)
+
+The primary interface for all robot control.  Launch it and choose a mode from the menu:
+
+```bash
+.venv/bin/python robot_control/scripts/robot_cli.py
+.venv/bin/python robot_control/scripts/robot_cli.py --no-config-write
+.venv/bin/python robot_control/scripts/robot_cli.py --config path/to/machine.yaml
+```
+
+### CLI modes
+
+| Mode | Module | What it does |
+|------|--------|-------------|
+| **Interactive Control** | `cli/interactive_control.py` | Keyboard jog (arrows / PgUp/Dn), homing, tool select, digital outputs, pump dispense |
+| **Pump Controller** | `cli/pump_controller.py` | Pump tests (juggle, volume, speed ramp, repeatability), control (home, dispense, purge, fill), calibration (volume accuracy, mixing) |
+| **Lineart Tracer** | `cli/lineart_tracer.py` | Interactive image selection, mode/parameter editing, dry-run or execute on robot |
+| **Calibration** | `cli/calibration.py` | Steps/mm, Z heights, tool offset, speed test, endstops, endstop phase, servo/valve tests, bed mesh |
+
+### Interactive Control keymap
+
+| Key | Action | Key | Action |
+|-----|--------|-----|--------|
+| Arrow keys | Jog X/Y | Page Up/Down | Jog Z |
+| +/- | Change jog step | H | Home X Y Z |
+| G | Go to position | P | Select pen |
+| A | Select airbrush | U | Tool up |
+| L | Tool down | O | Canvas origin |
+| 1 | Pump refill servo | 2 | Needle servo |
+| V | Air supply valve | F | Cycle pump |
+| D | Dispense pump | R | Retract pump |
+| J | Home pump | Esc | Emergency stop |
+| Q | Quit | | |
+
+---
+
+## Other standalone scripts
 
 ### run_tracer.py -- Execute pre-generated pen vectors
 
@@ -243,73 +283,6 @@ Loads a `pen_vectors.yaml` and drives the robot through the drawing sequence.
   --image "peakpx (4) high res" --dry-run
 ```
 
-### test_connection.py -- Verify Klipper API connectivity
-
-```bash
-.venv/bin/python robot_control/scripts/test_connection.py
-```
-
-### test_motors.py -- Hardware bring-up
-
-Writes `printer.cfg`, restarts Klipper, tests motors, endstops, homing, and circles.
-
-```bash
-.venv/bin/python robot_control/scripts/test_motors.py
-.venv/bin/python robot_control/scripts/test_motors.py --skip-to-homing --no-config-write
-```
-
-### test_motion.py -- Coordinated motion test
-
-```bash
-.venv/bin/python robot_control/scripts/test_motion.py
-```
-
-### test_pumps.py -- Syringe pump hardware bring-up
-
-Writes a minimal `printer.cfg` (`kinematics: none`) with only the selected pump motor.  Tests motor spin, endstop, homing, full travel, and volume dispensing.
-
-```bash
-.venv/bin/python robot_control/scripts/test_pumps.py
-.venv/bin/python robot_control/scripts/test_pumps.py --pump pump_1
-.venv/bin/python robot_control/scripts/test_pumps.py --no-config-write
-```
-
-### pump_testbed.py -- Interactive pump testbed
-
-Menu-driven script for testing, controlling, and calibrating all four syringe pumps (Cyan, Magenta, Yellow, Purge/IPA).  Axis motors are disabled -- only pump steppers are active.
-
-```bash
-.venv/bin/python robot_control/scripts/pump_testbed.py
-.venv/bin/python robot_control/scripts/pump_testbed.py --no-config-write
-```
-
-### calibrate.py -- Guided calibration
-
-Opt-in calibration routines for axes, endstops, digital outputs (servos / valve), and bed mesh.
-
-```bash
-# Axis calibration
-.venv/bin/python robot_control/scripts/calibrate.py --steps-x      # X rotation_distance
-.venv/bin/python robot_control/scripts/calibrate.py --steps-y      # Y rotation_distance
-.venv/bin/python robot_control/scripts/calibrate.py --z-heights    # Z seesaw heights
-.venv/bin/python robot_control/scripts/calibrate.py --tool-offset  # Pen vs airbrush XY offset
-.venv/bin/python robot_control/scripts/calibrate.py --speed        # Drawing speed test
-
-# Endstop verification
-.venv/bin/python robot_control/scripts/calibrate.py --endstops             # 10-cycle repeatability
-.venv/bin/python robot_control/scripts/calibrate.py --endstops --cycles 20 # 20 cycles
-.venv/bin/python robot_control/scripts/calibrate.py --endstop-phase        # Klipper endstop phase cal
-
-# Digital output tests (Arduino servos + solenoid valve)
-.venv/bin/python robot_control/scripts/calibrate.py --servo-refill   # Pump refill servo (PB6)
-.venv/bin/python robot_control/scripts/calibrate.py --servo-needle   # Airbrush needle servo (PB7)
-.venv/bin/python robot_control/scripts/calibrate.py --air-valve      # Air supply solenoid (PG15)
-
-# Bed mesh
-.venv/bin/python robot_control/scripts/calibrate.py --bed-mesh             # Surface leveling
-.venv/bin/python robot_control/scripts/calibrate.py --bed-mesh --full-canvas
-```
-
 ### run_job.py -- Execute calibration patterns
 
 ```bash
@@ -317,26 +290,15 @@ Opt-in calibration routines for axes, endstops, digital outputs (servos / valve)
 .venv/bin/python robot_control/scripts/run_job.py --pattern circle --interactive
 ```
 
-### interactive_control.py -- Keyboard jog controller
+### test_motors.py -- Hardware bring-up
+
+First-time motor/endstop validation via FORCE_MOVE.  Writes `printer.cfg`, restarts Klipper, then runs six phases: motor spin (Y, Z, dual-X), endstop check, homing, limit reach, and helical circle tests.  Includes MCU diagnostics.
 
 ```bash
-.venv/bin/python robot_control/scripts/interactive_control.py
+.venv/bin/python robot_control/scripts/test_motors.py
+.venv/bin/python robot_control/scripts/test_motors.py --skip-to-homing --no-config-write
+.venv/bin/python robot_control/scripts/test_motors.py --endstops-only
 ```
-
-| Key | Action | Key | Action |
-|-----|--------|-----|--------|
-| Arrow keys | Jog X/Y | Page Up/Down | Jog Z |
-| +/- | Change jog step | H | Home X Y Z |
-| G | Go to position | P | Select pen |
-| A | Select airbrush | U | Tool up |
-| D | Tool down | O | Canvas origin |
-| 1 | Pump refill servo | 2 | Needle servo |
-| V | Air supply valve | F | Cycle pump |
-| [ | Dispense pump | ] | Retract pump |
-| \\ | Home pump | Esc | Emergency stop |
-| Q | Quit | | |
-
-Motors are not enabled on startup -- press H to home.  Pump steppers are auto-disabled after each move.
 
 ---
 
@@ -409,5 +371,5 @@ The Arduino firmware is at `Arduino_Scripts/servo_control.ino`.
 | Endstops always TRIGGERED | Polarity inverted | Toggle `endstop_polarity` in machine.yaml |
 | Vibrations at high speed | Acceleration too high | Lower `max_accel_mm_s2` |
 | Servo not responding | Arduino not powered / wired | Check USB + A0/A1 wiring to Octopus PB6/PB7 |
-| Air valve not actuating | PG15 not in printer.cfg | Re-run calibrate.py to regenerate printer.cfg |
-| Pump motor jitters (no pump test) | Floating XYZ step/dir pins | Use `test_pumps.py` (silences unused axes) |
+| Air valve not actuating | PG15 not in printer.cfg | Use CLI Calibration mode to regenerate printer.cfg |
+| Pump motor jitters | Floating XYZ step/dir pins | Use CLI Pump Controller (writes pump-only printer.cfg) |
