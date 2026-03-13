@@ -27,7 +27,7 @@ Usage:
     
     # Load configs and LUTs
     sim_cfg = fs.load_yaml("configs/sim/physics_v1.yaml")
-    env_cfg = fs.load_yaml("configs/env_airbrush_v1.yaml")
+    env_cfg = {"work_area_mm": (210.0, 297.0), "render_px": (908, 1280)}
     luts = load_toy_luts()  # or load calibrated LUTs
     
     # Initialize renderer

@@ -54,18 +54,40 @@ from src.utils import (
 # FIXTURES
 # ============================================================================
 
-@pytest.fixture(scope="module")
-def project_root():
-    """Project root directory."""
-    return Path(__file__).parent.parent
+_MACHINE_CFG_DATA = {
+    'schema': 'machine.v1',
+    'work_area_mm': {'x': 250.0, 'y': 350.0, 'z': 40.0},
+    'canvas_mm': {'x_min': 20.0, 'x_max': 230.0, 'y_min': 26.5, 'y_max': 323.5},
+    'gcode_flavor': 'grbl_1.1f',
+    'units': 'mm',
+    'feed_units': 'mm/min',
+    'feeds': {'max_xy_mm_s': 200.0, 'max_z_mm_s': 30.0, 'rapid_mm_s': 300.0},
+    'acceleration': {'max_xy_mm_s2': 1000.0, 'max_z_mm_s2': 500.0},
+    'macros': {
+        'include_dir': 'macros/',
+        'purge': 'purge.g',
+        'pen_up': 'pen_up.g',
+        'pen_down': 'pen_down.g',
+    },
+    'safety': {
+        'soft_limits': True,
+        'purge_zone_mm': {'x': [0.0, 20.0], 'y': [0.0, 26.5], 'z': [0.0, 40.0]},
+    },
+}
 
 
 @pytest.fixture(scope="module")
-def machine_cfg(project_root):
-    """Load machine configuration (shared across module)."""
-    return validators.load_machine_profile(
-        project_root / "configs/machine_grbl_airbrush_v1.yaml"
-    )
+def machine_cfg_path(tmp_path_factory):
+    """Write a valid machine config to a temp file and return its path."""
+    cfg_path = tmp_path_factory.mktemp("configs") / "machine_test.yaml"
+    fs.atomic_yaml_dump(_MACHINE_CFG_DATA, cfg_path)
+    return cfg_path
+
+
+@pytest.fixture(scope="module")
+def machine_cfg(machine_cfg_path):
+    """Load machine configuration from temp file (shared across module)."""
+    return validators.load_machine_profile(machine_cfg_path)
 
 
 # ============================================================================
@@ -1068,11 +1090,9 @@ def test_profiler_nvtx():
 # VALIDATORS TESTS
 # ============================================================================
 
-def test_validators_stroke_bounds(project_root):
+def test_validators_stroke_bounds(machine_cfg_path):
     """Test get_stroke_bounds returns correct canvas dimensions."""
-    bounds = validators.get_stroke_bounds(
-        project_root / "configs/machine_grbl_airbrush_v1.yaml"
-    )
+    bounds = validators.get_stroke_bounds(machine_cfg_path)
     assert 'x' in bounds and 'y' in bounds and 'z' in bounds
     assert bounds['x'] == (20.0, 230.0)
     assert bounds['y'] == (26.5, 323.5)
@@ -1114,16 +1134,14 @@ def test_validators_out_of_bounds_stroke():
         validators.StrokeV1(**stroke_data)
 
 
-def test_validators_machine_profile(project_root):
-    """Test load_machine_profile works with real config."""
-    machine_cfg = validators.load_machine_profile(
-        project_root / "configs/machine_grbl_airbrush_v1.yaml"
-    )
-    assert machine_cfg.schema_version == "machine.v1"
-    assert machine_cfg.work_area_mm.x == 250.0
-    assert machine_cfg.canvas_mm.x_min == 20.0
-    assert machine_cfg.canvas_mm.x_max == 230.0
-    assert machine_cfg.gcode_flavor == "grbl_1.1f"
+def test_validators_machine_profile(machine_cfg_path):
+    """Test load_machine_profile works with inline config."""
+    cfg = validators.load_machine_profile(machine_cfg_path)
+    assert cfg.schema_version == "machine.v1"
+    assert cfg.work_area_mm.x == 250.0
+    assert cfg.canvas_mm.x_min == 20.0
+    assert cfg.canvas_mm.x_max == 230.0
+    assert cfg.gcode_flavor == "grbl_1.1f"
 
 
 def test_validators_flatten_config():

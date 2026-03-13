@@ -558,13 +558,13 @@ def validate_strokes_file(path: Union[str, Path]) -> StrokesFileV1:
         raise ValueError(f"Strokes file validation failed at {path}: {e}") from e
 
 
-def get_stroke_bounds(machine_cfg_path: Union[str, Path] = "configs/machine_grbl_airbrush_v1.yaml") -> Dict[str, Tuple[float, float]]:
+def get_stroke_bounds(machine_cfg_path: Union[str, Path]) -> Dict[str, Tuple[float, float]]:
     """Get stroke parameter bounds from machine profile.
     
     Parameters
     ----------
     machine_cfg_path : Union[str, Path]
-        Path to machine profile, default "configs/machine_grbl_airbrush_v1.yaml"
+        Path to a machine.v1.yaml profile
     
     Returns
     -------
