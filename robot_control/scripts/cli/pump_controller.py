@@ -1325,8 +1325,12 @@ def _calibrate_volume(s: _PumpSession) -> None:
         return
 
     _show_cal_statistics(s, pid, results, csv_path)
-
     s.render_screen()
+    questionary.press_any_key_to_continue(
+        "Press any key to view charts..."
+    ).ask()
+
+    s.console.clear()
     _show_cal_charts(s, results)
 
     total_travel = sum(r["travel_mm"] for r in results)
@@ -1339,7 +1343,12 @@ def _calibrate_volume(s: _PumpSession) -> None:
         )
         s.log(f"  (currently {sy.plunger_travel_mm:.4f})")
 
-        s.render_screen()
+    questionary.press_any_key_to_continue(
+        "Press any key to continue..."
+    ).ask()
+
+    s.render_screen()
+    if total_measured > 0 and total_travel > 0:
         if s.app.confirm_dangerous("Save corrected value to machine.yaml"):
             _save_volume_calibration(
                 {
