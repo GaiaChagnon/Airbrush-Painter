@@ -5,6 +5,7 @@ Provides centralized validation for all configuration files using pydantic:
     - LUT schema (luts.v1.yaml): Color/PSF/alpha lookup table metadata
     - Machine schema (machine.v1.yaml): Work area, feeds, G-code flavor, macros
     - Job schema (job.v1.yaml): Complete job specification for inference
+    - Calibration schema (calibration.v1): GPU digital-twin simulator parameters
 
 All modules must use these validators to load configs for fail-fast error detection
 with actionable messages (line numbers, offending keys, expected ranges).
@@ -20,6 +21,7 @@ Usage:
     job_cfg = validators.load_job_config("job.yaml")
     machine_cfg = validators.load_machine_profile("machine.yaml")
     strokes = validators.validate_strokes_file("strokes.yaml")
+    cal_cfg = validators.load_calibration_config("calibration.yaml")
 """
 
 from pathlib import Path
@@ -1150,3 +1152,336 @@ def load_pen_vectors(path: Union[str, Path]) -> PenVectorsV1:
         return PenVectorsV1(**data)
     except Exception as e:
         raise ValueError(f"Pen vectors validation failed at {path}: {e}") from e
+
+
+# ============================================================================
+# CALIBRATION SCHEMA V1  (digital_twin/calibration.yaml)
+# ============================================================================
+
+class CalibrationProfileV1(BaseModel):
+    """Radial spray profile shape parameters.
+
+    The canonical 1-D curve phi(u) with u = r / R(z):
+        u <= core_frac           : phi = 1.0
+        core_frac < u <= margin  : phi = exp(-((u-core_frac)/sigma)^power)
+        u > margin_factor        : phi = 0.0
+    """
+    core_frac: float = Field(
+        0.40, ge=0.0, le=1.0,
+        description="Flat-core radius as fraction of R(z) [0..1]",
+    )
+    skirt_sigma_frac: float = Field(
+        0.28, ge=0.01, le=2.0,
+        description="Gaussian skirt sigma as fraction of R(z) [0.01..2]",
+    )
+    skirt_power: float = Field(
+        1.8, ge=0.5, le=5.0,
+        description="Tail shaping exponent [0.5..5]",
+    )
+    margin_factor: float = Field(
+        1.5, ge=1.0, le=3.0,
+        description="ROI extent as multiple of R(z) [1..3]",
+    )
+    profile_resolution: int = Field(
+        1024, ge=64, le=4096,
+        description="Number of samples in the canonical 1-D profile",
+    )
+
+
+class CalibrationRenderSettings(BaseModel):
+    """Canvas geometry for the GPU simulator."""
+    canvas_hw: Tuple[int, int] = Field(
+        (908, 1280),
+        description="Canvas size in pixels (height, width), each >= 16",
+    )
+    work_area_mm: Tuple[float, float] = Field(
+        (210.0, 297.0),
+        description="Physical canvas size (width_mm, height_mm), each > 0",
+    )
+
+    @field_validator("canvas_hw")
+    @classmethod
+    def _hw_positive(cls, v: Tuple[int, int]) -> Tuple[int, int]:
+        if v[0] < 16 or v[1] < 16:
+            raise ValueError(
+                f"canvas_hw entries must be >= 16, got {v}"
+            )
+        return v
+
+    @field_validator("work_area_mm")
+    @classmethod
+    def _area_positive(cls, v: Tuple[float, float]) -> Tuple[float, float]:
+        if v[0] <= 0 or v[1] <= 0:
+            raise ValueError(
+                f"work_area_mm entries must be > 0, got {v}"
+            )
+        return v
+
+
+class CalibrationSamplingConfig(BaseModel):
+    """Stroke-sampling parameters for the GPU compositor."""
+    max_step_mm: float = Field(
+        0.25, gt=0.0, le=5.0,
+        description="Max arc-length spacing between stamps (mm)",
+    )
+    min_samples: int = Field(
+        8, ge=2, le=1000,
+        description="Minimum stamps per stroke",
+    )
+    normalize_cross_section: bool = Field(
+        True,
+        description="Normalize stamp integral for mass conservation",
+    )
+
+
+class CalibrationColorAxes(BaseModel):
+    """Color-LUT grid shape and domain."""
+    c_steps: int = Field(11, ge=2, le=64)
+    m_steps: int = Field(11, ge=2, le=64)
+    y_steps: int = Field(11, ge=2, le=64)
+    domain: Tuple[float, float] = Field(
+        (0.0, 1.0),
+        description="CMY input domain [lo, hi]",
+    )
+
+    @field_validator("domain")
+    @classmethod
+    def _domain_ordered(cls, v: Tuple[float, float]) -> Tuple[float, float]:
+        if v[0] >= v[1]:
+            raise ValueError(
+                f"domain lo must be < hi, got {v}"
+            )
+        return v
+
+
+# -- Raw-measurement sub-models -------------------------------------------
+
+class DotMeasurement(BaseModel):
+    """One dot measurement from a printed dot sheet."""
+    test_id: str = Field(..., min_length=1)
+    z_mm: float = Field(..., ge=0.0, le=30.0)
+    color_recipe_cmy: Tuple[float, float, float]
+    diameter_mm: float = Field(..., gt=0.0, le=50.0)
+    center_rgb: Tuple[float, float, float]
+    mid_rgb: Tuple[float, float, float]
+    edge_rgb: Tuple[float, float, float]
+    background_rgb: Tuple[float, float, float]
+
+
+class LineMeasurement(BaseModel):
+    """One line measurement from a printed line sheet."""
+    test_id: str = Field(..., min_length=1)
+    z_mm: float = Field(..., ge=0.0, le=30.0)
+    speed_mm_s: float = Field(..., ge=1.0, le=300.0)
+    color_recipe_cmy: Tuple[float, float, float]
+    width_mm: float = Field(..., gt=0.0, le=50.0)
+    center_rgb: Tuple[float, float, float]
+    shoulder_rgb: Tuple[float, float, float]
+    edge_rgb: Tuple[float, float, float]
+    background_rgb: Tuple[float, float, float]
+
+
+class SwatchMeasurement(BaseModel):
+    """One color-swatch measurement from a printed swatch chart."""
+    recipe_id: str = Field(..., min_length=1)
+    cmy_command: Tuple[float, float, float]
+    interior_rgb: Tuple[float, float, float]
+
+
+class OverlapMeasurement(BaseModel):
+    """One overlap/layering measurement from a staircase pattern."""
+    pattern_id: str = Field(..., min_length=1)
+    colors: List[Tuple[float, float, float]]
+    single_rgbs: List[Tuple[float, float, float]]
+    overlap_rgbs: List[Tuple[float, float, float]]
+
+
+class RawMeasurements(BaseModel):
+    """Container for all raw calibration measurements."""
+    dots: Dict[str, DotMeasurement] = Field(default_factory=dict)
+    lines: Dict[str, LineMeasurement] = Field(default_factory=dict)
+    swatches: Dict[str, SwatchMeasurement] = Field(default_factory=dict)
+    overlaps: Dict[str, OverlapMeasurement] = Field(default_factory=dict)
+
+
+class CalibrationValidationResult(BaseModel):
+    """Summary of the most recent validation run."""
+    last_run: Optional[str] = None
+    overall_delta_e_mean: Optional[float] = None
+    overall_delta_e_max: Optional[float] = None
+    per_block: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CalibrationPreviewSettings(BaseModel):
+    """Output paths for preview artifacts."""
+    dpi: int = Field(150, ge=50, le=600)
+    output_dir: str = Field("outputs/digital_twin")
+
+
+class CalibrationV1(BaseModel):
+    """Top-level schema for ``digital_twin/calibration.yaml``.
+
+    Every physics parameter the GPU simulator reads lives here.
+    No hardcoded constants in the rendering code.
+    """
+    schema_version: str = Field(
+        "calibration.v1",
+        description="Schema identifier (do not change)",
+    )
+
+    # Interpolation grids
+    z_grid_mm: List[float] = Field(..., min_length=2)
+    speed_grid_mm_s: List[float] = Field(..., min_length=2)
+
+    # LUTs
+    radius_lut_mm: List[float] = Field(..., min_length=2)
+    mass_lut: List[List[float]] = Field(..., min_length=2)
+    k_mass: float = Field(..., gt=0.0, le=100.0)
+
+    # Profile
+    profile: CalibrationProfileV1 = Field(
+        default_factory=CalibrationProfileV1,
+    )
+
+    # Color
+    color_axes: CalibrationColorAxes = Field(
+        default_factory=CalibrationColorAxes,
+    )
+    color_lut_path: Optional[str] = None
+    color_gain_lut: Optional[List[List[List[float]]]] = None
+    layer_gain_lut: Optional[List[float]] = None
+
+    # Paper
+    paper_white_rgb: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+
+    # Rendering / sampling
+    render: CalibrationRenderSettings = Field(
+        default_factory=CalibrationRenderSettings,
+    )
+    sampling: CalibrationSamplingConfig = Field(
+        default_factory=CalibrationSamplingConfig,
+    )
+
+    # Measurements
+    raw_measurements: RawMeasurements = Field(
+        default_factory=RawMeasurements,
+    )
+
+    # Validation
+    validation: CalibrationValidationResult = Field(
+        default_factory=CalibrationValidationResult,
+    )
+
+    # Preview
+    preview_settings: CalibrationPreviewSettings = Field(
+        default_factory=CalibrationPreviewSettings,
+    )
+
+    # -- Cross-field validators --------------------------------------------
+
+    @field_validator("schema_version")
+    @classmethod
+    def _check_schema(cls, v: str) -> str:
+        if v != "calibration.v1":
+            raise ValueError(
+                f"Expected schema_version 'calibration.v1', got '{v}'"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _check_grid_consistency(self) -> "CalibrationV1":
+        nz = len(self.z_grid_mm)
+        nv = len(self.speed_grid_mm_s)
+
+        if len(self.radius_lut_mm) != nz:
+            raise ValueError(
+                f"radius_lut_mm length ({len(self.radius_lut_mm)}) "
+                f"must equal z_grid_mm length ({nz})"
+            )
+
+        if len(self.mass_lut) != nz:
+            raise ValueError(
+                f"mass_lut has {len(self.mass_lut)} rows, "
+                f"expected {nz} (one per z_grid_mm entry)"
+            )
+        for i, row in enumerate(self.mass_lut):
+            if len(row) != nv:
+                raise ValueError(
+                    f"mass_lut row {i} has {len(row)} entries, "
+                    f"expected {nv} (one per speed_grid_mm_s entry)"
+                )
+
+        for i, r in enumerate(self.radius_lut_mm):
+            if r < 0:
+                raise ValueError(
+                    f"radius_lut_mm[{i}] = {r} must be >= 0"
+                )
+
+        for i, row in enumerate(self.mass_lut):
+            for j, m in enumerate(row):
+                if m < 0:
+                    raise ValueError(
+                        f"mass_lut[{i}][{j}] = {m} must be >= 0"
+                    )
+
+        return self
+
+
+# ============================================================================
+# PUBLIC API  (calibration)
+# ============================================================================
+
+def load_calibration_config(
+    path: Union[str, Path],
+) -> CalibrationV1:
+    """Load and validate a digital-twin calibration YAML.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to ``calibration.yaml``.
+
+    Returns
+    -------
+    CalibrationV1
+        Validated calibration model.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *path* does not exist.
+    ValueError
+        If validation fails (actionable message with offending key).
+    """
+    from . import fs
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Calibration config not found: {path}")
+
+    data = fs.load_yaml(path)
+    try:
+        return CalibrationV1(**data)
+    except Exception as e:
+        raise ValueError(
+            f"Calibration config validation failed at {path}: {e}"
+        ) from e
+
+
+def save_calibration_config(
+    cal: CalibrationV1,
+    path: Union[str, Path],
+) -> None:
+    """Atomically write a validated calibration model to YAML.
+
+    Parameters
+    ----------
+    cal : CalibrationV1
+        Validated calibration model.
+    path : str or Path
+        Destination path.
+    """
+    from . import fs
+
+    data = cal.model_dump(mode="json")
+    fs.atomic_yaml_dump(data, Path(path))

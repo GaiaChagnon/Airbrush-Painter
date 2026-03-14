@@ -1,0 +1,133 @@
+# Digital Twin Calibration Configuration
+# Purpose: All physics parameters for the GPU stamp-splatting airbrush simulator.
+# Used by: digital_twin/gpu_simulator.py
+# Populated by: digital_twin/calibration_cli.py
+#
+# Every number the simulator reads comes from this file.
+# No hardcoded physics constants exist in code.
+#
+# Units: mm for geometry, mm/s for speed, linear RGB [0,1] for color.
+
+schema_version: "calibration.v1"
+
+# ---------------------------------------------------------------------------
+# Interpolation grids
+# ---------------------------------------------------------------------------
+# z_grid_mm: nozzle-to-paper heights at which radius and mass are sampled.
+# speed_grid_mm_s: traverse speeds at which mass is sampled.
+# All LUT rows/columns are indexed by these grids.
+z_grid_mm: [2.0, 4.0, 6.0, 8.0, 10.0, 15.0, 20.0]
+speed_grid_mm_s: [10.0, 30.0, 60.0, 120.0, 240.0]
+
+# ---------------------------------------------------------------------------
+# Spray footprint: radius_lut_mm[z]
+# ---------------------------------------------------------------------------
+# Spray half-width in mm at each z_grid point.
+# Fitted from dot-sheet visible diameters: radius = diameter / 2.
+# len(radius_lut_mm) must equal len(z_grid_mm).
+radius_lut_mm: [0.43, 0.71, 1.10, 1.64, 2.24, 3.46, 4.90]
+
+# ---------------------------------------------------------------------------
+# Deposition: mass_lut[z][speed]
+# ---------------------------------------------------------------------------
+# Opacity deposited per mm of path length.
+# Indexed [z_grid][speed_grid], so shape is (Nz, Nv).
+# Fitted from line-sheet center darkness relative to background.
+# Each row must have len(speed_grid_mm_s) entries.
+mass_lut:
+  - [0.80, 0.27, 0.13, 0.07, 0.03]    # z = 2 mm
+  - [0.70, 0.23, 0.12, 0.06, 0.03]    # z = 4 mm
+  - [0.60, 0.20, 0.10, 0.05, 0.025]   # z = 6 mm
+  - [0.50, 0.17, 0.08, 0.04, 0.02]    # z = 8 mm
+  - [0.42, 0.14, 0.07, 0.035, 0.018]  # z = 10 mm
+  - [0.32, 0.11, 0.05, 0.027, 0.013]  # z = 15 mm
+  - [0.25, 0.08, 0.04, 0.02, 0.01]    # z = 20 mm
+
+# ---------------------------------------------------------------------------
+# Amplitude scale
+# ---------------------------------------------------------------------------
+# Global gain multiplied into alpha = k_mass * mass * ds * phi / integral.
+# Range: (0, 100].  Typical: 5-15 for alcohol ink.
+k_mass: 8.5
+
+# ---------------------------------------------------------------------------
+# Radial profile shape
+# ---------------------------------------------------------------------------
+# Defines the canonical 1-D radial intensity curve phi(u), u = r / R.
+#   u <= core_frac:           phi = 1.0            (flat core)
+#   core_frac < u <= 1.0:     phi = exp(-((u-core_frac)/sigma)^power)
+#   u > margin_factor:        phi = 0.0            (hard cutoff)
+# profile_resolution: number of samples stored in the 1-D table.
+profile:
+  core_frac: 0.40
+  skirt_sigma_frac: 0.28
+  skirt_power: 1.8
+  margin_factor: 1.5
+  profile_resolution: 1024
+
+# ---------------------------------------------------------------------------
+# Color LUT  (CMY -> linear RGB)
+# ---------------------------------------------------------------------------
+# color_axes defines the grid resolution and input domain.
+# color_lut_path: path to a .pt tensor of shape (c_steps, m_steps, y_steps, 3).
+#   null => generate a default subtractive model: RGB = 1 - CMY.
+# color_gain_lut: optional per-recipe scalar gain, same grid shape (Nc, Nm, Ny).
+#   null => no gain correction.
+# layer_gain_lut: optional correction per accumulated layer count [1-layer, 2, 3, 4].
+#   null => no layering correction.
+color_axes:
+  c_steps: 11
+  m_steps: 11
+  y_steps: 11
+  domain: [0.0, 1.0]
+
+color_lut_path: null
+color_gain_lut: null
+layer_gain_lut: null
+
+# ---------------------------------------------------------------------------
+# Scanner / paper normalization
+# ---------------------------------------------------------------------------
+# Linear RGB of the unprinted paper surface as measured by the scanner.
+# Used to normalize measurements into the simulator's observation space.
+paper_white_rgb: [1.0, 1.0, 1.0]
+
+# ---------------------------------------------------------------------------
+# Rendering geometry
+# ---------------------------------------------------------------------------
+render:
+  canvas_hw: [908, 1280]          # pixels [height, width]
+  work_area_mm: [210.0, 297.0]   # physical size [width_mm, height_mm]
+
+# ---------------------------------------------------------------------------
+# Stroke sampling
+# ---------------------------------------------------------------------------
+sampling:
+  max_step_mm: 0.25              # max arc-length spacing between stamps
+  min_samples: 8                 # minimum stamps per stroke
+  normalize_cross_section: true  # normalize stamp integral for mass conservation
+
+# ---------------------------------------------------------------------------
+# Raw measurements  (populated by calibration_cli.py)
+# ---------------------------------------------------------------------------
+raw_measurements:
+  dots: {}
+  lines: {}
+  swatches: {}
+  overlaps: {}
+
+# ---------------------------------------------------------------------------
+# Validation summary  (populated by preview/validate block)
+# ---------------------------------------------------------------------------
+validation:
+  last_run: null
+  overall_delta_e_mean: null
+  overall_delta_e_max: null
+  per_block: {}
+
+# ---------------------------------------------------------------------------
+# Preview output settings
+# ---------------------------------------------------------------------------
+preview_settings:
+  dpi: 150
+  output_dir: "outputs/digital_twin"
