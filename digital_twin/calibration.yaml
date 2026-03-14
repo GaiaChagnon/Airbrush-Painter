@@ -95,6 +95,12 @@ paper_white_rgb: [1.0, 1.0, 1.0]
 # ---------------------------------------------------------------------------
 # Rendering geometry
 # ---------------------------------------------------------------------------
+# NOTE: canvas_hw and work_area_mm determine DPI independently per axis.
+# If you need square pixels for scanned-image comparison, ensure
+# canvas_hw[0]/work_area_mm[1] == canvas_hw[1]/work_area_mm[0].
+# Current defaults give non-square pixels (~6.1 px/mm horizontal,
+# ~3.1 px/mm vertical).  Swap canvas_hw to [1280, 908] for roughly
+# square pixels on A4 portrait, or adjust to match your scanner setup.
 render:
   canvas_hw: [908, 1280]          # pixels [height, width]
   work_area_mm: [210.0, 297.0]   # physical size [width_mm, height_mm]
@@ -106,6 +112,9 @@ sampling:
   max_step_mm: 0.25              # max arc-length spacing between stamps
   min_samples: 8                 # minimum stamps per stroke
   normalize_cross_section: true  # normalize stamp integral for mass conservation
+  dot_reference_speed_mm_s: 60.0 # speed for mass_lut lookup when simulating dots
+  bezier_max_err_mm: 0.25        # Bezier flattening chord tolerance (mm)
+  bezier_max_depth: 12           # Bezier adaptive subdivision limit
 
 # ---------------------------------------------------------------------------
 # Raw measurements  (populated by calibration_cli.py)
@@ -131,3 +140,8 @@ validation:
 preview_settings:
   dpi: 150
   output_dir: "outputs/digital_twin"
+  delta_e_warn_threshold: 3.0    # dE below this is PASS
+  delta_e_fail_threshold: 5.0    # dE above this is FAIL; between = WARN
+  default_color_cmy: [0.8, 0.2, 0.1]  # reference recipe for preview renders
+  default_z_mm: 6.0              # default nozzle height for fill previews
+  default_speed_mm_s: 30.0       # default speed for fill previews

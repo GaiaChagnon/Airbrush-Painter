@@ -45,6 +45,7 @@ import socket
 import sys
 import time
 from pathlib import Path
+from collections.abc import Callable
 from typing import Optional
 
 import cv2  # type: ignore[import-not-found]
@@ -476,9 +477,19 @@ class PaperTransform:
 
         Image frame: top-left origin, +Y down.
         Machine frame: bottom-left origin, +Y up.
+
+        A 180-degree pre-rotation is applied to compensate for the
+        physical bed axis orientation: when viewed from the operator's
+        position the machine's effective frame is rotated 180 degrees
+        from the nominal (bottom-left, +Y up) convention.
+
         When ``mirror_x`` is True, the X axis is flipped so the image
         is horizontally mirrored on paper.
         """
+        # 180° correction for physical bed orientation
+        x_img = self.image_w - x_img
+        y_img = self.image_h - y_img
+
         x_scaled = x_img * self.scale
         y_scaled = y_img * self.scale
         if self.mirror_x:
@@ -606,6 +617,12 @@ def draw_rectangle(
 # Preview / export helpers
 # ===========================================================================
 
+# Standardised preview colour palette (BGR for OpenCV)
+_CLR_PAPER_BORDER = (219, 152, 52)    # #3498DB -- soft blue
+_CLR_MARGIN_BORDER = (34, 126, 230)   # #E67E22 -- amber/orange
+_CLR_DRAW_PATH = (60, 60, 60)         # #3C3C3C -- near-black
+_CLR_LABEL = (140, 130, 120)          # #788C8C -- slate grey
+
 
 def save_preview(
     paths_px: list[np.ndarray],
@@ -676,23 +693,23 @@ def render_machine_preview(
     sf = dpi / 10.0
     line_w = max(1, int(round(sf)))
 
-    # Draw paper border (light grey)
+    # Draw paper border
     paper_corners = transform.get_paper_corners()
     paper_pts = np.array(
         [mm_to_canvas(x, y) for x, y in paper_corners], dtype=np.int32,
     ).reshape(-1, 1, 2)
     cv2.polylines(canvas, [paper_pts], isClosed=True,
-                  color=(200, 200, 200), thickness=max(2, int(2 * sf)))
+                  color=_CLR_PAPER_BORDER, thickness=max(2, int(2 * sf)))
 
-    # Draw margin boundary (medium grey)
+    # Draw margin boundary
     margin_corners = transform.get_margin_corners()
     margin_pts = np.array(
         [mm_to_canvas(x, y) for x, y in margin_corners], dtype=np.int32,
     ).reshape(-1, 1, 2)
     cv2.polylines(canvas, [margin_pts], isClosed=True,
-                  color=(160, 160, 160), thickness=line_w)
+                  color=_CLR_MARGIN_BORDER, thickness=line_w)
 
-    # Draw all vectorised paths (black)
+    # Draw all vectorised paths
     for mpts in machine_paths:
         if len(mpts) < 2:
             continue
@@ -700,12 +717,12 @@ def render_machine_preview(
             [mm_to_canvas(x, y) for x, y in mpts], dtype=np.int32,
         ).reshape(-1, 1, 2)
         cv2.polylines(canvas, [pts], isClosed=False,
-                      color=(0, 0, 0), thickness=line_w)
+                      color=_CLR_DRAW_PATH, thickness=line_w)
 
     # Annotate dimensions
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.4 * sf
-    font_color = (120, 120, 120)
+    font_color = _CLR_LABEL
     font_thick = max(1, int(sf))
     line_spacing = int(14 * sf)
 
@@ -1257,6 +1274,8 @@ def _process_flow_imager(
     field_type: str = "noise",
     edge_field_multiplier: float | None = None,
     dark_field_multiplier: float | None = None,
+    invert: bool = False,
+    auto_contrast: bool = False,
     merge_tolerance_px: float = 5.0,
     simplify_tol_mm: float = 0.05,
     min_path_mm: float = 0.3,
@@ -1291,6 +1310,16 @@ def _process_flow_imager(
     edge_field_multiplier, dark_field_multiplier : float or None
         If set, blend edge-following or dark-curling fields into the
         noise field (try 1.0 as a starting point).
+    invert : bool
+        If True, invert the image before generating streamlines so
+        that white/light features receive dense lines instead of
+        sparse ones.  Use for images with prominent light subjects.
+    auto_contrast : bool
+        If True, apply CLAHE (Contrast Limited Adaptive Histogram
+        Equalization) to the image before generation.  Spreads the
+        brightness histogram so low-contrast images produce
+        stronger density variation in the output.  Applied before
+        invert, so both can be combined.
 
     Returns
     -------
@@ -1312,10 +1341,26 @@ def _process_flow_imager(
     if len(img.shape) == 3 and img.shape[2] == 4:
         alpha = img[:, :, 3]
 
+    if auto_contrast:
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        if len(img.shape) == 2:
+            img = clahe.apply(img)
+        else:
+            lab = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2LAB)
+            lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+            img[:, :, :3] = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    if invert:
+        if len(img.shape) == 2:
+            img = 255 - img
+        else:
+            img[:, :, :3] = 255 - img[:, :, :3]
+
     print(f"        Image: {W_orig} x {H_orig} px -> "
           f"{image_w_mm:.1f} x {image_h_mm:.1f} mm")
     print(f"        flow_seed={flow_seed}, field_type={field_type}, "
-          f"n_fields={n_fields}")
+          f"n_fields={n_fields}, invert={invert}, "
+          f"auto_contrast={auto_contrast}")
     print(f"        sep=[{min_sep}, {max_sep}], "
           f"length=[{min_length}, {max_length}], max_size={max_size}")
 
@@ -1447,6 +1492,8 @@ def process_image(
     flow_field_type: str = "noise",
     flow_edge_field_mult: float | None = None,
     flow_dark_field_mult: float | None = None,
+    flow_invert: bool = False,
+    flow_auto_contrast: bool = False,
     hatching_n_zones: int = 4,
     hatching_pen_width_mm: float = 0.3,
     hatching_angles: list[float] | None = None,
@@ -1532,6 +1579,8 @@ def process_image(
             field_type=flow_field_type,
             edge_field_multiplier=flow_edge_field_mult,
             dark_field_multiplier=flow_dark_field_mult,
+            invert=flow_invert,
+            auto_contrast=flow_auto_contrast,
             merge_tolerance_px=merge_tolerance_px,
             simplify_tol_mm=simplify_tol_mm,
             min_path_mm=min_path_mm,
@@ -1898,6 +1947,175 @@ def _process_hatched(
     return paths_mm, paths_px_final, image_w_mm, image_h_mm, mm_per_px, H, W
 
 
+def compute_execution_stats(
+    machine_paths: list[list[tuple[float, float]]],
+    draw_speed_mm_s: float,
+    travel_speed_mm_s: float,
+    z_plunge_speed_mm_s: float,
+    z_retract_speed_mm_s: float,
+    z_retract: float,
+    accel_mm_s2: float,
+    square_corner_velocity_mm_s: float,
+) -> dict:
+    """Compute execution statistics without sending any G-code.
+
+    Uses a trapezoidal motion model with Klipper-style junction
+    velocity to estimate total draw, travel, and plunge times.
+
+    Parameters
+    ----------
+    machine_paths : list[list[tuple[float, float]]]
+        Polylines in machine-frame mm.
+    draw_speed_mm_s : float
+        XY drawing speed (mm/s).
+    travel_speed_mm_s : float
+        XY travel speed (mm/s).
+    z_plunge_speed_mm_s : float
+        Z plunge speed (mm/s).
+    z_retract_speed_mm_s : float
+        Z retract speed (mm/s).
+    z_retract : float
+        Z retract distance per pen lift (mm).
+    accel_mm_s2 : float
+        XY acceleration limit (mm/s^2).
+    square_corner_velocity_mm_s : float
+        Klipper junction speed limit (mm/s).
+
+    Returns
+    -------
+    dict
+        Keys: paths, draw_mm, travel_mm, pen_lifts, draw_time_min,
+        travel_time_min, plunge_time_min, segments, estimated_time_min.
+    """
+    _sqrt = math.sqrt
+
+    def _trap_time(dist: float, v_max: float, accel: float) -> float:
+        if dist <= 0 or v_max <= 0:
+            return 0.0
+        d_ramp = v_max * v_max / accel
+        if dist >= d_ramp:
+            return dist / v_max + v_max / accel
+        return 2.0 * _sqrt(dist / accel)
+
+    total_draw_mm = 0.0
+    total_travel_mm = 0.0
+    total_pen_lifts = 0
+
+    for mpts in machine_paths:
+        for i in range(1, len(mpts)):
+            dx = mpts[i][0] - mpts[i - 1][0]
+            dy = mpts[i][1] - mpts[i - 1][1]
+            total_draw_mm += _sqrt(dx * dx + dy * dy)
+
+    prev_end: tuple[float, float] | None = None
+    for mpts in machine_paths:
+        if prev_end is not None:
+            dx = mpts[0][0] - prev_end[0]
+            dy = mpts[0][1] - prev_end[1]
+            total_travel_mm += _sqrt(dx * dx + dy * dy)
+        prev_end = mpts[-1]
+        total_pen_lifts += 1
+
+    scv = square_corner_velocity_mm_s
+    _SQRT2_M1 = _sqrt(2.0) - 1.0
+    _V_MAX = draw_speed_mm_s
+    _V_MAX2 = _V_MAX * _V_MAX
+    _A = accel_mm_s2
+
+    draw_time_s = 0.0
+    total_segments = 0
+
+    for mpts in machine_paths:
+        n = len(mpts)
+        if n < 2:
+            continue
+
+        dxs = [mpts[i][0] - mpts[i - 1][0] for i in range(1, n)]
+        dys = [mpts[i][1] - mpts[i - 1][1] for i in range(1, n)]
+        lens = [_sqrt(dxs[j] ** 2 + dys[j] ** 2) for j in range(n - 1)]
+
+        jvs: list[float] = []
+        for j in range(len(dxs) - 1):
+            l1, l2 = lens[j], lens[j + 1]
+            if l1 < 1e-6 or l2 < 1e-6:
+                jvs.append(0.0)
+                continue
+            cos_t = (
+                (dxs[j] * dxs[j + 1] + dys[j] * dys[j + 1])
+                / (l1 * l2)
+            )
+            if cos_t > 0.9999:
+                jvs.append(_V_MAX)
+            elif cos_t < -0.9999:
+                jvs.append(0.0)
+            else:
+                sin_hd = _sqrt(0.5 * (1.0 - cos_t))
+                factor = _SQRT2_M1 * sin_hd / (1.0 - sin_hd)
+                vj = scv * _sqrt(factor) if factor > 0.0 else 0.0
+                jvs.append(min(vj, _V_MAX))
+
+        for j in range(len(dxs)):
+            seg_len = lens[j]
+            if seg_len < 1e-6:
+                continue
+            v_entry = jvs[j - 1] if j > 0 else 0.0
+            v_exit = jvs[j] if j < len(jvs) else 0.0
+            vj = min(v_entry, v_exit)
+
+            if vj >= _V_MAX:
+                draw_time_s += seg_len / _V_MAX
+            else:
+                d_ramp = (_V_MAX2 - vj * vj) / _A
+                if seg_len >= d_ramp:
+                    draw_time_s += (
+                        2.0 * (_V_MAX - vj) / _A
+                        + (seg_len - d_ramp) / _V_MAX
+                    )
+                else:
+                    v_peak = _sqrt(vj * vj + _A * seg_len)
+                    draw_time_s += 2.0 * (v_peak - vj) / _A
+            total_segments += 1
+
+    travel_time_s = 0.0
+    prev_end_t: tuple[float, float] | None = None
+    for mpts in machine_paths:
+        if prev_end_t is not None:
+            dx = mpts[0][0] - prev_end_t[0]
+            dy = mpts[0][1] - prev_end_t[1]
+            travel_time_s += _trap_time(
+                _sqrt(dx * dx + dy * dy), travel_speed_mm_s, accel_mm_s2,
+            )
+        prev_end_t = mpts[-1]
+
+    plunge_time_s = total_pen_lifts * (
+        _trap_time(z_retract, z_plunge_speed_mm_s, accel_mm_s2)
+        + _trap_time(z_retract, z_retract_speed_mm_s, accel_mm_s2)
+    )
+
+    batch_size = 64
+    total_sends = sum(
+        1 + max(1, math.ceil(max(len(mp) - 1, 1) / batch_size))
+        for mp in machine_paths
+    )
+    comm_overhead_s = total_sends * 0.005
+
+    total_time_s = (
+        draw_time_s + travel_time_s + plunge_time_s + comm_overhead_s
+    )
+
+    return {
+        "paths": len(machine_paths),
+        "draw_mm": total_draw_mm,
+        "travel_mm": total_travel_mm,
+        "pen_lifts": total_pen_lifts,
+        "draw_time_min": draw_time_s / 60.0,
+        "travel_time_min": travel_time_s / 60.0,
+        "plunge_time_min": plunge_time_s / 60.0,
+        "segments": total_segments,
+        "estimated_time_min": total_time_s / 60.0,
+    }
+
+
 def execute_on_robot(
     sock: socket.socket,
     machine_paths: list[list[tuple[float, float]]],
@@ -1913,6 +2131,7 @@ def execute_on_robot(
     corner_circle_radius: float,
     dry_run: bool = False,
     skip_corners: bool = False,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict:
     """Execute the full drawing sequence on the robot.
 
@@ -1940,6 +2159,10 @@ def execute_on_robot(
         If True, compute stats without sending G-code.
     skip_corners : bool
         If True, skip alignment circles and border.
+    progress_callback : Callable[[int, int], None] or None
+        If provided, called as ``callback(completed, total)`` on each
+        path during Phase 3 instead of the default ``sys.stdout.write``
+        reporting.  Used by the CLI to drive a Rich progress bar.
 
     Returns
     -------
@@ -1955,264 +2178,152 @@ def execute_on_robot(
     margin_corners = transform.get_margin_corners()
     paper_corners = transform.get_paper_corners()
 
-    # ---- Compute stats ----
-    total_draw_mm = 0.0
-    total_travel_mm = 0.0
-    total_pen_lifts = 0
-
-    for mpts in machine_paths:
-        for i in range(1, len(mpts)):
-            dx = mpts[i][0] - mpts[i - 1][0]
-            dy = mpts[i][1] - mpts[i - 1][1]
-            total_draw_mm += math.sqrt(dx * dx + dy * dy)
-
-    prev_end: Optional[tuple[float, float]] = None
-    for mpts in machine_paths:
-        if prev_end is not None:
-            dx = mpts[0][0] - prev_end[0]
-            dy = mpts[0][1] - prev_end[1]
-            total_travel_mm += math.sqrt(dx * dx + dy * dy)
-        prev_end = mpts[-1]
-        total_pen_lifts += 1
-
-    # ---- Time estimates (trapezoidal motion model) ----
-    _sqrt = math.sqrt
-
-    def _trap_time(dist: float, v_max: float, accel: float) -> float:
-        if dist <= 0 or v_max <= 0:
-            return 0.0
-        d_ramp = v_max * v_max / accel
-        if dist >= d_ramp:
-            return dist / v_max + v_max / accel
-        return 2.0 * _sqrt(dist / accel)
-
-    scv = square_corner_velocity_mm_s
-    _SQRT2_M1 = _sqrt(2.0) - 1.0
-    _V_MAX = draw_speed_mm_s
-    _V_MAX2 = _V_MAX * _V_MAX
-    _A = accel_mm_s2
-
-    draw_time_s = 0.0
-    total_segments = 0
-
-    for mpts in machine_paths:
-        n = len(mpts)
-        if n < 2:
-            continue
-
-        dxs = [mpts[i][0] - mpts[i - 1][0] for i in range(1, n)]
-        dys = [mpts[i][1] - mpts[i - 1][1] for i in range(1, n)]
-        lens = [_sqrt(dxs[j] ** 2 + dys[j] ** 2) for j in range(n - 1)]
-
-        jvs: list[float] = []
-        for j in range(len(dxs) - 1):
-            l1, l2 = lens[j], lens[j + 1]
-            if l1 < 1e-6 or l2 < 1e-6:
-                jvs.append(0.0)
-                continue
-            cos_t = (dxs[j] * dxs[j + 1] + dys[j] * dys[j + 1]) / (l1 * l2)
-            if cos_t > 0.9999:
-                jvs.append(_V_MAX)
-            elif cos_t < -0.9999:
-                jvs.append(0.0)
-            else:
-                sin_hd = _sqrt(0.5 * (1.0 - cos_t))
-                factor = _SQRT2_M1 * sin_hd / (1.0 - sin_hd)
-                vj = scv * _sqrt(factor) if factor > 0.0 else 0.0
-                jvs.append(min(vj, _V_MAX))
-
-        for j in range(len(dxs)):
-            seg_len = lens[j]
-            if seg_len < 1e-6:
-                continue
-            v_entry = jvs[j - 1] if j > 0 else 0.0
-            v_exit = jvs[j] if j < len(jvs) else 0.0
-            vj = min(v_entry, v_exit)
-
-            if vj >= _V_MAX:
-                draw_time_s += seg_len / _V_MAX
-            else:
-                d_ramp = (_V_MAX2 - vj * vj) / _A
-                if seg_len >= d_ramp:
-                    draw_time_s += (
-                        2.0 * (_V_MAX - vj) / _A + (seg_len - d_ramp) / _V_MAX
-                    )
-                else:
-                    v_peak = _sqrt(vj * vj + _A * seg_len)
-                    draw_time_s += 2.0 * (v_peak - vj) / _A
-            total_segments += 1
-
-    travel_time_s = 0.0
-    prev_end_t: Optional[tuple[float, float]] = None
-    for mpts in machine_paths:
-        if prev_end_t is not None:
-            dx = mpts[0][0] - prev_end_t[0]
-            dy = mpts[0][1] - prev_end_t[1]
-            travel_time_s += _trap_time(
-                _sqrt(dx * dx + dy * dy), travel_speed_mm_s, accel_mm_s2,
-            )
-        prev_end_t = mpts[-1]
-
-    plunge_time_s = total_pen_lifts * (
-        _trap_time(z_retract, z_plunge_speed_mm_s, accel_mm_s2)
-        + _trap_time(z_retract, z_retract_speed_mm_s, accel_mm_s2)
+    stats = compute_execution_stats(
+        machine_paths=machine_paths,
+        draw_speed_mm_s=draw_speed_mm_s,
+        travel_speed_mm_s=travel_speed_mm_s,
+        z_plunge_speed_mm_s=z_plunge_speed_mm_s,
+        z_retract_speed_mm_s=z_retract_speed_mm_s,
+        z_retract=z_retract,
+        accel_mm_s2=accel_mm_s2,
+        square_corner_velocity_mm_s=square_corner_velocity_mm_s,
     )
 
-    batch_size = 64
-    total_sends = sum(
-        1 + max(1, math.ceil(max(len(mp) - 1, 1) / batch_size))
-        for mp in machine_paths
-    )
-    comm_overhead_s = total_sends * 0.005
+    total_draw_mm = stats["draw_mm"]
+    total_travel_mm = stats["travel_mm"]
+    total_pen_lifts = stats["pen_lifts"]
+    total_segments = stats["segments"]
+    est_min = stats["estimated_time_min"]
 
-    total_time_s = draw_time_s + travel_time_s + plunge_time_s + comm_overhead_s
-
-    print()
-    print("=" * 60)
-    print("  EXECUTION PLAN")
-    print("=" * 60)
-    print()
-    print(f"  Paths:             {len(machine_paths)}")
-    print(f"  Drawing distance:  {total_draw_mm:.0f} mm "
-          f"({draw_time_s / 60.0:.1f} min, {total_segments} segments)")
-    print(f"  Travel distance:   {total_travel_mm:.0f} mm "
-          f"({travel_time_s / 60.0:.1f} min)")
-    print(f"  Pen lifts:         {total_pen_lifts}")
-    print(f"  Plunge time:       {plunge_time_s / 60.0:.1f} min")
-    print(f"  Comms overhead:    {comm_overhead_s / 60.0:.1f} min "
-          f"({total_sends} sends)")
-    print(f"  Estimated total:   {total_time_s / 60.0:.1f} min "
-          f"({total_time_s / 3600.0:.1f} hours)")
-    print()
-
-    stats = {
-        "paths": len(machine_paths),
-        "draw_mm": total_draw_mm,
-        "travel_mm": total_travel_mm,
-        "pen_lifts": total_pen_lifts,
-        "estimated_time_min": total_time_s / 60.0,
-    }
+    if progress_callback is None:
+        print()
+        print("=" * 60)
+        print("  EXECUTION PLAN")
+        print("=" * 60)
+        print()
+        print(f"  Paths:             {len(machine_paths)}")
+        print(f"  Drawing distance:  {total_draw_mm:.0f} mm "
+              f"({stats['draw_time_min']:.1f} min,"
+              f" {total_segments} segments)")
+        print(f"  Travel distance:   {total_travel_mm:.0f} mm "
+              f"({stats['travel_time_min']:.1f} min)")
+        print(f"  Pen lifts:         {total_pen_lifts}")
+        print(f"  Plunge time:       "
+              f"{stats['plunge_time_min']:.1f} min")
+        print(f"  Estimated total:   {est_min:.1f} min "
+              f"({est_min / 60.0:.1f} hours)")
+        print()
 
     if dry_run:
         print("  [DRY RUN] -- no G-code sent.")
         return stats
 
     # ---- Apply motion limits ----
+    scv = square_corner_velocity_mm_s
     _raw_gcode(sock, f"SET_VELOCITY_LIMIT ACCEL={accel_mm_s2:.0f}")
     _raw_gcode(
         sock,
         f"SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY={scv:.1f}",
     )
 
-    # ---- Phase 0: pen placement check ----
-    print("=" * 60)
-    print("  PHASE 0: PEN PLACEMENT CHECK")
-    print("=" * 60)
-    print()
-
-    first_cx, first_cy = paper_corners[0]
-    print(f"  Moving to paper edge corner: ({first_cx:.1f}, {first_cy:.1f}) mm")
+    # ---- Phase 0: retract and move to first corner ----
     pen_up(sock, z_travel, z_up_fr)
-    travel_to(sock, first_cx, first_cy, travel_fr)
     _raw_gcode(sock, "M400")
-
-    print(f"  Lowering Z to contact ({z_contact:.3f} mm)...")
-    pen_down(sock, z_contact, z_down_fr)
-    _raw_gcode(sock, "M400")
-
-    print()
-    print("  >> Insert the pen and verify it touches the paper.")
-    print("  >> Adjust --z-contact if needed (higher = pen closer to bed).")
-    print()
-    input("  Press ENTER when pen depth is correct to continue...")
-    pen_up(sock, z_travel, z_up_fr)
 
     # ---- Phase 1: alignment circles ----
+    _quiet = progress_callback is not None
+
     if not skip_corners:
-        print()
-        print("=" * 60)
-        print("  PHASE 1: CORNER ALIGNMENT CIRCLES")
-        print("=" * 60)
-        print()
+        if not _quiet:
+            print()
+            print("=" * 60)
+            print("  PHASE 1: CORNER ALIGNMENT CIRCLES")
+            print("=" * 60)
+            print()
 
         for i, (cx, cy) in enumerate(margin_corners):
             label = ["bottom-left", "bottom-right", "top-right", "top-left"][i]
-            print(f"  Corner {i + 1}/4 ({label}): ({cx:.1f}, {cy:.1f}) mm")
+            if not _quiet:
+                print(f"  Corner {i + 1}/4 ({label}): ({cx:.1f}, {cy:.1f}) mm")
             draw_circle_at(
                 sock, cx, cy, corner_circle_radius,
                 z_contact, z_travel, z_down_fr, z_up_fr, draw_fr, travel_fr,
             )
 
         _raw_gcode(sock, "M400")
-        print()
-        print("  All 4 corner circles drawn.")
-        print("  >> Align paper so its corners match the circles.")
-        print()
-        input("  Press ENTER when paper is aligned to continue...")
-    else:
-        print()
-        print("  [Skipping corner alignment]")
+        if not _quiet:
+            print()
+            print("  All 4 corner circles drawn.")
+            print("  >> Align paper so its corners match the circles.")
+            print()
+            input("  Press ENTER when paper is aligned to continue...")
 
     # ---- Phase 2: border rectangle ----
-    print()
-    print("=" * 60)
-    print("  PHASE 2: BORDER RECTANGLE")
-    print("=" * 60)
-    print()
-
     draw_rectangle(
         sock, margin_corners,
         z_contact, z_travel, z_down_fr, z_up_fr, draw_fr, travel_fr,
     )
     _raw_gcode(sock, "M400")
-    print("  Border rectangle drawn.")
-    print()
+    if not _quiet:
+        print()
+        print("=" * 60)
+        print("  PHASE 2: BORDER RECTANGLE")
+        print("=" * 60)
+        print()
+        print("  Border rectangle drawn.")
+        print()
 
     # ---- Phase 3: draw all paths ----
-    print("=" * 60)
-    print("  PHASE 3: DRAWING LINE ART")
-    print("=" * 60)
-    print()
+    if progress_callback is None:
+        print("=" * 60)
+        print("  PHASE 3: DRAWING LINE ART")
+        print("=" * 60)
+        print()
 
     t_start = time.monotonic()
     last_report_time = t_start
     prev_pct = -1
     DRAW_BATCH = 64
-    REPORT_INTERVAL_S = 60.0  # update at least every minute
+    REPORT_INTERVAL_S = 60.0
 
     z_travel_c = max(Z_MIN_SAFE, min(z_travel, Z_MAX_SAFE))
     z_contact_c = max(Z_MIN_SAFE, min(z_contact, Z_MAX_SAFE))
 
     for path_idx, mpts in enumerate(machine_paths):
-        pct = int(100.0 * (path_idx + 1) / len(machine_paths))
-        now = time.monotonic()
-        time_since_report = now - last_report_time
-        is_milestone = pct >= prev_pct + 5
-        is_timer = time_since_report >= REPORT_INTERVAL_S
-        is_last = path_idx == len(machine_paths) - 1
+        if progress_callback is not None:
+            progress_callback(path_idx + 1, len(machine_paths))
+        else:
+            pct = int(100.0 * (path_idx + 1) / len(machine_paths))
+            now = time.monotonic()
+            time_since_report = now - last_report_time
+            is_milestone = pct >= prev_pct + 5
+            is_timer = time_since_report >= REPORT_INTERVAL_S
+            is_last = path_idx == len(machine_paths) - 1
 
-        if is_milestone or is_timer or is_last:
-            elapsed = now - t_start
-            frac = (path_idx + 1) / len(machine_paths)
-            eta_s = (elapsed / frac - elapsed) if frac > 0.01 else 0.0
-            draw_done_mm = sum(
-                math.sqrt(
-                    (mp[i][0] - mp[i-1][0])**2
-                    + (mp[i][1] - mp[i-1][1])**2
+            if is_milestone or is_timer or is_last:
+                elapsed = now - t_start
+                frac = (path_idx + 1) / len(machine_paths)
+                eta_s = (elapsed / frac - elapsed) if frac > 0.01 else 0.0
+                draw_done_mm = sum(
+                    math.sqrt(
+                        (mp[i][0] - mp[i-1][0])**2
+                        + (mp[i][1] - mp[i-1][1])**2
+                    )
+                    for mp in machine_paths[:path_idx + 1]
+                    for i in range(1, len(mp))
+                ) if path_idx < 20 else total_draw_mm * frac
+                speed_actual = (
+                    draw_done_mm / elapsed if elapsed > 1.0 else 0.0
                 )
-                for mp in machine_paths[:path_idx + 1]
-                for i in range(1, len(mp))
-            ) if path_idx < 20 else total_draw_mm * frac
-            speed_actual = draw_done_mm / elapsed if elapsed > 1.0 else 0.0
-            sys.stdout.write(
-                f"\r  Path {path_idx + 1}/{len(machine_paths)} "
-                f"({pct}%)  elapsed: {elapsed / 60.0:.1f} min  "
-                f"ETA: {eta_s / 60.0:.1f} min  "
-                f"speed: {speed_actual:.0f} mm/s    "
-            )
-            sys.stdout.flush()
-            prev_pct = pct
-            last_report_time = now
+                sys.stdout.write(
+                    f"\r  Path {path_idx + 1}/{len(machine_paths)} "
+                    f"({pct}%)  elapsed: {elapsed / 60.0:.1f} min  "
+                    f"ETA: {eta_s / 60.0:.1f} min  "
+                    f"speed: {speed_actual:.0f} mm/s    "
+                )
+                sys.stdout.flush()
+                prev_pct = pct
+                last_report_time = now
 
         x0 = max(0.0, min(mpts[0][0], WORKSPACE_X_MM))
         y0 = max(0.0, min(mpts[0][1], WORKSPACE_Y_MM))
@@ -2238,15 +2349,18 @@ def execute_on_robot(
     _raw_gcode(sock, "M400")
 
     elapsed = time.monotonic() - t_start
-    print()
-    print()
-    print(f"  Drawing complete in {elapsed / 60.0:.1f} min")
+    if progress_callback is None:
+        print()
+        print()
+        print(f"  Drawing complete in {elapsed / 60.0:.1f} min")
 
     # ---- Return to safe position ----
-    print("  Returning to safe position...")
+    if not _quiet:
+        print("  Returning to safe position...")
     travel_to(sock, WORKSPACE_X_MM / 2.0, WORKSPACE_Y_MM / 2.0, travel_fr)
     _raw_gcode(sock, "M400")
-    print("  Done.")
+    if not _quiet:
+        print("  Done.")
 
     stats["actual_time_min"] = elapsed / 60.0
     return stats

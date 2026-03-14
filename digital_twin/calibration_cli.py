@@ -20,11 +20,9 @@ Usage
 from __future__ import annotations
 
 import argparse
-import copy
 import datetime
 import logging
 import math
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -121,6 +119,22 @@ def ask_cmy(prompt: str) -> Tuple[float, float, float]:
         return vals  # type: ignore[return-value]
 
 
+def _format_value(v: Any) -> str:
+    """Format a value for display in confirm_values, handling nested lists."""
+    if isinstance(v, float):
+        return f"{v:.4f}"
+    if isinstance(v, (tuple, list)):
+        if v and isinstance(v[0], (tuple, list)):
+            # nested: list of lists/tuples
+            parts = []
+            for sub in v:
+                inner = ", ".join(_format_value(x) for x in sub)
+                parts.append(f"[{inner}]")
+            return ", ".join(parts)
+        return ", ".join(_format_value(x) for x in v)
+    return str(v)
+
+
 def confirm_values(
     console: Console,
     label: str,
@@ -131,13 +145,7 @@ def confirm_values(
     table.add_column("Field")
     table.add_column("Value")
     for k, v in data.items():
-        if isinstance(v, (tuple, list)):
-            v_str = ", ".join(f"{x:.4f}" for x in v)
-        elif isinstance(v, float):
-            v_str = f"{v:.4f}"
-        else:
-            v_str = str(v)
-        table.add_row(k, v_str)
+        table.add_row(k, _format_value(v))
     console.print(table)
     return questionary.confirm("Accept these values?", default=True).ask()
 
@@ -268,7 +276,9 @@ def block_dot_sheet(session: CalibrationSession) -> None:
 
         elif action == "Fit & preview":
             if not dots:
-                session.console.print("[yellow]No dot measurements yet.[/yellow]")
+                session.console.print(
+                    "[yellow]No dot measurements yet.[/yellow]",
+                )
                 continue
             _fit_dots(session, dots, cal_dict)
 
@@ -307,7 +317,6 @@ def _fit_dots(
         table.add_row(f"{z:.1f}", f"{old_r:.3f}", f"{new_radius[i]:.3f}")
     session.console.print(table)
 
-    # Fit profile shape from centre/mid/edge ratios (simplified)
     _fit_profile_from_dots(session, dots, cal_dict)
 
     if questionary.confirm("Accept fitted radius?", default=True).ask():
@@ -324,8 +333,9 @@ def _fit_profile_from_dots(
 ) -> None:
     """Estimate profile shape from centre/mid/edge darkness ratios.
 
-    Uses a simple grid search over (core_frac, skirt_sigma_frac, skirt_power)
-    to minimise the RMS error between measured and predicted radial samples.
+    Uses a grid search over (core_frac, skirt_sigma_frac, skirt_power)
+    to minimise the RMS error between measured and predicted radial
+    samples normalised by the measured background.
     """
     samples = []
     for dot in dots.values():
@@ -335,7 +345,6 @@ def _fit_profile_from_dots(
         center_rel = 1.0 - _lum(dot["center_rgb"]) / bg_lum
         mid_rel = 1.0 - _lum(dot["mid_rgb"]) / bg_lum
         edge_rel = 1.0 - _lum(dot["edge_rgb"]) / bg_lum
-        # normalised u positions: centre=0, mid=0.5, edge=0.9
         samples.append((center_rel, mid_rel, edge_rel))
 
     if not samples:
@@ -351,28 +360,28 @@ def _fit_profile_from_dots(
         for sf in np.linspace(0.10, 0.60, 10):
             for sp in np.linspace(1.0, 3.0, 5):
                 phi_center = 1.0
-                u_mid = 0.5
-                u_edge = 0.9
+                u_mid, u_edge = 0.5, 0.9
                 phi_mid = (
                     1.0 if u_mid <= cf
-                    else math.exp(-((u_mid - cf) / max(sf, 1e-6)) ** sp)
+                    else math.exp(
+                        -((u_mid - cf) / max(sf, 1e-6)) ** sp
+                    )
                 )
                 phi_edge = (
                     1.0 if u_edge <= cf
-                    else math.exp(-((u_edge - cf) / max(sf, 1e-6)) ** sp)
+                    else math.exp(
+                        -((u_edge - cf) / max(sf, 1e-6)) ** sp
+                    )
                 )
                 if target_center > 0:
-                    phi_center_n = phi_center
                     phi_mid_n = phi_mid / phi_center * target_center
                     phi_edge_n = phi_edge / phi_center * target_center
                 else:
                     phi_mid_n = phi_mid
                     phi_edge_n = phi_edge
-                    phi_center_n = 1.0
 
                 err = (
-                    (phi_center_n - target_center) ** 2
-                    + (phi_mid_n - target_mid) ** 2
+                    (phi_mid_n - target_mid) ** 2
                     + (phi_edge_n - target_edge) ** 2
                 )
                 if err < best_err:
@@ -483,13 +492,13 @@ def _fit_lines(
 ) -> None:
     """Fit mass_lut from measured line centre darkness.
 
-    For each (z, speed) measurement the target centre transmission
-    ``T_center = center_lum / bg_lum`` is used to solve for mass:
+    For each (z, speed) measurement, the centre transmission
+    ``T = center_lum / bg_lum`` is inverted using the correct
+    paint luminance (from subtractive model of the line's CMY
+    recipe) and the renderer's adaptive ds (based on radius at z).
 
-        T = (1 - alpha) + alpha * paint_lum
-        alpha ~ k * mass * ds * phi_center / integral
-
-    We invert this for ``mass`` at the centre (phi_center ~ 1).
+    The inversion accounts for the R² area normalisation and the
+    number of overlapping stamps at the line centre.
     """
     z_grid = np.array(cal_dict["z_grid_mm"])
     speed_grid = np.array(cal_dict["speed_grid_mm_s"])
@@ -497,41 +506,63 @@ def _fit_lines(
     new_mass = old_mass.copy()
 
     k = cal_dict["k_mass"]
+    radius_lut = np.array(cal_dict["radius_lut_mm"])
     profile_integral = _approx_profile_integral(cal_dict["profile"])
-    ds_approx = cal_dict["sampling"]["max_step_mm"]
+    max_step = cal_dict["sampling"]["max_step_mm"]
+    margin = cal_dict["profile"].get("margin_factor", 1.5)
 
-    # measured points
-    z_pts = []
-    v_pts = []
-    mass_pts = []
+    z_pts: List[float] = []
+    v_pts: List[float] = []
+    mass_pts: List[float] = []
 
     for line in lines.values():
         bg_lum = _lum(line["background_rgb"])
         center_lum = _lum(line["center_rgb"])
         if bg_lum < 0.01:
             continue
-        T_center = center_lum / bg_lum
-        T_center = max(T_center, 0.001)
 
-        paint_lum = 0.0  # worst case: black paint
-        # T = (1-a) + a*paint  =>  a = (1 - T) / (1 - paint)
-        alpha_target = (1.0 - T_center) / max(1.0 - paint_lum, 1e-6)
-        alpha_target = min(max(alpha_target, 0.0), 1.0)
+        T_center = max(center_lum / bg_lum, 0.001)
 
-        if profile_integral > 0 and k > 0 and ds_approx > 0:
-            mass_val = alpha_target * profile_integral / (k * ds_approx)
-        else:
-            mass_val = alpha_target
+        # actual paint luminance from subtractive model
+        cmy = line["color_recipe_cmy"]
+        paint_lum = (
+            0.2126 * (1.0 - cmy[0])
+            + 0.7152 * (1.0 - cmy[1])
+            + 0.0722 * (1.0 - cmy[2])
+        )
 
-        z_pts.append(line["z_mm"])
+        # adaptive ds matching the renderer's rule
+        z = line["z_mm"]
+        R = float(np.interp(z, z_grid, radius_lut))
+        R = max(R, 0.01)
+        target_ds = min(0.25 * R, max_step)
+        actual_ds = max(target_ds, 1e-4)
+
+        R_sq = R * R
+
+        # estimate how many stamps overlap the centre pixel
+        n_covering = max(1, int(2.0 * margin * R / actual_ds))
+
+        # small-alpha approximation:
+        #   T ≈ 1 - n * alpha_single * (1 - paint_lum)
+        #   alpha_single = k * mass * ds / (integral * R²)
+        one_minus_T = max(1.0 - T_center, 0.0)
+        denom = max(
+            n_covering * k * actual_ds * (1.0 - paint_lum), 1e-8,
+        )
+        mass_val = one_minus_T * profile_integral * R_sq / denom
+
+        z_pts.append(z)
         v_pts.append(line["speed_mm_s"])
         mass_pts.append(mass_val)
 
     if not z_pts:
-        session.console.print("[yellow]Could not derive mass values.[/yellow]")
+        session.console.print(
+            "[yellow]Could not derive mass values.[/yellow]",
+        )
         return
 
-    # scatter-interpolate onto the grid
+    # inverse-distance interpolation onto the (z, speed) grid
     for iz, zg in enumerate(z_grid):
         for iv, vg in enumerate(speed_grid):
             weights = []
@@ -594,7 +625,9 @@ def block_color_swatches(session: CalibrationSession) -> None:
     """Enter swatch measurements, fit color LUT."""
     session.console.print(Panel(
         "Enter measurements from the printed color swatch chart.\n"
-        "For each swatch: CMY recipe and measured interior RGB.",
+        "For each swatch: CMY recipe and measured interior RGB.\n\n"
+        "The fitter inverts the compositing model to recover\n"
+        "per-stamp paint_rgb from the observed dense-fill colour.",
         title="Block 4: Color Swatches",
     ))
 
@@ -654,28 +687,35 @@ def _fit_swatches(
 ) -> None:
     """Build a color LUT from measured swatches.
 
-    For each swatch at grid point (c, m, y), set the LUT entry directly.
-    Between measurements, use inverse-distance interpolation.
+    The measured interior RGB is the result of accumulated compositing
+    over many fill strokes, not the per-stamp paint_rgb.  This function
+    estimates the per-stamp alpha from the current mass_lut and fill
+    conditions, then inverts the compositing to recover paint_rgb.
+
+    At grid points without nearby measurements the default subtractive
+    model (RGB = 1 - CMY) is used as a fallback.
     """
     ca = cal_dict["color_axes"]
     Nc, Nm, Ny = ca["c_steps"], ca["m_steps"], ca["y_steps"]
     lo, hi = ca["domain"]
 
-    lut = np.zeros((Nc, Nm, Ny, 3), dtype=np.float32)
-    # default: subtractive
+    # default LUT: subtractive
     c_vals = np.linspace(lo, hi, Nc)
     m_vals = np.linspace(lo, hi, Nm)
     y_vals = np.linspace(lo, hi, Ny)
     C, M, Y = np.meshgrid(c_vals, m_vals, y_vals, indexing="ij")
-    lut[..., 0] = 1.0 - C
-    lut[..., 1] = 1.0 - M
-    lut[..., 2] = 1.0 - Y
+    lut = np.stack([1.0 - C, 1.0 - M, 1.0 - Y], axis=-1).astype(np.float32)
 
-    measured_points = []
+    # estimate per-fill-pass alpha for inversion
+    pw = np.array(cal_dict["paper_white_rgb"])
+    alpha_eff, n_passes = _estimate_fill_alpha(cal_dict)
+
+    measured_points: List[Tuple[List[float], np.ndarray]] = []
     for sw in swatches.values():
         cmy = sw["cmy_command"]
-        rgb = sw["interior_rgb"]
-        measured_points.append((cmy, rgb))
+        interior = np.array(sw["interior_rgb"])
+        paint_rgb = _invert_swatch_color(interior, pw, alpha_eff, n_passes)
+        measured_points.append((cmy, paint_rgb))
 
     if measured_points:
         for ic in range(Nc):
@@ -702,29 +742,29 @@ def _fit_swatches(
 
     lut = np.clip(lut, 0.0, 1.0)
 
-    # Save as .pt
-    lut_path = session.cal_path.parent / "color_lut.pt"
-    torch.save(torch.from_numpy(lut), str(lut_path))
+    # save as .pt -- store just the filename, not the full relative path
+    lut_filename = "color_lut.pt"
+    lut_disk_path = session.cal_path.parent / lut_filename
+    torch.save(torch.from_numpy(lut), str(lut_disk_path))
 
-    cal_dict["color_lut_path"] = str(lut_path)
+    cal_dict["color_lut_path"] = lut_filename
     session.cal = CalibrationV1(**cal_dict)
     session.modified = True
     session.invalidate_simulator()
 
     # preview table
-    table = Table(title="Swatch comparison")
+    table = Table(title="Swatch comparison (per-stamp paint_rgb vs target)")
     table.add_column("Recipe")
-    table.add_column("Target RGB")
-    table.add_column("LUT RGB")
-    table.add_column("dE", justify="right")
+    table.add_column("Target interior")
+    table.add_column("Inverted paint_rgb")
+    table.add_column("dE (interior vs resim)")
 
     for sid, sw in swatches.items():
         cmy = sw["cmy_command"]
         target = sw["interior_rgb"]
-        # nearest LUT lookup
-        ic = int(round((cmy[0] - lo) / (hi - lo) * (Nc - 1)))
-        im = int(round((cmy[1] - lo) / (hi - lo) * (Nm - 1)))
-        iy = int(round((cmy[2] - lo) / (hi - lo) * (Ny - 1)))
+        ic = int(round((cmy[0] - lo) / max(hi - lo, 1e-6) * (Nc - 1)))
+        im = int(round((cmy[1] - lo) / max(hi - lo, 1e-6) * (Nm - 1)))
+        iy = int(round((cmy[2] - lo) / max(hi - lo, 1e-6) * (Ny - 1)))
         ic = max(0, min(ic, Nc - 1))
         im = max(0, min(im, Nm - 1))
         iy = max(0, min(iy, Ny - 1))
@@ -743,7 +783,95 @@ def _fit_swatches(
             f"{de:.2f}",
         )
     session.console.print(table)
-    session.console.print(f"[green]Color LUT saved to {lut_path}[/green]")
+    session.console.print(
+        f"[green]Color LUT saved to {lut_disk_path}[/green]",
+    )
+
+
+def _estimate_fill_alpha(cal_dict: Dict) -> Tuple[float, int]:
+    """Estimate per-stamp centre alpha and pass count for a dense fill.
+
+    Uses the preview defaults (z, speed) and the mass_lut to compute
+    the alpha a single stamp deposits at the centre pixel, and how
+    many stamps overlap a pixel in a dense horizontal fill.
+    """
+    ps = cal_dict.get("preview_settings", {})
+    fill_z = ps.get("default_z_mm", 6.0)
+    fill_speed = ps.get("default_speed_mm_s", 30.0)
+    line_spacing = 0.5
+
+    z_grid = np.array(cal_dict["z_grid_mm"])
+    speed_grid = np.array(cal_dict["speed_grid_mm_s"])
+    radius_lut = np.array(cal_dict["radius_lut_mm"])
+    mass_arr = np.array(cal_dict["mass_lut"])
+    k = cal_dict["k_mass"]
+
+    R = float(np.interp(fill_z, z_grid, radius_lut))
+    R = max(R, 0.01)
+    margin = cal_dict["profile"].get("margin_factor", 1.5)
+    max_step = cal_dict["sampling"]["max_step_mm"]
+    target_ds = min(0.25 * R, max_step)
+    ds = max(target_ds, 1e-4)
+
+    # bilinear interp of mass
+    iz = np.searchsorted(z_grid, fill_z).clip(1, len(z_grid) - 1)
+    iv = np.searchsorted(speed_grid, fill_speed).clip(
+        1, len(speed_grid) - 1,
+    )
+    tz = (fill_z - z_grid[iz - 1]) / max(
+        z_grid[iz] - z_grid[iz - 1], 1e-6,
+    )
+    tv = (fill_speed - speed_grid[iv - 1]) / max(
+        speed_grid[iv] - speed_grid[iv - 1], 1e-6,
+    )
+    tz = np.clip(tz, 0, 1)
+    tv = np.clip(tv, 0, 1)
+    mass = (
+        mass_arr[iz-1, iv-1] * (1-tz) * (1-tv)
+        + mass_arr[iz-1, iv] * (1-tz) * tv
+        + mass_arr[iz, iv-1] * tz * (1-tv)
+        + mass_arr[iz, iv] * tz * tv
+    )
+
+    integral = _approx_profile_integral(cal_dict["profile"])
+    R_sq = R * R
+    alpha_single = k * mass * ds / max(integral * R_sq, 1e-8)
+    alpha_single = min(alpha_single, 1.0)
+
+    # stamps along the line overlapping a centre pixel
+    n_along_line = max(1, int(2 * margin * R / ds))
+    # fill lines crossing a pixel (vertical coverage)
+    n_lines = max(1, int(2 * margin * R / line_spacing))
+    n_passes = n_along_line * n_lines
+
+    return float(alpha_single), n_passes
+
+
+def _invert_swatch_color(
+    interior_rgb: np.ndarray,
+    paper_white: np.ndarray,
+    alpha_per_stamp: float,
+    n_passes: int,
+) -> np.ndarray:
+    """Invert the compositing model to recover per-stamp paint_rgb.
+
+    The dense swatch is modelled as ``n_passes`` applications of:
+        canvas = canvas * ((1-a) + a * paint_rgb)
+
+    After N passes:
+        interior = paper * T^N  where  T = (1-a) + a*paint
+
+    We invert for paint_rgb per channel.
+    """
+    ratio = interior_rgb / np.maximum(paper_white, 1e-6)
+    ratio = np.clip(ratio, 0.01, 0.99)
+
+    N = max(n_passes, 1)
+    T_eff = np.power(ratio, 1.0 / N)
+
+    a = np.clip(alpha_per_stamp, 0.01, 0.99)
+    paint = (T_eff - (1.0 - a)) / a
+    return np.clip(paint, 0.0, 1.0)
 
 
 # ============================================================================
@@ -784,7 +912,9 @@ def block_layering(session: CalibrationSession) -> None:
             for ci in range(n_colors):
                 c = ask_cmy(f"  Colour {ci+1} CMY")
                 colors.append(list(c))
-                rgb = ask_rgb(f"  Single-colour RGB for colour {ci+1}")
+                rgb = ask_rgb(
+                    f"  Single-colour RGB for colour {ci+1}",
+                )
                 single_rgbs.append(list(rgb))
 
             n_overlaps = int(
@@ -827,9 +957,14 @@ def _validate_layering(
     overlaps: Dict[str, Any],
     cal_dict: Dict,
 ) -> None:
-    """Compare simulated overlap RGB to measured, offer gain correction."""
+    """Compare simulated overlap RGB to measured for each pattern.
+
+    Each colour is rendered as a dense fill band centred on the canvas.
+    Single-colour simulations are compared to the entered single_rgbs.
+    The combined overlap is compared to each entered overlap_rgb.
+    """
     sim = session.simulator
-    delta_es = []
+    delta_es: List[float] = []
 
     table = Table(title="Layering Validation")
     table.add_column("Pattern")
@@ -840,44 +975,46 @@ def _validate_layering(
 
     for pid, ov in overlaps.items():
         colors = ov["colors"]
-        # simulate overlap by sequential rendering
-        canvas = sim.reset(batch_size=1)
-        fill_z = 6.0
-        fill_speed = 30.0
-        cx = sim._cal.render.work_area_mm[0] / 2
-        cy = sim._cal.render.work_area_mm[1] / 2
-        line_len = 20.0
+        single_rgbs_meas = ov.get("single_rgbs", [])
 
-        for cidx, cmy in enumerate(colors):
-            stroke = {
-                "bezier": {
-                    "p1": (cx - line_len / 2, cy),
-                    "p2": (cx - line_len / 6, cy),
-                    "p3": (cx + line_len / 6, cy),
-                    "p4": (cx + line_len / 2, cy),
-                },
-                "z_profile": {"z0": fill_z, "z1": fill_z},
-                "speed_profile": {"v0": fill_speed, "v1": fill_speed},
-                "color_cmy": {"c": cmy[0], "m": cmy[1], "y": cmy[2]},
-            }
-            # render several parallel passes to build coverage
-            for offset in np.arange(-3.0, 3.0, 0.5):
-                s = copy.deepcopy(stroke)
-                for key in ["p1", "p2", "p3", "p4"]:
-                    x, y = s["bezier"][key]
-                    s["bezier"][key] = (x, y + offset)
-                canvas = sim.render_stroke(canvas, s)
+        # --- single-colour validation ---
+        for ci, (cmy, meas_single) in enumerate(
+            zip(colors, single_rgbs_meas),
+        ):
+            single_canvas = sim.reset(batch_size=1)
+            single_canvas = _render_fill_band(
+                sim, single_canvas, cmy, band_half=10.0,
+            )
+            sim_single = _sample_centre(
+                sim, single_canvas,
+            ).cpu().tolist()
 
-        # sample overlap centre
-        px_x = int(cx * sim._dpi_x)
-        px_y = int(cy * sim._dpi_y)
-        px_x = min(max(px_x, 0), sim._W - 1)
-        px_y = min(max(px_y, 0), sim._H - 1)
-        sim_rgb = canvas[0, :, px_y, px_x].cpu().tolist()
+            t = torch.tensor([meas_single], dtype=torch.float32)
+            s = torch.tensor([sim_single], dtype=torch.float32)
+            lab_t = color_utils.rgb_to_lab(t)
+            lab_s = color_utils.rgb_to_lab(s)
+            de = float(color_utils.delta_e2000(lab_t, lab_s).item())
+            delta_es.append(de)
+
+            table.add_row(
+                pid, f"single_c{ci}",
+                _fmt_rgb(meas_single), _fmt_rgb(sim_single),
+                f"{de:.2f}",
+            )
+
+        # --- combined overlap ---
+        overlap_canvas = sim.reset(batch_size=1)
+        for cmy in colors:
+            overlap_canvas = _render_fill_band(
+                sim, overlap_canvas, cmy, band_half=10.0,
+            )
+        sim_overlap = _sample_centre(
+            sim, overlap_canvas,
+        ).cpu().tolist()
 
         for oi, meas_rgb in enumerate(ov["overlap_rgbs"]):
             t = torch.tensor([meas_rgb], dtype=torch.float32)
-            s = torch.tensor([sim_rgb], dtype=torch.float32)
+            s = torch.tensor([sim_overlap], dtype=torch.float32)
             lab_t = color_utils.rgb_to_lab(t)
             lab_s = color_utils.rgb_to_lab(s)
             de = float(color_utils.delta_e2000(lab_t, lab_s).item())
@@ -885,8 +1022,7 @@ def _validate_layering(
 
             table.add_row(
                 pid, f"overlap_{oi}",
-                f"({meas_rgb[0]:.2f},{meas_rgb[1]:.2f},{meas_rgb[2]:.2f})",
-                f"({sim_rgb[0]:.2f},{sim_rgb[1]:.2f},{sim_rgb[2]:.2f})",
+                _fmt_rgb(meas_rgb), _fmt_rgb(sim_overlap),
                 f"{de:.2f}",
             )
 
@@ -895,9 +1031,12 @@ def _validate_layering(
     if delta_es:
         mean_de = sum(delta_es) / len(delta_es)
         session.console.print(
-            f"Mean dE across overlaps: {mean_de:.2f}",
+            f"Mean dE across layering: {mean_de:.2f}",
         )
-        if mean_de > 3.0:
+        de_fail = cal_dict.get("preview_settings", {}).get(
+            "delta_e_fail_threshold", 5.0,
+        )
+        if mean_de > de_fail:
             session.console.print(
                 "[yellow]Systematic bias detected. "
                 "Consider fitting layer_gain_lut.[/yellow]",
@@ -906,10 +1045,65 @@ def _validate_layering(
                 "Fit a simple layer_gain_lut?", default=False,
             ).ask():
                 gain = 1.0 / max(mean_de / 3.0, 0.5)
-                cal_dict["layer_gain_lut"] = [1.0, gain, gain * 0.9, gain * 0.8]
+                cal_dict["layer_gain_lut"] = [
+                    1.0, gain, gain * 0.9, gain * 0.8,
+                ]
                 session.cal = CalibrationV1(**cal_dict)
                 session.modified = True
                 session.invalidate_simulator()
+
+
+def _render_fill_band(
+    sim, canvas: torch.Tensor, cmy: list, band_half: float = 10.0,
+) -> torch.Tensor:
+    """Render a dense horizontal fill band centred on the canvas."""
+    ps = sim._cal.preview_settings
+    fill_z = ps.default_z_mm
+    fill_speed = ps.default_speed_mm_s
+    cx = sim._cal.render.work_area_mm[0] / 2
+    cy = sim._cal.render.work_area_mm[1] / 2
+    line_len = 30.0
+    line_spacing = 0.5
+
+    yy = cy - band_half
+    while yy < cy + band_half:
+        stroke = {
+            "bezier": {
+                "p1": (cx - line_len / 2, yy),
+                "p2": (cx - line_len / 6, yy),
+                "p3": (cx + line_len / 6, yy),
+                "p4": (cx + line_len / 2, yy),
+            },
+            "z_profile": {"z0": fill_z, "z1": fill_z},
+            "speed_profile": {"v0": fill_speed, "v1": fill_speed},
+            "color_cmy": {
+                "c": cmy[0], "m": cmy[1], "y": cmy[2],
+            },
+        }
+        canvas = sim.render_stroke(canvas, stroke)
+        yy += line_spacing
+    return canvas
+
+
+def _sample_centre(sim, canvas: torch.Tensor) -> torch.Tensor:
+    """Sample a small patch at the canvas centre and return mean RGB."""
+    cx = sim._cal.render.work_area_mm[0] / 2
+    cy = sim._cal.render.work_area_mm[1] / 2
+    px_x = int(cx * sim._dpi_x)
+    px_y = int(cy * sim._dpi_y)
+    px_x = min(max(px_x, 0), sim._W - 1)
+    px_y = min(max(px_y, 0), sim._H - 1)
+    r = 2
+    y0 = max(px_y - r, 0)
+    y1 = min(px_y + r + 1, sim._H)
+    x0 = max(px_x - r, 0)
+    x1 = min(px_x + r + 1, sim._W)
+    return canvas[0, :, y0:y1, x0:x1].mean(dim=(1, 2))
+
+
+def _fmt_rgb(rgb) -> str:
+    """Format an RGB list/tuple for table display."""
+    return f"({rgb[0]:.2f},{rgb[1]:.2f},{rgb[2]:.2f})"
 
 
 # ============================================================================
@@ -933,8 +1127,7 @@ def block_preview_validate(session: CalibrationSession) -> None:
     table = sim.summary_table()
     session.console.print(table)
 
-    # aggregate stats
-    all_de = []
+    all_de: List[float] = []
     for block_data in results.values():
         for entry in block_data.values():
             all_de.append(entry["delta_e"])
@@ -945,7 +1138,8 @@ def block_preview_validate(session: CalibrationSession) -> None:
         mean_de = sum(all_de) / len(all_de)
         max_de = max(all_de)
         session.console.print(
-            f"\nOverall  mean dE = {mean_de:.2f}   max dE = {max_de:.2f}",
+            f"\nOverall  mean dE = {mean_de:.2f}   "
+            f"max dE = {max_de:.2f}",
         )
         cal_dict["validation"]["last_run"] = (
             datetime.datetime.now().isoformat()
@@ -963,7 +1157,6 @@ def block_preview_validate(session: CalibrationSession) -> None:
     session.cal = CalibrationV1(**cal_dict)
     session.modified = True
 
-    # save preview images
     out_dir = Path(session.cal.preview_settings.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -987,9 +1180,7 @@ def block_preview_validate(session: CalibrationSession) -> None:
     session.save()
 
 
-def _save_canvas_png(
-    canvas: torch.Tensor, path: Path,
-) -> None:
+def _save_canvas_png(canvas: torch.Tensor, path: Path) -> None:
     """Save a (1,3,H,W) linear-RGB canvas as an sRGB PNG."""
     from PIL import Image
 
@@ -1012,18 +1203,15 @@ def dot_matrix_pattern(
 ) -> List[Dict]:
     """Generate stroke descriptors for a dot matrix calibration sheet.
 
-    Returns
-    -------
-    list of dict
-        Stroke descriptors (tiny-length strokes -> isolated dots).
+    Returns list of stroke dicts (tiny-length strokes -> isolated dots).
     """
     strokes = []
     c, m, y = color_cmy
+    tiny = 0.01
     for row, z in enumerate(z_values):
         cy = spacing_mm * (row + 1)
         for col in range(n_repeats):
             cx = spacing_mm * (col + 1)
-            tiny = 0.01
             strokes.append({
                 "bezier": {
                     "p1": (cx, cy), "p2": (cx + tiny, cy),
@@ -1196,7 +1384,9 @@ def main(cal_path: Optional[str] = None) -> None:
                 logger.exception("Block failed")
 
     if session.modified:
-        if questionary.confirm("Save unsaved changes?", default=True).ask():
+        if questionary.confirm(
+            "Save unsaved changes?", default=True,
+        ).ask():
             session.save()
 
     console.print("[bold]Done.[/bold]")

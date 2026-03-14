@@ -9,6 +9,8 @@ keeping the display persistent and uncluttered.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import time
 from pathlib import Path
@@ -17,7 +19,15 @@ from typing import TYPE_CHECKING, Any
 import questionary
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 from rich.text import Text
 
@@ -32,7 +42,7 @@ _JOBS_YAML = _CONFIGS_DIR / "jobs.yaml"
 _LINEART_YAML = _CONFIGS_DIR / "lineart.yaml"
 _IMAGES_DIR = Path(__file__).resolve().parents[2] / "images"
 _RAW_IMAGES_DIR = _PROJECT_ROOT / "data" / "raw_images" / "hard"
-_DEFAULT_OUTPUT_DIR = _PROJECT_ROOT / "outputs" / "lineart_traces"
+_PREVIEW_DIR = Path(__file__).resolve().parents[2] / "images" / "previews"
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
 
 
@@ -102,9 +112,10 @@ def run(app: RobotApp) -> None:
 
     from robot_control.scripts.run_lineart_tracer import (
         PaperTransform,
+        compute_execution_stats,
         execute_on_robot,
         process_image,
-        save_preview,
+        render_machine_preview,
         save_vectors_yaml,
     )
 
@@ -247,45 +258,86 @@ def run(app: RobotApp) -> None:
             "flow_max_length": flow_cfg.get("max_length", 40.0),
             "flow_max_size": flow_cfg.get("max_size", 800),
             "flow_seed": flow_cfg.get("flow_seed", 42),
+            "flow_invert": flow_cfg.get("invert", False),
+            "flow_auto_contrast": flow_cfg.get("auto_contrast", False),
         })
 
-    param_table = Table(title=f"Parameters ({mode})")
-    param_table.add_column("Parameter", style="bold")
-    param_table.add_column("Value")
-    for k, v in params.items():
-        param_table.add_row(k.replace("_", " ").title(), str(v))
-
-    console.clear()
-    console.print(
-        Panel(
-            Text.from_markup(
-                f"[bold]Step 3[/]  Parameters\n\n"
-                f"  Image: [bold]{image_path.name}[/]   Mode: [bold]{mode}[/]"
-            ),
-            border_style="cyan",
+    def _show_param_table() -> None:
+        tbl = Table(title=f"Parameters ({mode})")
+        tbl.add_column("Parameter", style="bold")
+        tbl.add_column("Value")
+        for k, v in params.items():
+            tbl.add_row(k.replace("_", " ").title(), str(v))
+        console.clear()
+        console.print(
+            Panel(
+                Text.from_markup(
+                    f"[bold]Step 3[/]  Parameters\n\n"
+                    f"  Image: [bold]{image_path.name}[/]"
+                    f"   Mode: [bold]{mode}[/]"
+                ),
+                border_style="cyan",
+            )
         )
-    )
-    console.print(param_table)
+        console.print(tbl)
 
-    edit = questionary.confirm("Edit parameters?", default=False).ask()
-    if edit is None:
-        return
-    if edit:
-        console.print("[dim]Press Enter to keep default, or type new value.[/]")
-        for k, v in list(params.items()):
+    _show_param_table()
+
+    while True:
+        edit = questionary.confirm(
+            "Edit parameters?", default=False,
+        ).ask()
+        if edit is None:
+            return
+        if not edit:
+            break
+
+        param_keys = list(params.keys())
+        choices = [
+            questionary.Choice(
+                f"{k.replace('_', ' ').title()} = {params[k]}",
+                value=k,
+            )
+            for k in param_keys
+        ]
+        selected = questionary.checkbox(
+            "Select parameters to edit:", choices=choices,
+        ).ask()
+        if selected is None:
+            return
+        if not selected:
+            continue
+
+        for k in selected:
+            v = params[k]
+            label = k.replace("_", " ").title()
             if isinstance(v, bool):
-                params[k] = questionary.confirm(f"{k}?", default=v).ask()
+                result = questionary.confirm(
+                    f"{label}?", default=v,
+                ).ask()
+                if result is not None:
+                    params[k] = result
             elif isinstance(v, float):
-                params[k] = _ask_float(app, k.replace("_", " ").title(), v)
+                params[k] = _ask_float(app, label, v)
             elif isinstance(v, int):
-                params[k] = _ask_int(app, k.replace("_", " ").title(), v)
+                params[k] = _ask_int(app, label, v)
+            elif isinstance(v, str):
+                raw = questionary.text(
+                    f"{label}:", default=v,
+                ).ask()
+                if raw is not None and raw.strip():
+                    params[k] = raw.strip()
             elif isinstance(v, list):
-                raw = questionary.text(f"{k} {v}:", default=str(v)).ask()
+                raw = questionary.text(
+                    f"{label} {v}:", default=str(v),
+                ).ask()
                 if raw and raw.strip():
                     try:
                         params[k] = eval(raw.strip())  # noqa: S307
                     except Exception:
                         pass
+
+        _show_param_table()
 
     # === Step 4: Execution options ===
     console.clear()
@@ -302,8 +354,6 @@ def run(app: RobotApp) -> None:
     exec_options = questionary.checkbox(
         "Select options:",
         choices=[
-            questionary.Choice("Dry run (no G-code)", value="dry_run"),
-            questionary.Choice("Save preview image", value="save_preview"),
             questionary.Choice("Save pen_vectors.yaml", value="save_vectors"),
             questionary.Choice("Skip corner alignment", value="skip_corners"),
             questionary.Choice("Mirror X", value="mirror_x"),
@@ -312,8 +362,6 @@ def run(app: RobotApp) -> None:
     if exec_options is None:
         return
 
-    dry_run = "dry_run" in exec_options
-    do_save_preview = "save_preview" in exec_options
     do_save_vectors = "save_vectors" in exec_options
     skip_corners = "skip_corners" in exec_options
     mirror_x = "mirror_x" in exec_options
@@ -345,49 +393,54 @@ def run(app: RobotApp) -> None:
         task = progress.add_task("Processing image...", total=None)
 
         try:
-            paths_mm, paths_px, image_w_mm, image_h_mm, mm_per_px, H, W = process_image(
-                image_path=image_path,
-                paper_w=params["paper_w"],
-                paper_h=params["paper_h"],
-                margin=params["margin"],
-                mode=mode,
-                merge_tolerance_px=params["merge_tolerance"],
-                turdsize=params["turdsize"],
-                threshold=params.get("threshold"),
-                simplify_tol_mm=params["simplify_tol"],
-                min_path_mm=params["min_path_mm"],
-                hatch_levels=tuple(params.get("levels", [64, 128, 192])),
-                hatch_pitch_mm=params.get("hatch_pitch", 0.6),
-                hatch_angle_deg=params.get("hatch_angle", 45.0),
-                hatch_blur_radius=params.get("blur_radius", 10),
-                hatch_image_scale=params.get("image_scale", 1.0),
-                hatch_circular=params.get("circular", False),
-                hatch_invert=params.get("invert", False),
-                hatch_include_outlines=params.get("include_outlines", True),
-                hatch_outline_turdsize=hatch_cfg.get("outline_turdsize", 10),
-                flow_noise_coeff=params.get("noise_coeff", 0.001),
-                flow_n_fields=params.get("n_fields", 1),
-                flow_min_sep=params.get("flow_min_sep", 0.8),
-                flow_max_sep=params.get("flow_max_sep", 10.0),
-                flow_min_length=params.get("flow_min_length", 0.0),
-                flow_max_length=params.get("flow_max_length", 40.0),
-                flow_max_size=params.get("flow_max_size", 800),
-                flow_seed=params.get("flow_seed", 42),
-                flow_flow_seed=params.get("flow_seed", 42),
-                flow_search_ef=flow_cfg.get("search_ef", 50),
-                flow_test_frequency=flow_cfg.get("test_frequency", 2.0),
-                flow_field_type=params.get("field_type", "noise"),
-                flow_edge_field_mult=flow_cfg.get("edge_field_multiplier"),
-                flow_dark_field_mult=flow_cfg.get("dark_field_multiplier"),
-                hatching_n_zones=params.get("n_zones", 4),
-                hatching_pen_width_mm=line_width_mm,
-                hatching_angles=params.get("hatching_angles", [45.0]),
-                hatching_blur_radius=params.get("hatching_blur", 5),
-                hatching_image_scale=params.get("hatching_scale", 1.0),
-                hatching_include_outlines=params.get("hatching_outlines", True),
-                hatching_outline_turdsize=htng_cfg.get("outline_turdsize", 10),
-                hatching_connect_gap_px=params.get("connect_gap", 5.0),
-            )
+            # Redirect stderr to suppress tqdm bars from
+            # vpype-flow-imager (writes \r updates to stderr).
+            with contextlib.redirect_stderr(io.StringIO()):
+                paths_mm, paths_px, image_w_mm, image_h_mm, mm_per_px, H, W = process_image(
+                    image_path=image_path,
+                    paper_w=params["paper_w"],
+                    paper_h=params["paper_h"],
+                    margin=params["margin"],
+                    mode=mode,
+                    merge_tolerance_px=params["merge_tolerance"],
+                    turdsize=params["turdsize"],
+                    threshold=params.get("threshold"),
+                    simplify_tol_mm=params["simplify_tol"],
+                    min_path_mm=params["min_path_mm"],
+                    hatch_levels=tuple(params.get("levels", [64, 128, 192])),
+                    hatch_pitch_mm=params.get("hatch_pitch", 0.6),
+                    hatch_angle_deg=params.get("hatch_angle", 45.0),
+                    hatch_blur_radius=params.get("blur_radius", 10),
+                    hatch_image_scale=params.get("image_scale", 1.0),
+                    hatch_circular=params.get("circular", False),
+                    hatch_invert=params.get("invert", False),
+                    hatch_include_outlines=params.get("include_outlines", True),
+                    hatch_outline_turdsize=hatch_cfg.get("outline_turdsize", 10),
+                    flow_noise_coeff=params.get("noise_coeff", 0.001),
+                    flow_n_fields=params.get("n_fields", 1),
+                    flow_min_sep=params.get("flow_min_sep", 0.8),
+                    flow_max_sep=params.get("flow_max_sep", 10.0),
+                    flow_min_length=params.get("flow_min_length", 0.0),
+                    flow_max_length=params.get("flow_max_length", 40.0),
+                    flow_max_size=params.get("flow_max_size", 800),
+                    flow_seed=params.get("flow_seed", 42),
+                    flow_flow_seed=params.get("flow_seed", 42),
+                    flow_search_ef=flow_cfg.get("search_ef", 50),
+                    flow_test_frequency=flow_cfg.get("test_frequency", 2.0),
+                    flow_field_type=params.get("field_type", "noise"),
+                    flow_edge_field_mult=flow_cfg.get("edge_field_multiplier"),
+                    flow_dark_field_mult=flow_cfg.get("dark_field_multiplier"),
+                    flow_invert=params.get("flow_invert", False),
+                    flow_auto_contrast=params.get("flow_auto_contrast", False),
+                    hatching_n_zones=params.get("n_zones", 4),
+                    hatching_pen_width_mm=line_width_mm,
+                    hatching_angles=params.get("hatching_angles", [45.0]),
+                    hatching_blur_radius=params.get("hatching_blur", 5),
+                    hatching_image_scale=params.get("hatching_scale", 1.0),
+                    hatching_include_outlines=params.get("hatching_outlines", True),
+                    hatching_outline_turdsize=htng_cfg.get("outline_turdsize", 10),
+                    hatching_connect_gap_px=params.get("connect_gap", 5.0),
+                )
         except Exception as exc:
             progress.stop()
             console.print(f"[red]Processing failed: {exc}[/]")
@@ -417,17 +470,6 @@ def run(app: RobotApp) -> None:
             title="Vectorization Results",
         )
     )
-
-    stem = image_path.stem
-    out_dir = _DEFAULT_OUTPUT_DIR / stem
-
-    if do_save_preview:
-        save_preview(paths_px, H, W, out_dir / "preview.png")
-        console.print(f"  Preview saved: {out_dir / 'preview.png'}")
-
-    if do_save_vectors:
-        save_vectors_yaml(paths_mm, image_w_mm, image_h_mm, W, H, out_dir / "pen_vectors.yaml")
-        console.print(f"  Vectors saved: {out_dir / 'pen_vectors.yaml'}")
 
     img_is_portrait = image_h_mm > image_w_mm
     paper_is_landscape = params["paper_w"] > params["paper_h"]
@@ -473,10 +515,67 @@ def run(app: RobotApp) -> None:
         mpts = [xform.image_to_machine(float(pt[0]), float(pt[1])) for pt in p]
         machine_paths.append(mpts)
 
-    if dry_run:
-        console.print("\n[bold cyan]DRY RUN[/] -- no G-code sent to robot.")
-        log.log_action("tracer", "dry_run_complete", f"{len(machine_paths)} paths")
-        questionary.press_any_key_to_continue("Press any key to continue...").ask()
+    # === Step 6: Visualisation ===
+    stem = image_path.stem
+    preview_path = _PREVIEW_DIR / f"{stem}_preview.png"
+
+    vis_stats = compute_execution_stats(
+        machine_paths=machine_paths,
+        draw_speed_mm_s=params["draw_speed"],
+        travel_speed_mm_s=params["travel_speed"],
+        z_plunge_speed_mm_s=params["z_plunge_speed"],
+        z_retract_speed_mm_s=params["z_retract_speed"],
+        z_retract=params["z_retract"],
+        accel_mm_s2=params["accel"],
+        square_corner_velocity_mm_s=params["square_corner_velocity"],
+    )
+    vis_stats["mode"] = mode
+
+    render_machine_preview(
+        machine_paths, xform, preview_path, stats=vis_stats,
+    )
+    console.print(f"  Preview saved: {preview_path}")
+
+    if do_save_vectors:
+        vectors_path = _PREVIEW_DIR / f"{stem}_vectors.yaml"
+        save_vectors_yaml(
+            paths_mm, image_w_mm, image_h_mm, W, H, vectors_path,
+        )
+        console.print(f"  Vectors saved: {vectors_path}")
+
+    est_min = vis_stats["estimated_time_min"]
+    console.print(
+        Panel(
+            Text.from_markup(
+                f"[bold]Visualisation[/]\n\n"
+                f"  Paths:      [bold]{vis_stats['paths']}[/]\n"
+                f"  Draw:       {vis_stats['draw_mm']:.0f} mm"
+                f"  ({vis_stats['draw_time_min']:.1f} min)\n"
+                f"  Travel:     {vis_stats['travel_mm']:.0f} mm"
+                f"  ({vis_stats['travel_time_min']:.1f} min)\n"
+                f"  Pen lifts:  {vis_stats['pen_lifts']}\n"
+                f"  Segments:   {vis_stats['segments']}\n"
+                f"  Est. total: [bold]{est_min:.1f}[/] min"
+                f"  ({est_min / 60.0:.1f} hours)"
+            ),
+            title="Execution Estimate",
+            border_style="cyan",
+        )
+    )
+
+    log.log_action(
+        "tracer", "visualisation",
+        f"{vis_stats['paths']} paths, {est_min:.1f} min est",
+    )
+
+    run_job = questionary.confirm(
+        "Execute job on robot?", default=False,
+    ).ask()
+    if run_job is None or not run_job:
+        console.print("[cyan]Job not executed.[/]")
+        questionary.press_any_key_to_continue(
+            "Press any key to continue...",
+        ).ask()
         return
 
     # === Execute on robot ===
@@ -485,7 +584,9 @@ def run(app: RobotApp) -> None:
         Panel(
             Text.from_markup(
                 f"[bold]Executing on Robot[/]\n\n"
-                f"  {len(machine_paths)} paths   {total_draw_mm:.0f} mm total"
+                f"  [bold]{len(machine_paths)}[/] paths"
+                f"   [bold]{total_draw_mm:.0f}[/] mm total"
+                f"   est. [bold]{est_min:.1f}[/] min"
             ),
             border_style="green",
         )
@@ -498,11 +599,88 @@ def run(app: RobotApp) -> None:
         app.connection.connect()
 
     from robot_control.hardware.pump_control import wait_for_ready as _hw_wait
-    from robot_control.scripts.run_lineart_tracer import _raw_gcode
+    from robot_control.scripts.run_lineart_tracer import (
+        WORKSPACE_Z_MM,
+        Z_MAX_SAFE,
+        Z_MIN_SAFE,
+        _raw_gcode,
+        _verify_mesh_loaded,
+        pen_up,
+    )
 
     socket_path = app.config.connection.socket_path
-    console.print("  Connecting to Klipper for drawing...")
+
+    init_lines: list[str] = []
+    init_lines.append("Connecting to Klipper...")
     sock = _hw_wait(socket_path, timeout=60.0)
+
+    _raw_gcode(sock, "SET_IDLE_TIMEOUT TIMEOUT=3600", timeout=5.0)
+
+    init_lines.append("Homing all axes...")
+    if not _raw_gcode(sock, "G28", timeout=60.0):
+        console.print("[red]  ERROR: Homing failed![/]")
+        sock.close()
+        return
+    init_lines.append(
+        f"  Homed OK  X=0  Y=0  Z={WORKSPACE_Z_MM:.0f}"
+    )
+
+    z_travel_val = max(Z_MIN_SAFE, min(params["z_retract"], Z_MAX_SAFE))
+    pen_up(sock, z_travel_val, params["z_retract_speed"] * 60.0)
+    _raw_gcode(sock, "M400")
+    init_lines.append(f"  Z retracted to {z_travel_val:.1f} mm")
+
+    _raw_gcode(sock, "G90")
+
+    mesh_ok = _raw_gcode(sock, "BED_MESH_PROFILE LOAD=default")
+    if mesh_ok:
+        margin_corners = xform.get_margin_corners()
+        with contextlib.redirect_stdout(io.StringIO()) as mesh_buf:
+            _verify_mesh_loaded(
+                sock, margin_corners, params["z_contact"],
+            )
+        mesh_text = mesh_buf.getvalue().strip()
+        if mesh_text:
+            from rich.markup import escape as _esc
+            for ln in mesh_text.splitlines():
+                init_lines.append(_esc(ln.rstrip()))
+    else:
+        init_lines.append("[yellow]WARNING: No bed mesh -- Z flat[/]")
+
+    console.print(
+        Panel(
+            Text.from_markup("\n".join(init_lines)),
+            title="Initialisation",
+            border_style="blue",
+        )
+    )
+
+    # -- Rich progress bar driven by execute_on_robot callback --
+    draw_progress: Progress | None = None
+    draw_task_id: int = 0
+
+    def _on_path_progress(completed: int, total: int) -> None:
+        nonlocal draw_progress, draw_task_id
+        if draw_progress is None:
+            draw_progress = Progress(
+                SpinnerColumn(spinner_name="dots"),
+                TextColumn(
+                    "[bold blue]{task.description}[/]  "
+                    "[bold]{task.percentage:>5.1f}%[/]"
+                ),
+                BarColumn(bar_width=60),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TextColumn("ETA"),
+                TimeRemainingColumn(),
+                console=console,
+                refresh_per_second=4,
+            )
+            draw_progress.start()
+            draw_task_id = draw_progress.add_task(
+                "Drawing paths", total=total,
+            )
+        draw_progress.update(draw_task_id, completed=completed)
 
     try:
         stats = execute_on_robot(
@@ -520,23 +698,40 @@ def run(app: RobotApp) -> None:
             corner_circle_radius=params["corner_radius"],
             dry_run=False,
             skip_corners=skip_corners,
+            progress_callback=_on_path_progress,
         )
 
+        if draw_progress is not None:
+            draw_progress.stop()
+            draw_progress = None
+
         if stats:
-            console.clear()
+            elapsed_min = stats.get("actual_time_min", 0.0)
+            est_min = stats.get("estimated_time_min", 0.0)
             console.print(
-                info_panel(
-                    {k: str(v) for k, v in stats.items()},
-                    title="Execution Stats",
+                Panel(
+                    Text.from_markup(
+                        f"Drawing complete in"
+                        f" [bold green]{elapsed_min:.1f}[/] min"
+                        f"  (estimated {est_min:.1f} min)\n\n"
+                        f"  Paths:    [bold]{stats['paths']}[/]\n"
+                        f"  Draw:     {stats['draw_mm']:.0f} mm\n"
+                        f"  Travel:   {stats['travel_mm']:.0f} mm\n"
+                        f"  Pen lifts: {stats['pen_lifts']}"
+                    ),
+                    title="Execution Complete",
                     border_style="green",
                 )
             )
         log.log_action(
-            "tracer", "execute_complete", f"{len(machine_paths)} paths drawn"
+            "tracer", "execute_complete",
+            f"{len(machine_paths)} paths drawn",
         )
 
     except KeyboardInterrupt:
-        console.print("\n[yellow]Drawing interrupted -- pen up and disable.[/]")
+        console.print(
+            "\n[yellow]Drawing interrupted -- pen up and disable.[/]"
+        )
         try:
             _raw_gcode(sock, "G0 Z40 F1200\nM400\nM18")
         except Exception:
@@ -549,6 +744,8 @@ def run(app: RobotApp) -> None:
         except Exception:
             pass
     finally:
+        if draw_progress is not None:
+            draw_progress.stop()
         try:
             sock.close()
         except Exception:

@@ -194,10 +194,13 @@ class _PumpSession:
         for pid in self.pump_ids:
             m = self.motor(pid)
             sy = self.syringe(pid)
+            pos_mm = self.pump_positions.get(pid, 0.0)
             states[pid] = {
                 "fluid": m.fluid,
-                "position_mm": self.pump_positions.get(pid, 0.0),
+                "position_mm": pos_mm,
+                "position_ml": pos_mm * sy.volume_per_mm,
                 "travel_mm": sy.plunger_travel_mm,
+                "travel_ml": sy.volume_ml,
                 "homed": self.homed[pid],
                 "speed_mm_s": self.current_speeds.get(pid, 0.0),
             }

@@ -171,7 +171,9 @@ def pump_diagram(
     ----------
     pump_states : dict
         ``{pump_id: {"fluid": str, "position_mm": float,
-        "travel_mm": float, "homed": bool, "speed_mm_s": float}}``.
+        "position_ml": float, "travel_mm": float,
+        "travel_ml": float, "homed": bool,
+        "speed_mm_s": float}}``.
     valve_open : bool
         Refill valve state.
     needle_retracted : bool
@@ -199,11 +201,12 @@ def pump_diagram(
         fluid = st.get("fluid", "?")
         pos = st.get("position_mm", 0.0)
         travel = st.get("travel_mm", 16.5)
+        pos_ml = st.get("position_ml", 0.0)
+        travel_ml = st.get("travel_ml", 1.0)
         homed = st.get("homed", False)
         speed = st.get("speed_mm_s", 0.0)
         color = _FLUID_COLORS.get(fluid, "white")
 
-        # Plunger bar: [████████░░░░░░░░░░░░] 5.2 / 16.5 mm
         ratio = max(0.0, min(1.0, pos / travel)) if travel > 0 else 0.0
         filled = int(ratio * _SYRINGE_WIDTH)
         empty = _SYRINGE_WIDTH - filled
@@ -218,7 +221,7 @@ def pump_diagram(
             f"  {pid:<8} {fluid:<8} {homed_tag} "
         )
         label.append_text(bar)
-        label.append(f"  {pos:6.2f} / {travel:.1f} mm")
+        label.append(f"  {pos_ml:.3f} / {travel_ml:.3f} ml")
         if speed > 0:
             label.append(f"  @ {speed:.1f} mm/s")
         lines.append(label)

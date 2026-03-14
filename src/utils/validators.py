@@ -1232,6 +1232,18 @@ class CalibrationSamplingConfig(BaseModel):
         True,
         description="Normalize stamp integral for mass conservation",
     )
+    dot_reference_speed_mm_s: float = Field(
+        60.0, ge=1.0, le=300.0,
+        description="Speed for mass_lut lookup when simulating dots",
+    )
+    bezier_max_err_mm: float = Field(
+        0.25, gt=0.0, le=5.0,
+        description="Bezier flattening chord error tolerance (mm)",
+    )
+    bezier_max_depth: int = Field(
+        12, ge=4, le=20,
+        description="Bezier adaptive subdivision depth limit",
+    )
 
 
 class CalibrationColorAxes(BaseModel):
@@ -1313,9 +1325,29 @@ class CalibrationValidationResult(BaseModel):
 
 
 class CalibrationPreviewSettings(BaseModel):
-    """Output paths for preview artifacts."""
+    """Output paths and default rendering parameters for preview artifacts."""
     dpi: int = Field(150, ge=50, le=600)
     output_dir: str = Field("outputs/digital_twin")
+    delta_e_warn_threshold: float = Field(
+        3.0, ge=0.0, le=20.0,
+        description="dE below this is PASS",
+    )
+    delta_e_fail_threshold: float = Field(
+        5.0, ge=0.0, le=50.0,
+        description="dE above this is FAIL; between warn and fail = WARN",
+    )
+    default_color_cmy: Tuple[float, float, float] = Field(
+        (0.8, 0.2, 0.1),
+        description="Default CMY recipe for preview renders",
+    )
+    default_z_mm: float = Field(
+        6.0, ge=0.0, le=30.0,
+        description="Default nozzle height for fill previews (mm)",
+    )
+    default_speed_mm_s: float = Field(
+        30.0, ge=1.0, le=300.0,
+        description="Default traverse speed for fill previews (mm/s)",
+    )
 
 
 class CalibrationV1(BaseModel):

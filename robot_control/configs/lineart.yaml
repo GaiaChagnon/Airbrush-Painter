@@ -93,6 +93,15 @@ flow_imager:
   edge_field_multiplier: null        # Blend edge-following field (try 1.0)
   dark_field_multiplier: null        # Blend dark-curling field (try 1.0)
 
+  # Inversion for images with white/light features.
+  # When true, inverts the image so light areas receive dense lines.
+  invert: false
+
+  # Auto-contrast via CLAHE (Contrast Limited Adaptive Histogram Eq).
+  # Spreads brightness histogram so low-contrast images produce
+  # stronger density variation.  Applied before invert.
+  auto_contrast: false
+
   # Path post-processing
   min_path_mm: 0.3                   # Drop paths shorter than this (mm)
   simplify_tol_mm: 0.05              # Douglas-Peucker tolerance (mm)
