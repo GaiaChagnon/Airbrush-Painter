@@ -89,5 +89,8 @@ configs/sim/luts/*.pt
 *.tmp
 .tmp/
 
+# Internal planning docs (local only)
+Improvement_Plan.md
+
 # Keep directory structure with .gitkeep files
 !**/.gitkeep
