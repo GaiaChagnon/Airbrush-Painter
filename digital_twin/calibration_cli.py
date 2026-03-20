@@ -33,18 +33,16 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from src.utils import color as color_utils, fs, validators
-from src.utils.validators import (
-    CalibrationV1,
-    DotMeasurement,
-    LineMeasurement,
-    OverlapMeasurement,
-    SwatchMeasurement,
-)
+from src.utils import color as color_utils, validators
+from src.utils.validators import CalibrationV1
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CALIBRATION_PATH = Path("digital_twin/calibration.yaml")
+
+# Module-level console for standalone input helpers that don't have
+# access to a CalibrationSession.
+_input_console = Console()
 
 
 # ============================================================================
@@ -69,10 +67,12 @@ def ask_float(
         try:
             val = float(raw)
         except ValueError:
-            print(f"  Invalid number: '{raw}'")
+            _input_console.print(f"  [red]Invalid number: '{raw}'[/red]")
             continue
         if val < min_val or val > max_val:
-            print(f"  Out of range [{min_val}, {max_val}]: {val}")
+            _input_console.print(
+                f"  [red]Out of range [{min_val}, {max_val}]: {val}[/red]",
+            )
             continue
         return val
 
@@ -85,15 +85,17 @@ def ask_rgb(prompt: str) -> Tuple[float, float, float]:
             raise KeyboardInterrupt
         parts = raw.replace(",", " ").split()
         if len(parts) != 3:
-            print("  Need exactly 3 values")
+            _input_console.print("  [red]Need exactly 3 values[/red]")
             continue
         try:
             vals = tuple(float(p) for p in parts)
         except ValueError:
-            print("  Non-numeric value")
+            _input_console.print("  [red]Non-numeric value[/red]")
             continue
         if any(v < 0.0 or v > 1.0 for v in vals):
-            print("  Each component must be in [0, 1]")
+            _input_console.print(
+                "  [red]Each component must be in [0, 1][/red]",
+            )
             continue
         return vals  # type: ignore[return-value]
 
@@ -106,15 +108,17 @@ def ask_cmy(prompt: str) -> Tuple[float, float, float]:
             raise KeyboardInterrupt
         parts = raw.replace(",", " ").split()
         if len(parts) != 3:
-            print("  Need exactly 3 values")
+            _input_console.print("  [red]Need exactly 3 values[/red]")
             continue
         try:
             vals = tuple(float(p) for p in parts)
         except ValueError:
-            print("  Non-numeric value")
+            _input_console.print("  [red]Non-numeric value[/red]")
             continue
         if any(v < 0.0 or v > 1.0 for v in vals):
-            print("  Each component must be in [0, 1]")
+            _input_console.print(
+                "  [red]Each component must be in [0, 1][/red]",
+            )
             continue
         return vals  # type: ignore[return-value]
 
@@ -182,7 +186,8 @@ class CalibrationSession:
     def simulator(self):
         """Lazy-loaded GPU simulator, rebuilt when calibration changes."""
         if self._sim is None:
-            self.save()
+            if self.modified:
+                self.save()
             from digital_twin.gpu_simulator import GPUStampSimulator
             self._sim = GPUStampSimulator(self.cal_path)
         return self._sim
@@ -407,6 +412,11 @@ def _fit_profile_from_dots(
                 "skirt_sigma_frac"
             ]
             cal_dict["profile"]["skirt_power"] = best_params["skirt_power"]
+            # Persist profile independently so it survives even if
+            # the radius fit is rejected afterward.
+            session.cal = CalibrationV1(**cal_dict)
+            session.modified = True
+            session.invalidate_simulator()
 
 
 def _lum(rgb) -> float:
@@ -614,7 +624,8 @@ def _approx_profile_integral(profile_dict: Dict) -> float:
     phi[u > margin] = 0.0
 
     du = u[1] - u[0]
-    return float(2.0 * np.pi * np.trapz(phi * u, dx=du))
+    _trapz = getattr(np, "trapezoid", np.trapz)
+    return float(2.0 * np.pi * _trapz(phi * u, dx=du))
 
 
 # ============================================================================
@@ -757,7 +768,7 @@ def _fit_swatches(
     table.add_column("Recipe")
     table.add_column("Target interior")
     table.add_column("Inverted paint_rgb")
-    table.add_column("dE (interior vs resim)")
+    table.add_column("dE (interior vs LUT)")
 
     for sid, sw in swatches.items():
         cmy = sw["cmy_command"]
@@ -1131,6 +1142,10 @@ def block_preview_validate(session: CalibrationSession) -> None:
     for block_data in results.values():
         for entry in block_data.values():
             all_de.append(entry["delta_e"])
+            if "delta_e_shoulder" in entry:
+                all_de.append(entry["delta_e_shoulder"])
+            if "delta_e_edge" in entry:
+                all_de.append(entry["delta_e_edge"])
 
     cal_dict = session.cal.model_dump(mode="json")
 
@@ -1176,6 +1191,7 @@ def block_preview_validate(session: CalibrationSession) -> None:
         session.console.print(
             f"[red]Preview render failed: {exc}[/red]",
         )
+        logger.exception("Preview render failed")
 
     session.save()
 
@@ -1345,7 +1361,14 @@ def main(cal_path: Optional[str] = None) -> None:
         console.print(f"[red]File not found: {cal_path}[/red]")
         return
 
-    session = CalibrationSession(cal_path_obj, console)
+    try:
+        session = CalibrationSession(cal_path_obj, console)
+    except Exception as exc:
+        console.print(
+            f"[red]Failed to load calibration: {exc}[/red]",
+        )
+        logger.exception("Calibration load failed: %s", cal_path)
+        return
 
     menu_items = [
         "1. White reference",

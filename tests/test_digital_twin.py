@@ -614,3 +614,122 @@ class TestPreviewTools:
         b = torch.rand(3, 100, 100)
         hm = sim.error_heatmap(a, b)
         assert hm.shape == (100, 100)
+
+
+# ============================================================================
+# Profile persistence (regression for silent data-loss bug)
+# ============================================================================
+
+class TestProfilePersistence:
+    """Verify profile-fit acceptance is persisted independently of radius."""
+
+    def test_profile_survives_radius_rejection(self, cal_path):
+        """Profile params committed to session even when radius is rejected.
+
+        Reproduces the bug where ``_fit_profile_from_dots`` modified
+        ``cal_dict`` in-place but only ``_fit_dots`` committed to
+        ``session.cal`` -- gated behind radius acceptance.
+        """
+        from digital_twin.calibration_cli import (
+            CalibrationSession,
+            _fit_profile_from_dots,
+        )
+        from rich.console import Console
+
+        console = Console()
+        session = CalibrationSession(cal_path, console)
+        original_core = session.cal.profile.core_frac
+        cal_dict = session.cal.model_dump(mode="json")
+
+        # Synthesize dots with a strong contrast gradient so the
+        # grid search finds a distinctly different profile.
+        dots = {
+            "synth_z6": {
+                "z_mm": 6.0,
+                "color_recipe_cmy": [0.8, 0.2, 0.1],
+                "diameter_mm": 2.2,
+                "center_rgb": [0.1, 0.1, 0.1],
+                "mid_rgb": [0.5, 0.5, 0.5],
+                "edge_rgb": [0.95, 0.95, 0.95],
+                "background_rgb": [1.0, 1.0, 1.0],
+            },
+        }
+
+        # Directly call the profile fitter with auto-accept by
+        # verifying it writes into cal_dict.
+        from unittest.mock import patch
+
+        with patch("questionary.confirm") as mock_confirm:
+            mock_confirm.return_value.ask.return_value = True
+            _fit_profile_from_dots(session, dots, cal_dict)
+
+        # After accepting, session.cal must reflect the new profile.
+        new_core = session.cal.profile.core_frac
+        assert new_core == cal_dict["profile"]["core_frac"], (
+            "Profile not committed to session.cal after acceptance"
+        )
+        assert session.modified, "session.modified not set after profile fit"
+
+
+# ============================================================================
+# Validation aggregation (line shoulder/edge inclusion)
+# ============================================================================
+
+class TestValidationAggregation:
+    """Overall dE aggregation includes shoulder and edge for lines."""
+
+    def test_shoulder_edge_included(self, sim):
+        """compare_to_measurements returns shoulder/edge keys for lines."""
+        results = sim.compare_to_measurements()
+        for lid, entry in results.get("lines", {}).items():
+            assert "delta_e_shoulder" in entry, (
+                f"Line {lid} missing delta_e_shoulder"
+            )
+            assert "delta_e_edge" in entry, (
+                f"Line {lid} missing delta_e_edge"
+            )
+
+
+# ============================================================================
+# Simulator guard tests
+# ============================================================================
+
+class TestSimulatorGuards:
+    """Config and input contract validations added to the simulator."""
+
+    def test_reject_non_ascending_z_grid(self, cal_path):
+        """Non-ascending z_grid_mm raises ValueError."""
+        from digital_twin.gpu_simulator import GPUStampSimulator
+
+        data = fs.load_yaml(cal_path)
+        data["z_grid_mm"] = [10.0, 5.0, 2.0, 1.0, 0.5, 0.3, 0.1]
+        data["radius_lut_mm"] = data["radius_lut_mm"][:7]
+        out = cal_path.parent / "bad_z.yaml"
+        fs.atomic_yaml_dump(data, out)
+        with pytest.raises(ValueError, match="z_grid_mm"):
+            GPUStampSimulator(out, device=torch.device("cpu"))
+
+    def test_reject_equal_domain(self, cal_path):
+        """color_axes.domain with lo == hi raises ValueError."""
+        from digital_twin.gpu_simulator import GPUStampSimulator
+
+        data = fs.load_yaml(cal_path)
+        data["color_axes"]["domain"] = [0.5, 0.5]
+        out = cal_path.parent / "bad_domain.yaml"
+        fs.atomic_yaml_dump(data, out)
+        with pytest.raises(ValueError, match="color_axes.domain"):
+            GPUStampSimulator(out, device=torch.device("cpu"))
+
+    def test_reject_wrong_device_canvas(self, sim, simple_stroke):
+        """Canvas on wrong device raises ValueError."""
+        if not torch.cuda.is_available():
+            pytest.skip("No CUDA device to test cross-device rejection")
+        canvas_cuda = sim.reset().to("cuda")
+        with pytest.raises(ValueError, match="device"):
+            sim.render_stroke(canvas_cuda, simple_stroke)
+
+    def test_reject_wrong_dtype_canvas(self, sim, simple_stroke):
+        """Canvas with float64 dtype raises ValueError."""
+        canvas_f64 = sim.reset().to(dtype=torch.float64)
+        with pytest.raises(ValueError, match="dtype"):
+            sim.render_stroke(canvas_f64, simple_stroke)

@@ -168,8 +168,11 @@ class RobotApp:
             self.console.print("\n[yellow]Returning to main menu...[/]")
         except Exception as exc:
             self.session_log.log_error(exc)
-            self.console.print(f"\n[red]Error: {exc}[/]")
+            self.console.print(f"\n[bold red]Error in {label}:[/] {exc}")
             logger.exception("Mode %s failed", label)
+            questionary.press_any_key_to_continue(
+                "Press any key to return to main menu..."
+            ).ask()
 
         self.session_log.log_action("app", "mode_exit", label)
 

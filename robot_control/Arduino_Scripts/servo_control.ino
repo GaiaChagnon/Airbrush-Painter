@@ -5,45 +5,52 @@
 // HIGH/LOW; this Arduino translates those into servo positions.
 //
 // Wiring (Octopus -> Arduino -> Servo):
-//   PB6  ->  A0 (digital input)  ->  Servo 1 (pin 11)  Pump refill valve
-//   PB7  ->  A1 (digital input)  ->  Servo 2 (pin 10)  Airbrush needle retract
+//   PB6  ->  A0 (digital input)  ->  Servo 1 (pin 11)  Airbrush needle retract
+//   PB7  ->  A1 (digital input)  ->  Servo 2 (pin 10)  Pump refill valve
+//   GND  ->  GND (shared ground between Octopus and Arduino)
 //
 // Klipper commands:
-//   SET_PIN PIN=servo_pump_refill VALUE=1       -> Servo 1 valve OPEN  (2000 us)
-//   SET_PIN PIN=servo_pump_refill VALUE=0       -> Servo 1 valve CLOSED (2500 us)
-//   SET_PIN PIN=servo_airbrush_needle VALUE=1   -> Servo 2 needle retracted, spray ON
-//   SET_PIN PIN=servo_airbrush_needle VALUE=0   -> Servo 2 needle forward, spray OFF
+//   SET_PIN PIN=servo_airbrush_needle VALUE=1   -> Servo 1 needle retracted, spray ON
+//   SET_PIN PIN=servo_airbrush_needle VALUE=0   -> Servo 1 needle forward, spray OFF
+//   SET_PIN PIN=servo_pump_refill VALUE=1       -> Servo 2 valve OPEN  (SERVO2_ON_US)
+//   SET_PIN PIN=servo_pump_refill VALUE=0       -> Servo 2 valve CLOSED (SERVO2_OFF_US)
 //
-// Anti-jitter: each input is debounced over DEBOUNCE_MS before the
-// servo position is updated.  This prevents glitches from EMI or
-// brief signal transitions on the Octopus output pins.
+// Debug: open Serial Monitor at 115200 baud to see input state changes.
 
 #include <Servo.h>
 
 // --------------- pin assignments ---------------
-const int SERVO_PIN_1 = 11;   // pump refill servo
-const int SERVO_PIN_2 = 10;   // airbrush needle servo
-const int INPUT_PIN_1 = A0;   // PB6 -> pump refill
-const int INPUT_PIN_2 = A1;   // PB7 -> airbrush needle
+const int SERVO_PIN_1 = 11;   // airbrush needle servo
+const int SERVO_PIN_2 = 10;   // pump refill servo
+const int INPUT_PIN_1 = A0;   // PB6 -> airbrush needle
+const int INPUT_PIN_2 = A1;   // PB7 -> pump refill
+
+// --------------- servo pulse range (must match servo_setup.ino) ---------------
+const int SERVO_MIN_US = 500;
+const int SERVO_MAX_US = 2500;
 
 // --------------- calibrated positions (microseconds) ---------------
-// Servo 1 – pump refill valve
-const int SERVO1_OFF_US = 2500;  // valve closed
-const int SERVO1_ON_US  = 2000;  // valve open
+// Servo 1 -- airbrush needle
+const int SERVO1_OFF_US = 2500;  // needle forward, spray OFF
+const int SERVO1_ON_US  = 2100;  // needle retracted, spray ON
 
-// Servo 2 – airbrush needle  (adjust after calibration)
-const int SERVO2_OFF_US = 500;   // needle forward, spray OFF
-const int SERVO2_ON_US  = 2500;  // needle retracted, spray ON
+// Servo 2 -- pump refill valve  (adjust after calibration)
+const int SERVO2_OFF_US = 2300;  // valve closed
+const int SERVO2_ON_US  = 2300;  // valve open
 
 // --------------- debounce ---------------
-// Signal must remain stable for this duration before a state change
-// is accepted.  50 ms rejects EMI spikes without adding perceptible
-// latency to valve actuation.
+// 50 ms rejects EMI spikes without adding perceptible latency.
 const unsigned long DEBOUNCE_MS = 50;
+
+// --------------- timing ---------------
+// Minimum interval between loop iterations (ms).
+// Keeps CPU utilization low; 10 ms still gives <60 ms response time
+// with debounce included.
+const unsigned long LOOP_INTERVAL_MS = 10;
 
 struct Debounce {
     int  stable;              // last accepted (debounced) reading
-    int  previous;            // raw reading on the prior loop iteration
+    int  previous;            // raw reading on the prior iteration
     unsigned long changed_at; // millis() when `previous` last flipped
 };
 
@@ -53,16 +60,17 @@ Debounce db2 = {LOW, LOW, 0};
 Servo servo1;
 Servo servo2;
 
+int last_state1 = -1;  // force initial update (no valid pin state is -1)
+int last_state2 = -1;
+
 // Returns the debounced state of `pin`, updating `db` in place.
 int debounced_read(int pin, Debounce &db) {
     int raw = digitalRead(pin);
 
     if (raw != db.previous) {
-        // Input just changed — restart the stability timer
         db.changed_at = millis();
         db.previous   = raw;
     } else if ((millis() - db.changed_at) >= DEBOUNCE_MS) {
-        // Input held steady long enough — accept it
         db.stable = raw;
     }
 
@@ -72,21 +80,56 @@ int debounced_read(int pin, Debounce &db) {
 void setup() {
     Serial.begin(115200);
 
-    servo1.attach(SERVO_PIN_1);
-    servo2.attach(SERVO_PIN_2);
+    servo1.attach(SERVO_PIN_1, SERVO_MIN_US, SERVO_MAX_US);
+    servo2.attach(SERVO_PIN_2, SERVO_MIN_US, SERVO_MAX_US);
 
-    pinMode(INPUT_PIN_1, INPUT);
-    pinMode(INPUT_PIN_2, INPUT);
+    // INPUT_PULLDOWN gives a defined LOW when Octopus pins are not driven
+    // (before Klipper init or if the cable is disconnected).  Octopus
+    // push-pull outputs override the weak pull-down when active.
+    pinMode(INPUT_PIN_1, INPUT_PULLDOWN);
+    pinMode(INPUT_PIN_2, INPUT_PULLDOWN);
 
-    // Both servos start in the OFF (safe) position
     servo1.writeMicroseconds(SERVO1_OFF_US);
     servo2.writeMicroseconds(SERVO2_OFF_US);
+
+    Serial.println("Servo controller ready");
+    Serial.print("  Servo 1 (needle): OFF=");
+    Serial.print(SERVO1_OFF_US);
+    Serial.print("us  ON=");
+    Serial.print(SERVO1_ON_US);
+    Serial.println("us");
+    Serial.print("  Servo 2 (valve):  OFF=");
+    Serial.print(SERVO2_OFF_US);
+    Serial.print("us  ON=");
+    Serial.print(SERVO2_ON_US);
+    Serial.println("us");
 }
 
 void loop() {
     int state1 = debounced_read(INPUT_PIN_1, db1);
     int state2 = debounced_read(INPUT_PIN_2, db2);
 
-    servo1.writeMicroseconds(state1 == HIGH ? SERVO1_ON_US : SERVO1_OFF_US);
-    servo2.writeMicroseconds(state2 == HIGH ? SERVO2_ON_US : SERVO2_OFF_US);
+    if (state1 != last_state1) {
+        int us = (state1 == HIGH) ? SERVO1_ON_US : SERVO1_OFF_US;
+        servo1.writeMicroseconds(us);
+        last_state1 = state1;
+        Serial.print("Needle: ");
+        Serial.print(state1 == HIGH ? "RETRACTED" : "FORWARD");
+        Serial.print("  (");
+        Serial.print(us);
+        Serial.println("us)");
+    }
+
+    if (state2 != last_state2) {
+        int us = (state2 == HIGH) ? SERVO2_ON_US : SERVO2_OFF_US;
+        servo2.writeMicroseconds(us);
+        last_state2 = state2;
+        Serial.print("Valve:  ");
+        Serial.print(state2 == HIGH ? "OPEN" : "CLOSED");
+        Serial.print("  (");
+        Serial.print(us);
+        Serial.println("us)");
+    }
+
+    delay(LOOP_INTERVAL_MS);
 }

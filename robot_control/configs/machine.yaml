@@ -116,9 +116,9 @@ pumps:
   enabled: true
   backlash_purge_mm: 0.5
   manifold_purge_volume_ml: 0.5
-  refill_valve_output: servo_pump_refill   # digital_outputs key for the refill valve servo
-  refill_valve_delay_s: 1.0                # seconds to wait after opening/closing the valve (servo transit time)
-  enforce_travel_limits: true              # when true, reject pump moves beyond plunger_travel_mm on homed pumps
+  refill_valve_output: servo_pump_refill
+  refill_valve_delay_s: 1.0
+  enforce_travel_limits: true
   stepper:
     motor_type: 1.8deg
     full_steps_per_rotation: 200
@@ -149,8 +149,8 @@ pumps:
       max_dispense_speed_mm_s: 4.0
       max_retract_speed_mm_s: 2.0
       syringe:
-        plunger_travel_mm: 18.0636
-        volume_ml: 1.0
+        plunger_travel_mm: 16.5
+        volume_ml: 0.8341
     pump_1:
       fluid: magenta
       octopus_slot: Motor 4
@@ -226,11 +226,11 @@ endstop_phase:
   enabled: true
 digital_outputs:
   servo_pump_refill:
-    pin: PB6
-    description: "Pump input refill enable (Arduino servo 1)"
-  servo_airbrush_needle:
     pin: PB7
-    description: "Airbrush needle retract / spray enable (Arduino servo 2)"
+    description: Pump input refill enable (Arduino servo 2)
+  servo_airbrush_needle:
+    pin: PB6
+    description: Airbrush needle retract / spray enable (Arduino servo 1)
   air_valve:
     pin: PG15
-    description: "Air supply solenoid valve (open/close)"
+    description: Air supply solenoid valve (open/close)

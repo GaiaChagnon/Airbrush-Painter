@@ -526,6 +526,16 @@ def generate_pump_test_cfg(
             f"pins: {pin_list}\n"
         )
 
+    # -- [output_pin] for digital outputs (valve, needle servo, etc.) --------
+    if config.digital_outputs:
+        for out_name, out_cfg in config.digital_outputs.items():
+            lines.append(
+                f"# --- {out_cfg.description or out_name} ---\n"
+                f"[output_pin {out_name}]\n"
+                f"pin: {out_cfg.pin}\n"
+                f"value: 0\n"
+            )
+
     # -- [manual_stepper] per pump ------------------------------------------
     # Apply enable_pin_inverted from pump stepper config: when True, Klipper
     # needs a ``!`` prefix so that ENABLE=1 drives the pin LOW (active-low

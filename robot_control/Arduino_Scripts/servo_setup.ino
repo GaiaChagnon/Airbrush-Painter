@@ -19,6 +19,6 @@ void loop() {
   delay(5000);
 
   Serial.println("lower");
-  Servo1.writeMicroseconds(1500);
+  Servo1.writeMicroseconds(2100);
   delay(5000);
 }

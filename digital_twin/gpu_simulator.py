@@ -36,9 +36,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -309,13 +306,29 @@ class GPUStampSimulator:
         self._cal = validators.load_calibration_config(calibration_path)
         self._cal_path = Path(calibration_path)
 
-        # ---- grids -----------------------------------------------------
+        # ---- grids (must be strictly ascending for interp) ---------------
         self._z_grid = torch.tensor(
             self._cal.z_grid_mm, dtype=torch.float32, device=device,
         )
         self._speed_grid = torch.tensor(
             self._cal.speed_grid_mm_s, dtype=torch.float32, device=device,
         )
+        if (
+            len(self._z_grid) > 1
+            and not (self._z_grid[1:] > self._z_grid[:-1]).all()
+        ):
+            raise ValueError(
+                "z_grid_mm must be strictly ascending, got "
+                f"{self._cal.z_grid_mm}"
+            )
+        if (
+            len(self._speed_grid) > 1
+            and not (self._speed_grid[1:] > self._speed_grid[:-1]).all()
+        ):
+            raise ValueError(
+                "speed_grid_mm_s must be strictly ascending, got "
+                f"{self._cal.speed_grid_mm_s}"
+            )
 
         # ---- LUTs ------------------------------------------------------
         self._radius_lut = torch.tensor(
@@ -329,6 +342,11 @@ class GPUStampSimulator:
         # ---- color LUT: (1, 3, Nc, Nm, Ny) for grid_sample
         self._color_lut = self._load_color_lut().to(device)
         self._color_domain = self._cal.color_axes.domain
+        if self._color_domain[1] <= self._color_domain[0]:
+            raise ValueError(
+                f"color_axes.domain must be strictly ascending "
+                f"(lo < hi), got {self._color_domain}"
+            )
 
         # ---- optional gain LUTs ----------------------------------------
         self._color_gain_5d: Optional[torch.Tensor] = None
@@ -397,7 +415,17 @@ class GPUStampSimulator:
             lut_path = Path(self._cal.color_lut_path)
             if not lut_path.is_absolute():
                 lut_path = self._cal_path.parent / lut_path
-            raw = torch.load(lut_path, map_location="cpu", weights_only=True)
+            try:
+                raw = torch.load(
+                    lut_path, map_location="cpu", weights_only=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to load color LUT from {lut_path}. "
+                    f"Ensure the file is a plain tensor checkpoint "
+                    f"saved with torch.save() (PyTorch >= 2.0 required "
+                    f"for weights_only=True). Original error: {exc}"
+                ) from exc
             if raw.shape != (Nc, Nm, Ny, 3):
                 raise ValueError(
                     f"color_lut shape {raw.shape} != expected "
@@ -637,12 +665,32 @@ class GPUStampSimulator:
 
     # ---- public rendering API ----------------------------------------
 
+    def _validate_canvas(self, canvas: torch.Tensor) -> None:
+        """Check canvas device and dtype match simulator expectations.
+
+        Raises
+        ------
+        ValueError
+            If device or dtype do not match.
+        """
+        if canvas.device != self.device:
+            raise ValueError(
+                f"Canvas device {canvas.device} != simulator "
+                f"device {self.device}. Move the canvas first."
+            )
+        if canvas.dtype != torch.float32:
+            raise ValueError(
+                f"Canvas dtype {canvas.dtype} != expected "
+                f"torch.float32"
+            )
+
     def render_stroke(
         self,
         canvas: torch.Tensor,
         stroke_dict: Dict,
     ) -> torch.Tensor:
         """Render one stroke onto every canvas in the batch."""
+        self._validate_canvas(canvas)
         samples = self.sample_stroke(stroke_dict)
         if samples.n_samples == 0:
             return canvas
@@ -654,6 +702,7 @@ class GPUStampSimulator:
         strokes: List[Dict],
     ) -> torch.Tensor:
         """Render a sequence of strokes."""
+        self._validate_canvas(canvas)
         for sd in strokes:
             canvas = self.render_stroke(canvas, sd)
         return canvas
@@ -664,6 +713,7 @@ class GPUStampSimulator:
         stroke_dicts: List[Dict],
     ) -> torch.Tensor:
         """Render one distinct stroke per batch element."""
+        self._validate_canvas(canvas)
         B = canvas.shape[0]
         if len(stroke_dicts) != B:
             raise ValueError(
@@ -703,6 +753,7 @@ class GPUStampSimulator:
         Tensor
             Updated canvas.
         """
+        self._validate_canvas(canvas)
         z_t = torch.tensor(z_mm, dtype=torch.float32, device=self.device)
         R = _gpu_interp_1d(
             z_t.unsqueeze(0), self._z_grid, self._radius_lut,
@@ -779,7 +830,16 @@ class GPUStampSimulator:
         canvas: torch.Tensor,
         batched: BatchedStrokeSamples,
     ) -> torch.Tensor:
-        """Splat a distinct stroke per batch element (sequential samples)."""
+        """Splat a distinct stroke per batch element (sequential samples).
+
+        Notes
+        -----
+        Current implementation uses nested Python loops over samples
+        and batch elements, launching one GPU kernel per stamp. This
+        is correct but bandwidth-limited for large batches. A future
+        optimisation could fuse stamps with shared ROI bounds into a
+        single batched kernel launch.
+        """
         B = canvas.shape[0]
 
         paint_rgb = self._lookup_paint_rgb(batched.color_cmy)  # (B, 3)
@@ -929,16 +989,13 @@ class GPUStampSimulator:
         canvas[:, :, y_min:y_max, x_min:x_max] = new_roi
 
         # --- layer count update ---
+        # alpha_4d is always 4-D here: either (B,1,Hk,Wk) from the
+        # layer-gain path or (1,1,Hk,Wk) from the plain path.
         if self._layer_count is not None:
             with torch.no_grad():
-                if alpha_4d.dim() == 4:
-                    stamp_mask = (
-                        alpha_4d[:, 0] > ALPHA_COUNT_THRESHOLD
-                    ).float()
-                else:
-                    stamp_mask = (
-                        alpha > ALPHA_COUNT_THRESHOLD
-                    ).float().unsqueeze(0)
+                stamp_mask = (
+                    alpha_4d[:, 0] > ALPHA_COUNT_THRESHOLD
+                ).float()
 
                 if batch_offset is not None:
                     lc_roi = self._layer_count[
@@ -1156,7 +1213,9 @@ class GPUStampSimulator:
             sim_rgb = self._simulate_dot_rgb(
                 dot.z_mm, dot.color_recipe_cmy, dot.diameter_mm,
             )
-            target = torch.tensor(dot.center_rgb, device=self.device)
+            target = torch.tensor(
+                dot.center_rgb, dtype=torch.float32, device=self.device,
+            )
             de = self._delta_e(target, sim_rgb)
             dot_results[did] = {
                 "target_rgb": list(dot.center_rgb),
@@ -1177,15 +1236,24 @@ class GPUStampSimulator:
                 line.z_mm, line.speed_mm_s, line.color_recipe_cmy,
             )
             de_center = self._delta_e(
-                torch.tensor(line.center_rgb, device=self.device),
+                torch.tensor(
+                    line.center_rgb, dtype=torch.float32,
+                    device=self.device,
+                ),
                 sim_data["center_rgb"],
             )
             de_shoulder = self._delta_e(
-                torch.tensor(line.shoulder_rgb, device=self.device),
+                torch.tensor(
+                    line.shoulder_rgb, dtype=torch.float32,
+                    device=self.device,
+                ),
                 sim_data["shoulder_rgb"],
             )
             de_edge = self._delta_e(
-                torch.tensor(line.edge_rgb, device=self.device),
+                torch.tensor(
+                    line.edge_rgb, dtype=torch.float32,
+                    device=self.device,
+                ),
                 sim_data["edge_rgb"],
             )
             line_results[lid] = {
@@ -1203,10 +1271,14 @@ class GPUStampSimulator:
         swatch_results: Dict[str, Any] = {}
         for sid, sw in rm.swatches.items():
             cmy_t = torch.tensor(
-                sw.cmy_command, device=self.device,
+                sw.cmy_command, dtype=torch.float32,
+                device=self.device,
             )
             sim_rgb = self._lookup_paint_rgb(cmy_t)
-            target = torch.tensor(sw.interior_rgb, device=self.device)
+            target = torch.tensor(
+                sw.interior_rgb, dtype=torch.float32,
+                device=self.device,
+            )
             de = self._delta_e(target, sim_rgb)
             swatch_results[sid] = {
                 "target_rgb": list(sw.interior_rgb),
@@ -1221,7 +1293,9 @@ class GPUStampSimulator:
             sim_overlap = self._simulate_overlap_rgb(ov.colors)
             for oi, meas_rgb in enumerate(ov.overlap_rgbs):
                 key = f"{oid}_region{oi}"
-                target = torch.tensor(meas_rgb, device=self.device)
+                target = torch.tensor(
+                    meas_rgb, dtype=torch.float32, device=self.device,
+                )
                 de = self._delta_e(target, sim_overlap)
                 overlap_results[key] = {
                     "target_rgb": list(meas_rgb),
@@ -1377,6 +1451,17 @@ class GPUStampSimulator:
 
     # ---- Visualisation helpers ---------------------------------------
 
+    @staticmethod
+    def _ensure_agg() -> None:
+        """Activate the non-interactive Agg backend for matplotlib.
+
+        Called lazily inside plotting methods so that importing this
+        module does not force a global backend switch.
+        """
+        import matplotlib
+        if matplotlib.get_backend().lower() != "agg":
+            matplotlib.use("Agg")
+
     def error_heatmap(
         self,
         measured_rgb: torch.Tensor,
@@ -1405,7 +1490,7 @@ class GPUStampSimulator:
             Tuple[float, float, float],
         ],
         background_rgb: Optional[Tuple[float, float, float]] = None,
-    ) -> plt.Figure:
+    ) -> Any:
         """Overlay measured zoned RGB vs simulated radial profile.
 
         Parameters
@@ -1419,8 +1504,11 @@ class GPUStampSimulator:
 
         Returns
         -------
-        matplotlib.Figure
+        matplotlib.figure.Figure
         """
+        self._ensure_agg()
+        import matplotlib.pyplot as plt
+
         R = _gpu_interp_1d(
             torch.tensor([z], device=self.device),
             self._z_grid, self._radius_lut,
@@ -1467,11 +1555,13 @@ class GPUStampSimulator:
         ],
         color_cmy: Optional[Tuple[float, float, float]] = None,
         background_rgb: Optional[Tuple[float, float, float]] = None,
-    ) -> plt.Figure:
+    ) -> Any:
         """Cross-section intensity comparison: simulated vs measured.
 
-        Returns matplotlib.Figure.
+        Returns matplotlib.figure.Figure.
         """
+        self._ensure_agg()
+        import matplotlib.pyplot as plt
         if color_cmy is None:
             color_cmy = tuple(self._cal.preview_settings.default_color_cmy)
         canvas = self.reset(batch_size=1)

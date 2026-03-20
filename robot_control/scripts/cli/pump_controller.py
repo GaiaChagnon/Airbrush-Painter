@@ -68,6 +68,12 @@ _MANUAL_CAL_PATH = (
 
 _MAX_LOG_PANEL_LINES = 8
 
+# Isopropyl alcohol density at 20 C, used to convert mass (g) -> volume (ml)
+# in the volume calibration routine.  Source: CRC Handbook of Chemistry and
+# Physics, 99th ed.  Range 0.781-0.789 g/ml depending on purity and
+# temperature; 0.786 is the standard 99 % IPA at 20 C.
+_IPA_DENSITY_G_PER_ML = 0.786
+
 
 # ======================================================================
 # stdout capture for low-level pump_control print() calls
@@ -166,8 +172,24 @@ class _PumpSession:
         return f"{pid} ({m.fluid}, {m.octopus_slot})"
 
     def ensure_connected(self) -> socket.socket:
-        if self.sock is None:
-            raise RuntimeError("Not connected to Klipper")
+        """Return a live socket, reconnecting if the previous one died."""
+        if self.sock is not None:
+            try:
+                self.sock.getpeername()
+                return self.sock
+            except OSError:
+                self.log("[yellow]  Socket dead, reconnecting...[/]")
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
+
+        self.log("  Reconnecting to Klipper...")
+        self.sock = wait_for_ready(
+            self.cfg.connection.socket_path, timeout=15.0,
+        )
+        self.log("  [green]Reconnected[/]")
         return self.sock
 
     # ------------------------------------------------------------------
@@ -1223,7 +1245,7 @@ def _calibrate_volume(s: _PumpSession) -> None:
     data_dir.mkdir(exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = data_dir / f"{pid}_volume_cal_{timestamp}.csv"
-    csv_header = "cycle,target_ml,measured_ml,error_ml,error_pct,travel_mm,speed_mm_s,mm_per_ml_nominal,mm_per_ml_actual"
+    csv_header = "cycle,target_ml,measured_g,measured_ml,error_ml,error_pct,travel_mm,speed_mm_s,mm_per_ml_nominal,mm_per_ml_actual"
     csv_lines = [csv_header]
 
     sock = s.ensure_connected()
@@ -1286,10 +1308,18 @@ def _calibrate_volume(s: _PumpSession) -> None:
                 "Measure the output. Press any key to record..."
             ).ask()
 
-            measured = _ask_float(s.app, "Measured volume (ml)", target)
-            if measured <= 0:
-                s.log("  [yellow]Must be > 0. Using target.[/]")
-                measured = target
+            expected_mass_g = target * _IPA_DENSITY_G_PER_ML
+            mass_g = _ask_float(
+                s.app, "Measured mass (g)", round(expected_mass_g, 3),
+            )
+            if mass_g <= 0:
+                s.log("  [yellow]Mass must be > 0. Using expected.[/]")
+                mass_g = expected_mass_g
+            measured = mass_g / _IPA_DENSITY_G_PER_ML
+            s.log(
+                f"  {mass_g:.3f} g IPA -> {measured:.4f} ml "
+                f"(density {_IPA_DENSITY_G_PER_ML} g/ml)"
+            )
 
             error_ml = measured - target
             error_pct = (error_ml / target * 100.0) if target > 0 else 0.0
@@ -1298,6 +1328,7 @@ def _calibrate_volume(s: _PumpSession) -> None:
             result = {
                 "cycle": float(cycle_num),
                 "target_ml": target,
+                "measured_g": mass_g,
                 "measured_ml": measured,
                 "error_ml": error_ml,
                 "error_pct": error_pct,
@@ -1308,9 +1339,9 @@ def _calibrate_volume(s: _PumpSession) -> None:
             }
             results.append(result)
             csv_lines.append(
-                f"{cycle_num},{target:.4f},{measured:.4f},{error_ml:.4f},"
-                f"{error_pct:.2f},{travel_mm:.4f},{speed:.4f},"
-                f"{sy.mm_per_ml:.4f},{actual_mm_per_ml:.4f}"
+                f"{cycle_num},{target:.4f},{mass_g:.4f},{measured:.4f},"
+                f"{error_ml:.4f},{error_pct:.2f},{travel_mm:.4f},"
+                f"{speed:.4f},{sy.mm_per_ml:.4f},{actual_mm_per_ml:.4f}"
             )
             csv_path.write_text("\n".join(csv_lines) + "\n")
 
@@ -1339,12 +1370,13 @@ def _calibrate_volume(s: _PumpSession) -> None:
     total_travel = sum(r["travel_mm"] for r in results)
     total_measured = sum(r["measured_ml"] for r in results)
     if total_measured > 0 and total_travel > 0:
-        avg_mm_per_ml = total_travel / total_measured
-        corrected_travel = avg_mm_per_ml * sy.volume_ml
+        avg_ml_per_mm = total_measured / total_travel
+        corrected_volume = avg_ml_per_mm * sy.plunger_travel_mm
         s.log(
-            f"  Recommended plunger_travel_mm: [bold]{corrected_travel:.4f}[/]"
+            f"  Recommended volume_ml: [bold]{corrected_volume:.4f}[/]"
         )
-        s.log(f"  (currently {sy.plunger_travel_mm:.4f})")
+        s.log(f"  (currently {sy.volume_ml:.4f}, "
+              f"plunger_travel_mm fixed at {sy.plunger_travel_mm})")
 
     questionary.press_any_key_to_continue(
         "Press any key to continue..."
@@ -1352,12 +1384,12 @@ def _calibrate_volume(s: _PumpSession) -> None:
 
     s.render_screen()
     if total_measured > 0 and total_travel > 0:
-        if s.app.confirm_dangerous("Save corrected value to machine.yaml"):
+        if s.app.confirm_dangerous("Save corrected volume_ml to machine.yaml"):
             _save_volume_calibration(
                 {
                     pid: {
-                        "plunger_travel_mm": round(corrected_travel, 4),
-                        "volume_ml": sy.volume_ml,
+                        "plunger_travel_mm": sy.plunger_travel_mm,
+                        "volume_ml": round(corrected_volume, 4),
                     }
                 }
             )
@@ -1388,7 +1420,8 @@ def _show_cal_statistics(
     table = Table(title=f"Calibration Results: {s.pump_label(pid)}")
     table.add_column("#", justify="right")
     table.add_column("Target (ml)", justify="right")
-    table.add_column("Measured (ml)", justify="right")
+    table.add_column("Mass (g)", justify="right")
+    table.add_column("Volume (ml)", justify="right")
     table.add_column("Error (ml)", justify="right")
     table.add_column("Error %", justify="right")
     table.add_column("mm/ml", justify="right")
@@ -1403,6 +1436,7 @@ def _show_cal_statistics(
         table.add_row(
             f"{r['cycle']:.0f}",
             f"{r['target_ml']:.4f}",
+            f"{r['measured_g']:.3f}",
             f"{r['measured_ml']:.4f}",
             f"[{err_color}]{r['error_ml']:+.4f}[/]",
             f"[{err_color}]{r['error_pct']:+.2f}[/]",
@@ -1651,6 +1685,16 @@ def _run_submenu(
 # ======================================================================
 
 
+def _restore_printer_cfg(console: Console) -> None:
+    """Restore original printer.cfg from backup if it exists."""
+    backup = PRINTER_CFG_PATH.with_suffix(".cfg.bak")
+    if backup.exists():
+        backup.rename(PRINTER_CFG_PATH)
+        console.print(
+            "[dim]  Restored original printer.cfg from backup[/]"
+        )
+
+
 def run(app: RobotApp) -> None:
     """Entry point for pump controller mode."""
     cfg = app.config
@@ -1661,23 +1705,55 @@ def run(app: RobotApp) -> None:
         return
 
     s = _PumpSession(app)
+    wrote_config = False
 
-    # Write pump-only printer.cfg and connect
-    if not app.no_config_write:
-        if PRINTER_CFG_PATH.exists():
-            backup = PRINTER_CFG_PATH.with_suffix(".cfg.bak")
-            PRINTER_CFG_PATH.rename(backup)
-        config_text = generate_pump_test_cfg(cfg, pump_ids=s.pump_ids)
-        PRINTER_CFG_PATH.write_text(config_text)
-        s.log(f"  Wrote pump test printer.cfg to {PRINTER_CFG_PATH}")
-        s.log("  Restarting Klipper...")
+    # -- Initialization: visible progress on console (not log buffer) --
+    try:
+        if not app.no_config_write:
+            if PRINTER_CFG_PATH.exists():
+                backup = PRINTER_CFG_PATH.with_suffix(".cfg.bak")
+                PRINTER_CFG_PATH.rename(backup)
+            config_text = generate_pump_test_cfg(cfg, pump_ids=s.pump_ids)
+            PRINTER_CFG_PATH.write_text(config_text)
+            wrote_config = True
+            console.print(
+                f"[dim]  Wrote pump-only printer.cfg "
+                f"({len(s.pump_ids)} pumps)[/]"
+            )
+
+            with console.status(
+                "[bold cyan]Restarting Klipper...[/]",
+                spinner="dots",
+            ):
+                with s.capture_prints():
+                    restart_klipper(s.cfg.connection.socket_path)
+
+        with console.status(
+            "[bold cyan]Waiting for Klipper to become ready...[/]",
+            spinner="dots",
+        ):
+            with s.capture_prints():
+                s.sock = wait_for_ready(
+                    s.cfg.connection.socket_path, timeout=45.0,
+                )
+
+        console.print("[green]  Klipper connected[/]")
+        s.log("  [green]Klipper is ready[/]")
+
+    except RuntimeError as exc:
+        console.print(f"\n[bold red]Klipper connection failed:[/] {exc}")
+        console.print(
+            "\n[yellow]Troubleshooting:[/]\n"
+            "  1. Is the MCU USB cable connected?\n"
+            f"  2. Does the serial device exist? "
+            f"({cfg.connection.mcu_serial})\n"
+            "  3. Try: ls /dev/serial/by-id/\n"
+            "  4. Check Klipper log: ~/printer_data/logs/klippy.log"
+        )
+        _restore_printer_cfg(console)
         with s.capture_prints():
             restart_klipper(s.cfg.connection.socket_path)
-
-    s.log("  Waiting for Klipper...")
-    with s.capture_prints():
-        s.sock = wait_for_ready(s.cfg.connection.socket_path, timeout=45.0)
-    s.log("  [green]Klipper is ready[/]")
+        return
 
     for pid in s.pump_ids:
         pump_disable(s.sock, pid)
@@ -1738,5 +1814,10 @@ def run(app: RobotApp) -> None:
                 except Exception:
                     pass
             s.sock.close()
+
+        if wrote_config:
+            _restore_printer_cfg(console)
+            with s.capture_prints():
+                restart_klipper(s.cfg.connection.socket_path)
 
     console.print("[green]Pump controller session ended.[/]")

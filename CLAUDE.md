@@ -1,4 +1,6 @@
-# CLAUDE.md — Project Context for AI Assistants
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this project is
 
@@ -23,6 +25,7 @@ robot_control/
   job_ir/                  Intermediate representation for job actions
   scripts/cli/             Unified robot CLI (Rich + questionary)
   tests/                   Robot-control pytest suite (no hardware needed)
+digital_twin/              GPU stamp simulator, calibration wizard, physics backend for RL
 configs/
   schema/                  Canonical YAML schemas (stroke, job, machine, pen, LUTs)
   sim/                     Simulator configs (physics, renderer_cpu, manual calibration)
@@ -78,6 +81,16 @@ Use `src.utils.fs` for all atomic I/O: `atomic_yaml_dump`, `load_yaml`,
 - **Atomic writes** for all GUI-visible artifacts (`fs.atomic_*`, `fs.symlink_atomic`).
 - **No `print()`** for runtime output. Use `logging_config.setup_logging()` +
   `logging.getLogger(__name__)`.
+- **Containerized execution only.** Avoid system-specific hacks.
+- **Multi-resolution triad:** `render_px` (physics grid), `reward_px` (LPIPS
+  grid), `obs_px` (policy input). Keep `reward_px == render_px` unless
+  explicitly overridden.
+- **Adversarial tests:** Keep negative tests for reward hacking; do not weaken
+  them.
+- **Breaking API changes** require versioned schemas (e.g., `stroke.v2.yaml`),
+  not hidden param tweaks.
+- **Side-effect naming:** Functions that read/write files or mutate global state
+  must say so in their name (`*_inplace`, `*_to_file`).
 
 ## Coordinate transforms (lineart tracer)
 
@@ -169,11 +182,23 @@ Use the AskQuestion tool to batch these into structured choices where possible.
 
 - Python >= 3.10, full type hints. Prefer `TypedDict` / `pydantic` for structured data.
 - NumPy-style docstrings for complex functions; inline `#` for simple ones.
+  Include minimal runnable doctest `>>>` examples where helpful.
 - Document shapes, dtypes, ranges, units (especially tensors and mm geometry).
 - No star imports. No commented-out code. Lines <= 100 cols.
 - `ruff` + `black` + `isort` formatting.
 - Tests in `tests/` (core) or `robot_control/tests/` (hardware layer), named `test_*.py`.
 - External vendor APIs (OpenCV, LPIPS, nvdiffrast, Potrace) wrapped behind our modules.
+- Error messages must mention the offending key/path and expected range/shape.
+
+### Tag conventions
+
+```
+# TODO(<owner>, <YYYY-MM-DD>): short imperative; link to issue.
+# FIXME: correctness bug that must be fixed soon.
+# HACK: intentional workaround; document risk and exit criteria.
+# NOTE: important non-obvious context; invariants, contracts, or caveats.
+# PERF: performance-related rationale or follow-up.
+```
 
 ### Config changes
 
@@ -190,9 +215,13 @@ pip install -r requirements.txt
 # CPU renderer demo
 python scripts/demo_alcohol_ink.py
 
-# Tests
+# Tests (all core tests)
 python -m pytest tests/ -v
 python -m pytest robot_control/tests/ -v
+
+# Single test by name
+python -m pytest tests/test_utils_comprehensive.py::TestGeometry -v
+python -m pytest tests/ -k "test_name" -v
 
 # Robot CLI (needs Klipper hardware)
 python robot_control/scripts/robot_cli.py
