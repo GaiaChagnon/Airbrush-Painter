@@ -27,6 +27,7 @@ manual review before implementation.
 15. [Feature Opportunities](#15-feature-opportunities)
 16. [Missing Issues (Addendum)](#16-missing-issues-addendum-2026-03-20)
 17. [File Deletion Candidates](#17-file-deletion-candidates)
+18. [Risk Annotations](#18-risk-annotations)
 
 ---
 
@@ -45,9 +46,11 @@ manual review before implementation.
 - **File:** `configs/sim/luts/` (only `.gitkeep` exists)
 - **Issue:** `physics_v1.yaml` and `luts.v1.yaml` reference
   `color_lut.pt`, `alpha_lut.pt`, `psf_lut.pt` which do not exist.
-- **Impact:** `demo_alcohol_ink.py` crashes on `load_toy_luts()`.
-- **Fix:** Either ship placeholder tensors or add an existence check with a
-  clear error message.
+- **Impact:** Does **not** break `demo_alcohol_ink.py` -- `load_toy_luts()`
+  generates LUTs in memory. However, any future code path that tries to load
+  calibrated LUTs from disk will fail with no clear error message.
+- **Fix:** Add an existence check with a clear error message in the loader, or
+  document that these files are produced by the calibration pipeline.
 
 ---
 
@@ -173,18 +176,13 @@ CLAUDE.md rule 3: "No dead code. If code isn't called, delete it."
 - **Issue:** Imports `setup_logging` but never calls it.
 - **Fix:** Remove import or add `setup_logging()` call.
 
-### 6.5 Unused `eps` parameter in `compute.py`
-- **File:** `src/utils/compute.py:422-423`
-- **Issue:** `clamp_finite()` declares `eps` parameter but never uses it.
-- **Fix:** Remove the parameter.
-
-### 6.6 Dead config section in `renderer_cpu.v1.yaml`
+### 6.5 Dead config section in `renderer_cpu.v1.yaml`
 - **File:** `configs/sim/renderer_cpu.v1.yaml:56-60`
 - **Issue:** `stamp_train:` section defined but mode is hardcoded to
   `"opencv_distance"` on line 10. Section is unreachable.
 - **Fix:** Remove or document as future expansion.
 
-### 6.7 `tests/test_parity_cpu_vs_gpu.py` -- all tests are xfail/skip
+### 6.6 `tests/test_parity_cpu_vs_gpu.py` -- all tests are xfail/skip
 - **Issue:** 4 parity tests marked `@pytest.mark.xfail` with internal
   `pytest.skip()`. They will never actually run.
 - **Fix:** Remove xfail or implement GPU renderer path.
@@ -237,13 +235,7 @@ CLAUDE.md rule 10: "No resource leaks. Use context managers."
   lock. `disconnect()` could set it to `None` between check and use.
 - **Fix:** Move the None-check inside the lock.
 
-### 8.5 Socket variable may not be defined in lineart tracer
-- **File:** `robot_control/scripts/cli/lineart_tracer.py:685-752`
-- **Issue:** `sock` used in `finally` block but may be undefined if
-  `_hw_wait()` fails. Causes `NameError`.
-- **Fix:** Initialize `sock = None` before try block; check before close.
-
-### 8.6 Global mutable state in `gcode_generator.py`
+### 8.5 Global mutable state in `gcode_generator.py`
 - **File:** `src/utils/gcode_generator.py:47`
 - **Issue:** `_warned_macros: Set[str] = set()` is module-level mutable
   state. Thread-unsafe.
@@ -277,7 +269,6 @@ CLAUDE.md rule 10: "No resource leaks. Use context managers."
 | Module | Status |
 |--------|--------|
 | `src/airbrush_simulator/differentiable_renderer.py` | **Zero tests** |
-| `src/utils/profiler.py` | **Zero tests** (TimerAccumulator, nvtx_range, synchronize_and_time) |
 | `robot_control/scripts/cli/*` | **Zero tests** for any CLI module |
 
 ### 10.4 Missing edge case tests
@@ -290,9 +281,11 @@ CLAUDE.md rule 10: "No resource leaks. Use context managers."
 - No end-to-end test for: image load -> preprocess -> render -> gcode
 - No CLI workflow tests
 
-### 10.6 Missing test markers
-- No `@pytest.mark.integration`, `@pytest.mark.smoke`, `@pytest.mark.slow`
-- Can't selectively run fast vs. slow tests in CI
+### 10.6 Underused test markers
+- `pytest.ini` already defines `slow`, `integration`, `golden`, `physics`,
+  and `visual`. Only `@pytest.mark.smoke` is missing.
+- No tests currently use `@pytest.mark.slow` or `@pytest.mark.integration`
+  even though the markers are registered.
 
 ### 10.7 Inconsistent test path handling
 - Some tests use `Path("relative/path")` (fragile, CWD-dependent)
@@ -434,8 +427,10 @@ Patterns appearing in 3+ files that could be extracted to `src/utils/`.
   for container orchestration.
 
 ### 15.3 Test markers for CI filtering
-- **Proposed:** Add `@pytest.mark.smoke`, `@pytest.mark.slow`,
-  `@pytest.mark.integration` and register in `pytest.ini`.
+- `pytest.ini` already registers `slow`, `integration`, `golden`, `physics`,
+  `visual` but no tests currently use them and `smoke` is missing.
+- **Proposed:** Add `@pytest.mark.smoke` marker, then actually tag tests with
+  `@pytest.mark.slow` / `@pytest.mark.integration` so CI can run subsets.
 
 ### 15.4 Interpolation grid size guard
 - **File:** `digital_twin/gpu_simulator.py:178-179`
@@ -562,10 +557,10 @@ Items discovered during a second-pass audit that the original plan missed.
 - **Fix:** `except (OSError, ValueError): return False`.
 
 ### 16.14 (LOW) `validators.py` -- deprecated Pydantic v2 `min_items`
-- **File:** `src/utils/validators.py` (multiple List field declarations)
+- **File:** `src/utils/validators.py:413` (`JobConfig.passes` field, single occurrence)
 - **Issue:** `min_items=1` is deprecated in Pydantic v2; should be
-  `min_length=1`. Will trigger deprecation warnings and eventually break.
-- **Fix:** Replace `min_items` with `min_length` across all validators.
+  `min_length=1`. Single occurrence; low urgency.
+- **Fix:** Replace `min_items=1` with `min_length=1` on line 413.
 
 ### 16.15 (LOW) `run_job.py` -- `callable` lowercase type hint
 - **File:** `robot_control/scripts/run_job.py:33`
@@ -660,6 +655,21 @@ can be removed.
 
 ---
 
+## 18. Risk Annotations
+
+Items from this plan that can change operator-visible behavior if applied
+blindly. Each should be preceded by tests covering the current behavior.
+
+| Item(s) | Risk | Mitigation |
+|---------|------|------------|
+| Section 2 (mass `except Exception` narrowing) | Exposes previously swallowed runtime failures, especially in hardware/CLI paths. | Narrow one file at a time; add integration test for each path before narrowing. |
+| Section 3 + 16.5-16.7 (mass `print()` to logging) | Changes operator UX in interactive scripts; log output may not appear on console without handler config. | Ensure `setup_logging()` includes a console handler; test scripts interactively after conversion. |
+| 9.1 (`eval` to `ast.literal_eval`) | Safer, but removes expression-style inputs (e.g., `10 * 2.54`) if operators relied on them. | Document the change; add a `float()` fallback for simple arithmetic expressions if needed. |
+| 5.3 (merge `image_mm_to_machine_mm()`) | Must preserve canvas-offset and 180-degree rotation semantics or G-code coordinates break. | Write parity tests comparing both implementations' outputs before consolidating. |
+| 13.3 (raise on unknown G-code ops) | Stricter correctness, but may break forward-compatibility if new operation types are added. | Gate behind a `strict=True` flag defaulting to current behavior; add to CI. |
+
+---
+
 ## Summary Statistics
 
 | Category | Count |
@@ -669,9 +679,9 @@ can be removed.
 | print() violations | ~530+ calls across 10 files |
 | Magic numbers | ~20 distinct instances |
 | Code duplication | 6 clusters |
-| Dead code / stubs | 7 items |
+| Dead code / stubs | 6 items |
 | Type hint issues | 11 items |
-| Resource leaks / safety | 7 items |
+| Resource leaks / safety | 5 items |
 | Security | 1 (eval) |
 | Test gaps | 8 categories |
 | Config / build | 7 items |
