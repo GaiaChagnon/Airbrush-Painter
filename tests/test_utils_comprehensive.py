@@ -26,11 +26,9 @@ Run with: pytest tests/test_utils_comprehensive.py -v
 """
 
 import json
-from pathlib import Path
 
 import pytest
 import torch
-import numpy as np
 
 from src.utils import (
     color,
@@ -476,7 +474,7 @@ def test_make_stroke_id():
     assert sid.count('-') == 2
 
 
-def test_stroke_bbox_mm():
+def test_stroke_bbox_mm_from_yaml():
     """Test stroke bounding box from YAML."""
     stroke_dict = {
         'bezier': {
@@ -623,20 +621,20 @@ def test_to_device_recursive():
     
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")
-    t = torch.randn(2, 3)
-    nested = {
-        "a": t.clone(),
-        "b": [t.clone(), {"c": t.clone()}],
-        "scalar": 42
-    }
-    
+        t = torch.randn(2, 3)
+        nested = {
+            "a": t.clone(),
+            "b": [t.clone(), {"c": t.clone()}],
+            "scalar": 42
+        }
+
         dev = torch.device("cuda")
-    moved = torch_utils.to_device_recursive(nested, dev)
-    
+        moved = torch_utils.to_device_recursive(nested, dev)
+
         assert moved["a"].device.type == 'cuda'
         assert moved["b"][0].device.type == 'cuda'
         assert moved["b"][1]["c"].device.type == 'cuda'
-    assert moved["scalar"] == 42
+        assert moved["scalar"] == 42
 
 
 def test_set_channels_last():

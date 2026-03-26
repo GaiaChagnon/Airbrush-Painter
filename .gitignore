@@ -49,6 +49,7 @@ data/raw_images/*.png
 data/raw_images/*.jpg
 data/raw_images/**/*.png
 data/raw_images/**/*.jpg
+data/raw_images/**/*.JPG
 data/raw_images/**/*.jpeg
 data/raw_images/**/*.webp
 data/raw_images/**/*.bmp
@@ -81,6 +82,13 @@ gcode_output/**/*.yaml
 
 # LUTs (generated from calibration)
 configs/sim/luts/*.pt
+
+# MLflow (local tracking state, not versioned)
+mlflow.db
+mlruns/
+
+# MLflow artifacts
+**/artifact.txt
 
 # Logs
 *.log

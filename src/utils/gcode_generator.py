@@ -44,7 +44,14 @@ from . import fs, geometry, compute, validators
 logger = logging.getLogger(__name__)
 
 # Track warned macros to avoid log spam
+# NOTE: Module-level set; not thread-safe. Acceptable for single-threaded G-code generation.
 _warned_macros: Set[str] = set()
+
+# Fraction of max Z used for safe travel when travel_z_mm is not configured
+_SAFE_Z_FRACTION = 0.8
+
+# Minimum Z for pen tools (allows pressing slightly below paper surface)
+_PEN_Z_MIN_MM = -2.0
 
 
 # ============================================================================
@@ -390,7 +397,7 @@ def generate_stroke_gcode(
     z_interp = torch.clamp(z_interp, 0.0, machine_cfg.work_area_mm.z)
     
     # Safe travel Z (80% of max Z, or use safety.travel_z_mm if present)
-    safe_z = getattr(machine_cfg.safety, "travel_z_mm", machine_cfg.work_area_mm.z * 0.8)
+    safe_z = getattr(machine_cfg.safety, "travel_z_mm", machine_cfg.work_area_mm.z * _SAFE_Z_FRACTION)
     
     # Rapid to start position at safe Z
     x0 = pts_mach[0, 0].item()
@@ -555,7 +562,7 @@ def generate_pen_gcode(
         
         # Safe travel Z
         travel_z = pen_tool_cfg.safe_z_mm + tool_offset_z
-        validate_soft_limits(x0, y0, travel_z, machine_cfg, z_min=-2.0)
+        validate_soft_limits(x0, y0, travel_z, machine_cfg, z_min=_PEN_Z_MIN_MM)
         lines.append(f"G0 X{x0:.3f} Y{y0:.3f} Z{travel_z:.3f}\n")
         
         # Pen down (plunge to drawing Z)
@@ -568,14 +575,14 @@ def generate_pen_gcode(
             machine_cfg.feed_units,
             machine_cfg
         )
-        validate_soft_limits(x0, y0, pen_z, machine_cfg, z_min=-2.0)
+        validate_soft_limits(x0, y0, pen_z, machine_cfg, z_min=_PEN_Z_MIN_MM)
         lines.append(f"G1 Z{pen_z:.3f} F{plunge_feed:.1f}\n")
         
         # Draw polyline
         for i in range(1, len(pts_mach_offset)):
             x = pts_mach_offset[i, 0].item()
             y = pts_mach_offset[i, 1].item()
-            validate_soft_limits(x, y, pen_z, machine_cfg, z_min=-2.0)
+            validate_soft_limits(x, y, pen_z, machine_cfg, z_min=_PEN_Z_MIN_MM)
             lines.append(f"G1 X{x:.3f} Y{y:.3f} F{pen_feed:.1f}\n")
         
         # Pen up

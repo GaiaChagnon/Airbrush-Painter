@@ -14,11 +14,12 @@ from __future__ import annotations
 import contextlib
 import datetime
 import io
+import socket
 import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import plotext as plt
 import questionary
@@ -55,10 +56,7 @@ from robot_control.hardware.pump_control import (
 from robot_control.scripts.cli.widgets import info_panel, pump_diagram
 from src.utils.fs import atomic_yaml_dump, load_yaml
 
-if TYPE_CHECKING:
-    import socket
-
-    from robot_control.scripts.cli.app import RobotApp
+from robot_control.scripts.cli.app import RobotApp
 
 _CFG_PATH = Path(__file__).resolve().parents[2] / "configs" / "machine.yaml"
 _MANUAL_CAL_PATH = (

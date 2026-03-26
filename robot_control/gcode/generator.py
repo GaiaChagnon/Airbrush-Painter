@@ -172,6 +172,13 @@ class GCodeGenerator:
         self._last_rapid_y = None
 
     def _generate_op(self, op: Operation, buf: StringIO) -> None:
+        """Dispatch a single Job IR operation to its G-code emitter.
+
+        Raises
+        ------
+        GCodeError
+            If *op* is not a recognised operation type.
+        """
         if isinstance(op, HomeXY):
             self._gen_home(buf)
         elif isinstance(op, SelectTool):
@@ -189,7 +196,11 @@ class GCodeGenerator:
         elif isinstance(op, DrawArc):
             self._gen_arc(op, buf)
         else:
-            logger.warning("Unsupported operation: %s", type(op).__name__)
+            raise GCodeError(
+                f"Unsupported operation type: {type(op).__name__}. "
+                f"Expected one of: HomeXY, SelectTool, ToolUp, ToolDown, "
+                f"RapidXY, LinearMove, DrawPolyline, DrawArc"
+            )
 
     # ------------------------------------------------------------------
     # Individual generators

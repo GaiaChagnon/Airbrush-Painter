@@ -76,6 +76,7 @@ _CFG = load_config()
 SOCKET_PATH = _CFG.connection.socket_path
 PRINTER_CFG_PATH = Path.home() / "printer.cfg"
 ETX = b"\x03"
+_SOCKET_RECV_BUFFER_SIZE = 4096
 
 WORKSPACE_X_MM = _CFG.work_area.x
 WORKSPACE_Y_MM = _CFG.work_area.y
@@ -164,7 +165,7 @@ def _raw_send(
             remaining = max(0.05, deadline - time.monotonic())
             sock.settimeout(remaining)
             try:
-                chunk = sock.recv(4096)
+                chunk = sock.recv(_SOCKET_RECV_BUFFER_SIZE)
                 if not chunk:
                     break
                 buf += chunk
@@ -194,7 +195,7 @@ def _drain_socket(sock: socket.socket, duration: float = 0.2) -> None:
     while time.monotonic() < deadline:
         sock.settimeout(max(0.05, deadline - time.monotonic()))
         try:
-            data = sock.recv(4096)
+            data = sock.recv(_SOCKET_RECV_BUFFER_SIZE)
             if not data:
                 break
         except socket.timeout:

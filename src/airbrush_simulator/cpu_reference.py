@@ -55,7 +55,7 @@ import copy
 import hashlib
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -566,8 +566,8 @@ class CPUReferenceRenderer:
         # Center luminance drop check (if core mask provided)
         if core_mask is not None and core_mask.any():
             # Compute luminance (Y from linear RGB)
-            L_before = 0.2126 * canvas_before[..., 0] + 0.7152 * canvas_before[..., 1] + 0.0722 * canvas_before[..., 2]
-            L_after = 0.2126 * canvas_after[..., 0] + 0.7152 * canvas_after[..., 1] + 0.0722 * canvas_after[..., 2]
+            L_before = color_utils._REC709_R * canvas_before[..., 0] + color_utils._REC709_G * canvas_before[..., 1] + color_utils._REC709_B * canvas_before[..., 2]
+            L_after = color_utils._REC709_R * canvas_after[..., 0] + color_utils._REC709_G * canvas_after[..., 1] + color_utils._REC709_B * canvas_after[..., 2]
             
             drop = float(L_before[core_mask].mean() - L_after[core_mask].mean())
             min_drop = vis_cfg.get('min_center_luminance_drop', 0.05)
@@ -672,12 +672,18 @@ class CPUReferenceRenderer:
             logger.warning("Degenerate stroke (zero length), skipping")
             return canvas, alpha_map
         
-        # Compute z/v at each polyline vertex for determining sample spacing
-        n_verts = len(polyline_mm)
-        z_vals = np.linspace(z0, z1, n_verts)
-        v_vals = np.linspace(v0, v1, n_verts)
-        widths = np.array([self._width_mm(z, v) for z, v in zip(z_vals, v_vals)])
-        
+        # Sample z/v at a few points to estimate minimum width for spacing.
+        # Full-vertex sampling is unnecessary; the width function varies
+        # smoothly so 4-10 evenly-spaced probes capture the minimum well.
+        _N_WIDTH_PROBES = 8
+        n_probes = min(_N_WIDTH_PROBES, len(polyline_mm))
+        probe_fracs = np.linspace(0.0, 1.0, n_probes)
+        z_probes = z0 + (z1 - z0) * probe_fracs
+        v_probes = v0 + (v1 - v0) * probe_fracs
+        widths = np.array(
+            [self._width_mm(z, v) for z, v in zip(z_probes, v_probes)]
+        )
+
         # Determine adaptive target spacing (4 samples per min width, capped at 0.5mm)
         min_width_mm = widths.min()
         target_ds = max(1e-3, min(0.25 * min_width_mm, 0.5))
@@ -757,7 +763,7 @@ class CPUReferenceRenderer:
         self,
         canvas: np.ndarray,
         alpha_map: np.ndarray,
-        strokes: list
+        strokes: list[dict[str, Any]]
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Render multiple strokes in sequence.
         

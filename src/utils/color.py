@@ -20,8 +20,14 @@ Invariants:
     - Lab coordinates: L[0,100], a,b[-128,127]
 """
 
+from typing import Sequence, Union
+
 import torch
-import torch.nn.functional as F
+
+# Rec. 709 luminance coefficients
+_REC709_R = 0.2126
+_REC709_G = 0.7152
+_REC709_B = 0.0722
 
 
 def srgb_to_linear(img: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -114,13 +120,47 @@ def luminance_linear(img: torch.Tensor) -> torch.Tensor:
     if img.ndim == 3:
         # (3, H, W)
         r, g, b = img[0], img[1], img[2]
-        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+        return _REC709_R * r + _REC709_G * g + _REC709_B * b
     elif img.ndim == 4:
         # (B, 3, H, W)
         r, g, b = img[:, 0], img[:, 1], img[:, 2]
-        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+        return _REC709_R * r + _REC709_G * g + _REC709_B * b
     else:
-        raise ValueError(f"Expected shape (3, H, W) or (B, 3, H, W), got {img.shape}")
+        raise ValueError(
+            f"Expected shape (3, H, W) or (B, 3, H, W), got {img.shape}"
+        )
+
+
+def luminance_scalar(
+    rgb: Union[Sequence[float], torch.Tensor],
+) -> float:
+    """Rec. 709 luminance from an RGB triplet (tuple, list, or 1-D tensor).
+
+    Parameters
+    ----------
+    rgb : tuple, list, ndarray, or torch.Tensor
+        Length-3 RGB values (any numeric type). For torch tensors the
+        values are extracted via ``.item()`` to avoid graph issues.
+
+    Returns
+    -------
+    float
+        Scalar luminance: 0.2126*R + 0.7152*G + 0.0722*B
+
+    Examples
+    --------
+    >>> luminance_scalar((0.5, 0.5, 0.5))
+    0.5
+    >>> luminance_scalar([1.0, 0.0, 0.0])
+    0.2126
+    """
+    if isinstance(rgb, torch.Tensor):
+        r = rgb[0].item()
+        g = rgb[1].item()
+        b = rgb[2].item()
+    else:
+        r, g, b = rgb[0], rgb[1], rgb[2]
+    return _REC709_R * r + _REC709_G * g + _REC709_B * b
 
 
 def rgb_to_xyz(rgb: torch.Tensor) -> torch.Tensor:

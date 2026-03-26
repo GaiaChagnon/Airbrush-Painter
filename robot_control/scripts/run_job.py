@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -30,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PATTERN_MAP: dict[str, callable] = {
+PATTERN_MAP: dict[str, Callable[..., list[Operation]]] = {
     "square": patterns.square,
     "rectangle": patterns.rectangle,
     "cross": patterns.cross,

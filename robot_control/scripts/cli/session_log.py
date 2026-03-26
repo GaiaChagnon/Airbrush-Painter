@@ -62,7 +62,11 @@ class SessionLog:
         else:
             self._path = _DEFAULT_LOG
 
-        self._fh = open(self._path, "w", encoding="utf-8")  # noqa: SIM115
+        try:
+            self._fh = open(self._path, "w", encoding="utf-8")  # noqa: SIM115
+        except OSError:
+            self._fh = None
+            raise
         self._write_header()
         logger.info("Session log: %s", self._path)
 

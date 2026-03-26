@@ -38,7 +38,11 @@ try:
     _cfg = _load_config()
     _CANVAS_W = _cfg.canvas.width_mm
     _CANVAS_H = _cfg.canvas.height_mm
-except Exception:
+except (FileNotFoundError, KeyError) as _exc:
+    import logging as _logging
+    _logging.getLogger(__name__).debug(
+        "Could not load machine config, using A4 defaults: %s", _exc,
+    )
     _CANVAS_W = 210.0
     _CANVAS_H = 297.0
 

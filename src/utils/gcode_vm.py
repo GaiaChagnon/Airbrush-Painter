@@ -37,7 +37,7 @@ Usage:
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import re
 import logging
 import math
@@ -45,6 +45,12 @@ import math
 from . import validators
 
 logger = logging.getLogger(__name__)
+
+# Default modal feed rate for G-code controllers (mm/min)
+_DEFAULT_FEED_MM_MIN = 3000.0
+
+# Inches-to-millimeters conversion factor (ISO 31-1)
+_INCH_TO_MM = 25.4
 
 
 # ============================================================================
@@ -114,7 +120,7 @@ class GCodeVM:
         
         # VM state
         self.pos: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-        self.feed: float = 3000.0  # Default feed (mm/min), modal
+        self.feed: float = _DEFAULT_FEED_MM_MIN  # Default feed (mm/min), modal
         self.rapid_mm_s: float = getattr(machine_cfg.feeds, "rapid_mm_s", machine_cfg.feeds.max_xy_mm_s)
         self.absolute_mode: bool = True  # G90=absolute, G91=relative
         self.mm_units: bool = True  # G21=mm, G20=inch
@@ -163,7 +169,7 @@ class GCodeVM:
     def reset(self) -> None:
         """Reset VM state to initial position."""
         self.pos = (0.0, 0.0, 0.0)
-        self.feed = 3000.0
+        self.feed = _DEFAULT_FEED_MM_MIN
         self.absolute_mode = True
         self.mm_units = True
         self.units_scale = 1.0
@@ -347,7 +353,7 @@ class GCodeVM:
             # Update feed if specified (modal - persists to next move)
             # Convert to mm/min if in inches
             if 'F' in coords:
-                self.feed = coords['F'] * (25.4 if not self.mm_units else 1.0)
+                self.feed = coords['F'] * (_INCH_TO_MM if not self.mm_units else 1.0)
             
             # Apply unit scaling
             scaled_x = coords.get('X', 0.0 if not self.absolute_mode else None)
@@ -394,7 +400,7 @@ class GCodeVM:
         # G20: inch units (convert to mm internally)
         elif line_upper.startswith('G20'):
             self.mm_units = False
-            self.units_scale = 25.4  # 1 inch = 25.4 mm
+            self.units_scale = _INCH_TO_MM  # 1 inch = 25.4 mm
             logger.warning("Inch units (G20) detected, converting to mm internally")
         
         # G90: Absolute positioning
@@ -426,12 +432,12 @@ class GCodeVM:
             elif 'PEN' in line_upper:
                 self.total_time += self.pen_time_s
     
-    def run(self) -> Dict[str, any]:
+    def run(self) -> Dict[str, Any]:
         """Execute loaded G-code and return results.
         
         Returns
         -------
-        Dict[str, any]
+        Dict[str, Any]
             Results dictionary with keys:
                 - time_estimate_s: float (estimated execution time)
                 - violations: List[str] (soft-limit violations)
@@ -507,7 +513,7 @@ class GCodeVM:
 def validate_gcode_file(
     gcode_path: Union[str, Path],
     machine_cfg: validators.MachineV1
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """Validate G-code file and return results.
     
     Parameters
@@ -519,7 +525,7 @@ def validate_gcode_file(
     
     Returns
     -------
-    Dict[str, any]
+    Dict[str, Any]
         VM execution results (see GCodeVM.run())
     
     Raises

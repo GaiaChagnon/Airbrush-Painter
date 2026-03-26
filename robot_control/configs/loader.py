@@ -467,15 +467,43 @@ class MachineConfig:
         return mx, my
 
     def get_z_for_tool(self, tool: str, state: str) -> float:
-        """Return Z position for *tool* in *state* ('travel' or 'work')."""
-        if state == "travel":
-            return self.z_states.travel_mm
+        """Return Z position for *tool* in *state* ('travel' or 'work').
+
+        Parameters
+        ----------
+        tool : str
+            Tool name (``'pen'`` or ``'airbrush'``).
+        state : str
+            Movement state (``'travel'`` or ``'work'``).
+
+        Returns
+        -------
+        float
+            Z height in mm.
+
+        Raises
+        ------
+        ConfigError
+            If *state* or *tool* is unrecognised.
+        """
+        _Z_WORK_MAP: dict[str, float] = {
+            "pen": self.z_states.pen_work_mm,
+            "airbrush": self.z_states.airbrush_work_mm,
+        }
+        _Z_STATE_MAP: dict[str, float] = {
+            "travel": self.z_states.travel_mm,
+        }
+
+        if state in _Z_STATE_MAP:
+            return _Z_STATE_MAP[state]
         if state == "work":
-            if tool == "pen":
-                return self.z_states.pen_work_mm
-            if tool == "airbrush":
-                return self.z_states.airbrush_work_mm
-            raise ConfigError(f"Unknown tool '{tool}' for Z work state")
+            try:
+                return _Z_WORK_MAP[tool]
+            except KeyError:
+                raise ConfigError(
+                    f"Unknown tool '{tool}' for Z work state. "
+                    f"Expected one of {sorted(_Z_WORK_MAP)}"
+                )
         raise ConfigError(
             f"Unknown Z state '{state}'. Expected 'travel' or 'work'"
         )

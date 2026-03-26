@@ -5,41 +5,41 @@
 #   pip install -r requirements.txt
 
 # Tensor / image processing
-torch>=2.4.0
-torchvision>=0.19.0
-lpips>=0.1.4
-numpy>=1.24.0
-opencv-python>=4.9.0
-Pillow>=10.2.0
-scikit-image>=0.22.0
-scipy>=1.12.0
+torch>=2.4.0,<3.0.0
+torchvision>=0.19.0,<1.0.0
+lpips>=0.1.4,<1.0.0
+numpy>=1.24.0,<3.0.0
+opencv-python>=4.9.0,<5.0.0
+Pillow>=10.2.0,<12.0.0
+scikit-image>=0.22.0,<1.0.0
+scipy>=1.12.0,<2.0.0
 
 # Configuration & validation
-pydantic>=2.6.0
-ruamel.yaml>=0.18.0
+pydantic>=2.6.0,<3.0.0
+ruamel.yaml>=0.18.0,<1.0.0
 
 # Geometry
-shapely>=2.0.0
-pyclipper>=1.3.0
+shapely>=2.0.0,<3.0.0
+pyclipper>=1.3.0,<2.0.0
 
 # Vectorization & line-art tracing
-pypotrace>=0.3.0
-vpype>=1.14.0
-hatched @ git+https://github.com/plottertools/hatched.git
-vpype-flow-imager[all] @ git+https://github.com/serycjon/vpype-flow-imager.git
+pypotrace>=0.3.0,<1.0.0
+vpype>=1.14.0,<2.0.0
+hatched @ git+https://github.com/plottertools/hatched.git@267a082
+vpype-flow-imager[all] @ git+https://github.com/serycjon/vpype-flow-imager.git@e580530
 
 # Testing
-pytest>=8.0.0
-pytest-cov>=4.1.0
-hypothesis>=6.98.0
+pytest>=8.0.0,<9.0.0
+pytest-cov>=4.1.0,<6.0.0
+hypothesis>=6.98.0,<7.0.0
 
 # Utilities
-tqdm>=4.66.0
-colorlog>=6.8.0
+tqdm>=4.66.0,<5.0.0
+colorlog>=6.8.0,<7.0.0
 
 # Robot CLI terminal interface
-rich>=13.7.0
-questionary>=2.0.0
-readchar>=4.0.0
-plotext>=5.2.0
+rich>=13.7.0,<14.0.0
+questionary>=2.0.0,<3.0.0
+readchar>=4.0.0,<5.0.0
+plotext>=5.2.0,<6.0.0
 

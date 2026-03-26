@@ -18,6 +18,8 @@ Input images are expected to be in [0, 1] range (linear RGB) unless noted.
 import torch
 import torch.nn.functional as F
 
+from src.utils.color import _REC709_R, _REC709_G, _REC709_B
+
 
 def psnr(
     img1: torch.Tensor,
@@ -239,8 +241,8 @@ def edge_preservation_score(
         canvas = canvas.unsqueeze(0)
     
     # Convert to grayscale (luminance)
-    target_gray = 0.2126 * target[:, 0] + 0.7152 * target[:, 1] + 0.0722 * target[:, 2]
-    canvas_gray = 0.2126 * canvas[:, 0] + 0.7152 * canvas[:, 1] + 0.0722 * canvas[:, 2]
+    target_gray = _REC709_R * target[:, 0] + _REC709_G * target[:, 1] + _REC709_B * target[:, 2]
+    canvas_gray = _REC709_R * canvas[:, 0] + _REC709_G * canvas[:, 1] + _REC709_B * canvas[:, 2]
     
     # Add channel dimension for conv2d
     target_gray = target_gray.unsqueeze(1)  # (B, 1, H, W)

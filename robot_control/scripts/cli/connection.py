@@ -37,6 +37,15 @@ logger = logging.getLogger(__name__)
 ETX = b"\x03"
 PRINTER_CFG_PATH = Path.home() / "printer.cfg"
 
+# Size of the socket recv buffer (bytes)
+_SOCKET_RECV_BUFFER_SIZE = 4096
+
+# Timeout for raw socket connection to Klipper (seconds)
+_RAW_CONNECT_TIMEOUT_S = 45.0
+
+# Maximum time to wait for Klipper recovery from shutdown (seconds)
+_SHUTDOWN_RECOVERY_TIMEOUT_S = 30.0
+
 
 class KlipperConnectionManager:
     """Manages Klipper connectivity for all CLI modes.
@@ -155,7 +164,7 @@ class KlipperConnectionManager:
         """
         from robot_control.hardware.pump_control import wait_for_ready
 
-        sock = wait_for_ready(self._cfg.connection.socket_path, timeout=45.0)
+        sock = wait_for_ready(self._cfg.connection.socket_path, timeout=_RAW_CONNECT_TIMEOUT_S)
         self._raw_sock = sock
         with self._lock:
             self._connected = True
@@ -253,9 +262,11 @@ class KlipperConnectionManager:
         interval = self._cfg.interactive.position_poll_interval_ms / 1000.0
         while not self._poll_stop.is_set():
             try:
-                if self._client is not None:
-                    pos = self._client.get_position()
-                    status = self._client.get_status()
+                with self._lock:
+                    client = self._client
+                if client is not None:
+                    pos = client.get_position()
+                    status = client.get_status()
                     with self._lock:
                         self._position = pos
                         self._state = status.state
@@ -278,7 +289,7 @@ class KlipperConnectionManager:
         except Exception:
             pass
 
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + _SHUTDOWN_RECOVERY_TIMEOUT_S
         while time.monotonic() < deadline:
             time.sleep(1.0)
             try:
@@ -288,22 +299,21 @@ class KlipperConnectionManager:
                     return
             except Exception:
                 pass
-        raise RuntimeError("Could not recover Klipper from shutdown within 30 s")
+        raise RuntimeError(f"Could not recover Klipper from shutdown within {_SHUTDOWN_RECOVERY_TIMEOUT_S} s")
 
     def _restart_klipper(self) -> None:
         """Send RESTART and wait for ready."""
         self._console.print("  Restarting Klipper...")
         sp = self._cfg.connection.socket_path
         try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            sock.connect(sp)
-            payload = json.dumps({
-                "id": 1, "method": "gcode/script",
-                "params": {"script": "RESTART"},
-            }).encode() + ETX
-            sock.sendall(payload)
-            sock.close()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5.0)
+                sock.connect(sp)
+                payload = json.dumps({
+                    "id": 1, "method": "gcode/script",
+                    "params": {"script": "RESTART"},
+                }).encode() + ETX
+                sock.sendall(payload)
         except OSError:
             pass
         time.sleep(3.0)
@@ -317,24 +327,23 @@ class KlipperConnectionManager:
 
         while time.monotonic() < deadline:
             try:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(5.0)
-                sock.connect(sp)
-                payload = json.dumps({"id": 1, "method": "info", "params": {}}).encode() + ETX
-                sock.sendall(payload)
-                buf = b""
-                while ETX not in buf:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    buf += chunk
-                sock.close()
-                if ETX in buf:
-                    frame = buf[:buf.index(ETX)]
-                    msg = json.loads(frame.decode())
-                    state = msg.get("result", {}).get("state", "unknown")
-                    if state == "ready":
-                        return
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(5.0)
+                    sock.connect(sp)
+                    payload = json.dumps({"id": 1, "method": "info", "params": {}}).encode() + ETX
+                    sock.sendall(payload)
+                    buf = b""
+                    while ETX not in buf:
+                        chunk = sock.recv(_SOCKET_RECV_BUFFER_SIZE)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    if ETX in buf:
+                        frame = buf[:buf.index(ETX)]
+                        msg = json.loads(frame.decode())
+                        state = msg.get("result", {}).get("state", "unknown")
+                        if state == "ready":
+                            return
             except OSError:
                 pass
             time.sleep(1.0)

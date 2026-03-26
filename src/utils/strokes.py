@@ -62,7 +62,7 @@ def make_stroke_id(epoch: int, idx: int) -> str:
 def stroke_vec_to_yaml_dict(
     vec_mm: torch.Tensor,
     bounds: Dict[str, Tuple[float, float]],
-    stroke_id: str = None
+    stroke_id: str | None = None
 ) -> Dict:
     """Convert 15-D stroke vector (mm-space) to YAML dictionary with clamping.
 

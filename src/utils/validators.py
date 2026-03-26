@@ -30,6 +30,69 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ============================================================================
+# SUPPORTED SCHEMA VERSIONS
+# ============================================================================
+
+# Canonical registry of all schema versions this codebase can load.
+# Add new versions here when introducing versioned schema changes.
+SUPPORTED_SCHEMA_VERSIONS: Dict[str, List[str]] = {
+    "stroke": ["stroke.v1"],
+    "luts": ["luts.v1"],
+    "machine": ["machine.v1"],
+    "job": ["job.v1"],
+    "renderer_cpu": ["renderer_cpu.v1"],
+    "pen_tool": ["pen_tool.v1"],
+    "pen_tracer": ["pen_tracer.v2"],
+    "pen_vectors": ["pen_vectors.v1"],
+    "calibration": ["calibration.v1"],
+    "manual_calibration_results": ["manual_calibration_results.v1"],
+}
+
+
+def validate_schema_version(
+    schema_kind: str,
+    version_string: str,
+) -> str:
+    """Check that a schema version string is supported.
+
+    Parameters
+    ----------
+    schema_kind : str
+        Schema family key (e.g. ``"stroke"``, ``"machine"``).
+    version_string : str
+        The version string found in the YAML ``schema`` field.
+
+    Returns
+    -------
+    str
+        The validated version string (unchanged).
+
+    Raises
+    ------
+    ValueError
+        If *schema_kind* is unknown or *version_string* is not in the
+        supported list for that kind.
+
+    Examples
+    --------
+    >>> validate_schema_version("stroke", "stroke.v1")
+    'stroke.v1'
+    """
+    supported = SUPPORTED_SCHEMA_VERSIONS.get(schema_kind)
+    if supported is None:
+        raise ValueError(
+            f"Unknown schema kind '{schema_kind}'. "
+            f"Known kinds: {sorted(SUPPORTED_SCHEMA_VERSIONS.keys())}"
+        )
+    if version_string not in supported:
+        raise ValueError(
+            f"Unsupported {schema_kind} schema version '{version_string}'. "
+            f"Supported versions: {supported}"
+        )
+    return version_string
+
+
+# ============================================================================
 # STROKE SCHEMA V1
 # ============================================================================
 
@@ -111,9 +174,7 @@ class StrokesFileV1(BaseModel):
     @field_validator('schema_version')
     @classmethod
     def validate_schema(cls, v: str) -> str:
-        if v != "stroke.v1":
-            raise ValueError(f"Expected schema 'stroke.v1', got '{v}'")
-        return v
+        return validate_schema_version("stroke", v)
 
 
 # ============================================================================
@@ -231,9 +292,7 @@ class LUTsV1(BaseModel):
     @field_validator('schema_version')
     @classmethod
     def validate_schema(cls, v: str) -> str:
-        if v != "luts.v1":
-            raise ValueError(f"Expected schema 'luts.v1', got '{v}'")
-        return v
+        return validate_schema_version("luts", v)
 
 
 # ============================================================================
@@ -322,9 +381,7 @@ class MachineV1(BaseModel):
     @field_validator('schema_version')
     @classmethod
     def validate_schema(cls, v: str) -> str:
-        if v != "machine.v1":
-            raise ValueError(f"Expected schema 'machine.v1', got '{v}'")
-        return v
+        return validate_schema_version("machine", v)
     
     @field_validator('canvas_mm')
     @classmethod
@@ -419,9 +476,7 @@ class JobV1(BaseModel):
     @field_validator('schema_version')
     @classmethod
     def validate_schema(cls, v: str) -> str:
-        if v != "job.v1":
-            raise ValueError(f"Expected schema 'job.v1', got '{v}'")
-        return v
+        return validate_schema_version("job", v)
 
 
 # ============================================================================
@@ -753,9 +808,7 @@ class RendererCPUV1(BaseModel):
     @field_validator('schema')
     @classmethod
     def validate_schema(cls, v: str) -> str:
-        if v != "renderer_cpu.v1":
-            raise ValueError(f"schema must be 'renderer_cpu.v1', got {v}")
-        return v
+        return validate_schema_version("renderer_cpu", v)
 
 
 def load_renderer_cpu_config(path: Union[str, Path]) -> RendererCPUV1:
@@ -845,9 +898,7 @@ class PenToolV1(BaseModel):
     @field_validator('schema')
     @classmethod
     def validate_schema(cls, v: str) -> str:
-        if v != "pen_tool.v1":
-            raise ValueError(f"Expected schema 'pen_tool.v1', got '{v}'")
-        return v
+        return validate_schema_version("pen_tool", v)
     
     @field_validator('offset_mm')
     @classmethod
@@ -959,9 +1010,7 @@ class PenTracerV2(BaseModel):
     @field_validator('schema')
     @classmethod
     def validate_schema(cls, v: str) -> str:
-        if v != "pen_tracer.v2":
-            raise ValueError(f"Expected schema 'pen_tracer.v2', got '{v}'")
-        return v
+        return validate_schema_version("pen_tracer", v)
 
 
 # ============================================================================
@@ -1028,9 +1077,7 @@ class PenVectorsV1(BaseModel):
     @field_validator('schema')
     @classmethod
     def validate_schema(cls, v: str) -> str:
-        if v != "pen_vectors.v1":
-            raise ValueError(f"Expected schema 'pen_vectors.v1', got '{v}'")
-        return v
+        return validate_schema_version("pen_vectors", v)
     
     @field_validator('render_px')
     @classmethod
@@ -1414,11 +1461,7 @@ class CalibrationV1(BaseModel):
     @field_validator("schema_version")
     @classmethod
     def _check_schema(cls, v: str) -> str:
-        if v != "calibration.v1":
-            raise ValueError(
-                f"Expected schema_version 'calibration.v1', got '{v}'"
-            )
-        return v
+        return validate_schema_version("calibration", v)
 
     @model_validator(mode="after")
     def _check_grid_consistency(self) -> "CalibrationV1":

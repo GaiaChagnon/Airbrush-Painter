@@ -39,6 +39,18 @@ from src.utils.fs import atomic_yaml_dump, load_yaml
 
 logger = logging.getLogger(__name__)
 
+# Z binary-search tolerance for pen and airbrush (mm)
+_Z_CALIBRATION_TOLERANCE_MM = 0.05
+
+# Endstop repeatability: max acceptable range for XY axes (mm)
+_ENDSTOP_XY_TOLERANCE_MM = 0.1
+
+# Endstop repeatability: max acceptable range for Z axis (mm)
+_ENDSTOP_Z_TOLERANCE_MM = 0.05
+
+# Fraction of axis travel used for jog between homing cycles
+_JOG_TRAVEL_FRACTION = 0.75
+
 
 # ---------------------------------------------------------------------------
 # Steps per mm (rotation_distance) calibration
@@ -77,9 +89,9 @@ def calibrate_steps_per_mm(
     executor = JobExecutor(client, config)
 
     logger.info("Starting steps/mm calibration for %s axis", axis)
-    print(f"\n{'='*50}")
-    print(f"  STEPS/MM CALIBRATION -- {axis} AXIS")
-    print(f"{'='*50}\n")
+    logger.info("=" * 50)
+    logger.info("STEPS/MM CALIBRATION -- %s AXIS", axis)
+    logger.info("=" * 50)
 
     # Draw ruler pattern
     if axis.upper() == "X":
@@ -87,7 +99,7 @@ def calibrate_steps_per_mm(
     else:
         ops = patterns.ruler_y(length=distance_mm)
 
-    print(f"Drawing {distance_mm} mm ruler on {axis} axis...")
+    logger.info("Drawing %s mm ruler on %s axis...", distance_mm, axis)
     executor.run_interactive(ops)
 
     # Get measurement
@@ -110,11 +122,11 @@ def calibrate_steps_per_mm(
         "new_rotation_distance": new_rd,
     }
 
-    print(format_calibration_summary(summary))
+    logger.info("%s", format_calibration_summary(summary))
 
     if get_yes_no("Update config with new rotation_distance?"):
-        print(f"  New xy_rotation_distance: {new_rd:.4f}")
-        print("  (Update machine.yaml manually with this value)")
+        logger.info("New xy_rotation_distance: %.4f", new_rd)
+        logger.info("(Update machine.yaml manually with this value)")
 
     return summary
 
@@ -139,11 +151,11 @@ def calibrate_z_heights(
         ``pen_work_z``, ``airbrush_work_z``, ``travel_z``.
     """
     logger.info("Starting Z-height calibration")
-    print(f"\n{'='*50}")
-    print("  Z-HEIGHT (SEESAW) CALIBRATION")
-    print(f"{'='*50}\n")
+    logger.info("=" * 50)
+    logger.info("Z-HEIGHT (SEESAW) CALIBRATION")
+    logger.info("=" * 50)
 
-    print("Homing all axes...")
+    logger.info("Homing all axes...")
     client.send_gcode("G28\nM400", timeout=60.0)
 
     # Move to test position (canvas centre)
@@ -153,11 +165,11 @@ def calibrate_z_heights(
     f_travel = tc.travel_feed_mm_s * 60.0
     client.send_gcode(f"G0 X{cx:.1f} Y{cy:.1f} F{f_travel:.0f}\nM400")
 
-    print("\nPlace paper on the canvas.\n")
+    logger.info("Place paper on the canvas.")
 
     # Pen calibration
-    print("--- Pen Z calibration ---")
-    print("The Z axis will move incrementally.  Answer when pen touches paper.")
+    logger.info("--- Pen Z calibration ---")
+    logger.info("The Z axis will move incrementally.  Answer when pen touches paper.")
 
     def pen_prompt(z: float) -> bool:
         f_plunge = tc.plunge_feed_mm_s * 60.0
@@ -165,8 +177,8 @@ def calibrate_z_heights(
         return get_yes_no(f"Z = {z:.3f} mm -- is the pen touching paper?")
 
     z_min, z_max = 0.0, config.work_area.z
-    pen_z = binary_search_z(pen_prompt, z_min, z_max, tolerance=0.05)
-    print(f"  Pen work Z: {pen_z:.3f} mm")
+    pen_z = binary_search_z(pen_prompt, z_min, z_max, tolerance=_Z_CALIBRATION_TOLERANCE_MM)
+    logger.info("Pen work Z: %.3f mm", pen_z)
 
     # Raise to travel
     client.send_gcode(
@@ -174,8 +186,8 @@ def calibrate_z_heights(
     )
 
     # Airbrush calibration
-    print("\n--- Airbrush Z calibration ---")
-    print("Same procedure for the airbrush side of the seesaw.")
+    logger.info("--- Airbrush Z calibration ---")
+    logger.info("Same procedure for the airbrush side of the seesaw.")
 
     def airbrush_prompt(z: float) -> bool:
         f_plunge = tc.plunge_feed_mm_s * 60.0
@@ -184,8 +196,8 @@ def calibrate_z_heights(
             f"Z = {z:.3f} mm -- is the airbrush at correct spray height?",
         )
 
-    ab_z = binary_search_z(airbrush_prompt, z_min, z_max, tolerance=0.05)
-    print(f"  Airbrush work Z: {ab_z:.3f} mm")
+    ab_z = binary_search_z(airbrush_prompt, z_min, z_max, tolerance=_Z_CALIBRATION_TOLERANCE_MM)
+    logger.info("Airbrush work Z: %.3f mm", ab_z)
 
     travel_z = (pen_z + ab_z) / 2.0
 
@@ -194,7 +206,7 @@ def calibrate_z_heights(
         "airbrush_work_z": ab_z,
         "travel_z": travel_z,
     }
-    print(format_calibration_summary(summary))
+    logger.info("%s", format_calibration_summary(summary))
     return summary
 
 
@@ -217,21 +229,21 @@ def calibrate_tool_offset(
     executor = JobExecutor(client, config)
 
     logger.info("Starting tool-offset calibration")
-    print(f"\n{'='*50}")
-    print("  TOOL OFFSET CALIBRATION")
-    print(f"{'='*50}\n")
+    logger.info("=" * 50)
+    logger.info("TOOL OFFSET CALIBRATION")
+    logger.info("=" * 50)
 
     # Draw crosshair with pen
-    print("Step 1: Drawing crosshair with PEN...")
+    logger.info("Step 1: Drawing crosshair with PEN...")
     pen_ops = patterns.cross(size_mm=30.0, tool="pen")
     executor.run_interactive(pen_ops)
 
     # Draw crosshair with airbrush at same commanded position
-    print("Step 2: Drawing crosshair with AIRBRUSH at same position...")
+    logger.info("Step 2: Drawing crosshair with AIRBRUSH at same position...")
     ab_ops = patterns.cross(size_mm=30.0, tool="airbrush")
     executor.run_interactive(ab_ops)
 
-    print("\nMeasure the offset between the two crosshair centres.")
+    logger.info("Measure the offset between the two crosshair centres.")
     pen_x = get_float_input("Pen crosshair centre X (mm)", default=0.0)
     pen_y = get_float_input("Pen crosshair centre Y (mm)", default=0.0)
     ab_x = get_float_input("Airbrush crosshair centre X (mm)", default=0.0)
@@ -240,11 +252,11 @@ def calibrate_tool_offset(
     ox, oy = calculate_tool_offset(pen_x, pen_y, ab_x, ab_y)
 
     summary: dict[str, Any] = {"offset_x": ox, "offset_y": oy}
-    print(format_calibration_summary(summary))
+    logger.info("%s", format_calibration_summary(summary))
 
     if get_yes_no("Update airbrush xy_offset_mm in config?"):
-        print(f"  New airbrush xy_offset_mm: [{ox:.3f}, {oy:.3f}]")
-        print("  (Update machine.yaml manually with these values)")
+        logger.info("New airbrush xy_offset_mm: [%.3f, %.3f]", ox, oy)
+        logger.info("(Update machine.yaml manually with these values)")
 
     return summary
 
@@ -268,16 +280,16 @@ def calibrate_speed(
     executor = JobExecutor(client, config)
 
     logger.info("Starting speed calibration")
-    print(f"\n{'='*50}")
-    print("  SPEED CALIBRATION")
-    print(f"{'='*50}\n")
+    logger.info("=" * 50)
+    logger.info("SPEED CALIBRATION")
+    logger.info("=" * 50)
 
     speeds = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 75.0, 100.0]
-    print(f"Drawing lines at speeds: {speeds} mm/s")
+    logger.info("Drawing lines at speeds: %s mm/s", speeds)
     ops = patterns.speed_test(speeds=speeds)
     executor.run_interactive(ops)
 
-    print("\nExamine the drawn lines (numbered bottom to top).")
+    logger.info("Examine the drawn lines (numbered bottom to top).")
     idx = int(
         get_float_input(
             f"Which line number (1-{len(speeds)}) is the highest quality?",
@@ -288,7 +300,7 @@ def calibrate_speed(
     recommended = speeds[idx - 1]
 
     summary: dict[str, Any] = {"recommended_speed_mm_s": recommended}
-    print(format_calibration_summary(summary))
+    logger.info("%s", format_calibration_summary(summary))
     return summary
 
 
@@ -344,12 +356,12 @@ def verify_endstops(
         Per-axis statistics, raw positions, and pass/fail status.
         Tolerance: 0.1 mm range for XY, 0.05 mm range for Z.
     """
-    xy_tol = 0.1   # mm -- max acceptable range
-    z_tol = 0.05   # mm
+    xy_tol = _ENDSTOP_XY_TOLERANCE_MM
+    z_tol = _ENDSTOP_Z_TOLERANCE_MM
 
-    # Jog targets: 75 % of travel so the mechanics are well exercised
-    jog_x = config.work_area.x * 0.75
-    jog_y = config.work_area.y * 0.75
+    # Jog targets: fraction of travel so the mechanics are well exercised
+    jog_x = config.work_area.x * _JOG_TRAVEL_FRACTION
+    jog_y = config.work_area.y * _JOG_TRAVEL_FRACTION
     jog_z = config.z_states.travel_mm
     tc = config.get_tool("pen")
     f_xy = tc.travel_feed_mm_s * 60.0
@@ -365,13 +377,12 @@ def verify_endstops(
         "Starting %d-cycle endstop verification (microstep=%.4f mm)",
         cycles, microstep_mm,
     )
-    print(f"\n{'='*60}")
-    print(f"  ENDSTOP REPEATABILITY TEST  ({cycles} cycles, X+Y+Z)")
-    print(f"{'='*60}")
-    print(f"  Jog between homes: X={jog_x:.0f}  Y={jog_y:.0f}  Z={jog_z:.0f}")
-    print(f"  Microstep size:    {microstep_mm:.4f} mm")
-    print(f"  Tolerance:         XY range < {xy_tol} mm, Z range < {z_tol} mm")
-    print()
+    logger.info("=" * 60)
+    logger.info("ENDSTOP REPEATABILITY TEST  (%d cycles, X+Y+Z)", cycles)
+    logger.info("=" * 60)
+    logger.info("Jog between homes: X=%.0f  Y=%.0f  Z=%.0f", jog_x, jog_y, jog_z)
+    logger.info("Microstep size:    %.4f mm", microstep_mm)
+    logger.info("Tolerance:         XY range < %s mm, Z range < %s mm", xy_tol, z_tol)
 
     xs: list[float] = []
     ys: list[float] = []
@@ -384,9 +395,9 @@ def verify_endstops(
         xs.append(pos.x)
         ys.append(pos.y)
         zs.append(pos.z)
-        print(
-            f"  Cycle {i+1:2d}/{cycles}:  "
-            f"X={pos.x:.4f}  Y={pos.y:.4f}  Z={pos.z:.4f}"
+        logger.info(
+            "Cycle %2d/%d:  X=%.4f  Y=%.4f  Z=%.4f",
+            i + 1, cycles, pos.x, pos.y, pos.z,
         )
 
         # Jog away (skip on last cycle -- no need to travel after final read)
@@ -403,22 +414,24 @@ def verify_endstops(
     z_ok = sz["range"] < z_tol
     passed = xy_ok and z_ok
 
-    print(f"\n  {'Axis':<5} {'Mean':>9} {'StdDev':>9} "
-          f"{'Min':>9} {'Max':>9} {'Range':>9}  Result")
-    print(f"  {'-'*63}")
+    logger.info(
+        "%-5s %9s %9s %9s %9s %9s  Result",
+        "Axis", "Mean", "StdDev", "Min", "Max", "Range",
+    )
+    logger.info("-" * 63)
     for label, stats, tol in [("X", sx, xy_tol),
                                ("Y", sy, xy_tol),
                                ("Z", sz, z_tol)]:
         ok = stats["range"] < tol
         tag = "PASS" if ok else "FAIL"
-        print(
-            f"  {label:<5} {stats['mean']:9.4f} {stats['std']:9.4f} "
-            f"{stats['min']:9.4f} {stats['max']:9.4f} "
-            f"{stats['range']:9.4f}  {tag}"
+        logger.info(
+            "%-5s %9.4f %9.4f %9.4f %9.4f %9.4f  %s",
+            label, stats["mean"], stats["std"],
+            stats["min"], stats["max"], stats["range"], tag,
         )
 
     overall = "PASS" if passed else "FAIL"
-    print(f"\n  Overall: {overall}")
+    logger.info("Overall: %s", overall)
 
     summary: dict[str, Any] = {
         "passed": passed,
@@ -431,7 +444,7 @@ def verify_endstops(
         "raw_y": ys,
         "raw_z": zs,
     }
-    print(format_calibration_summary(summary))
+    logger.info("%s", format_calibration_summary(summary))
     return summary
 
 
@@ -474,19 +487,20 @@ def calibrate_endstop_phase(
         )
 
     logger.info("Starting endstop phase calibration")
-    print(f"\n{'='*60}")
-    print("  ENDSTOP PHASE CALIBRATION")
-    print(f"{'='*60}")
-    print("  This uses Klipper's [endstop_phase] module to measure")
-    print("  the exact microstep variance of each endstop switch.")
-    print()
+    logger.info("=" * 60)
+    logger.info("ENDSTOP PHASE CALIBRATION")
+    logger.info("=" * 60)
+    logger.info(
+        "This uses Klipper's [endstop_phase] module to measure "
+        "the exact microstep variance of each endstop switch.",
+    )
 
     # Home a few times so Klipper accumulates trigger-phase data
     n_homes = 10
-    print(f"  Homing {n_homes} times to gather phase data...")
+    logger.info("Homing %d times to gather phase data...", n_homes)
     for i in range(n_homes):
         client.send_gcode("G28\nM400", timeout=60.0)
-        print(f"    Home {i+1}/{n_homes} done")
+        logger.info("Home %d/%d done", i + 1, n_homes)
         if i < n_homes - 1:
             tc = config.get_tool("pen")
             f_xy = tc.travel_feed_mm_s * 60.0
@@ -499,22 +513,24 @@ def calibrate_endstop_phase(
                 f"G0 X{jog_x:.1f} Y{jog_y:.1f} F{f_xy:.0f}\nM400"
             )
 
-    print("\n  Running ENDSTOP_PHASE_CALIBRATE...")
+    logger.info("Running ENDSTOP_PHASE_CALIBRATE...")
     output = client.send_gcode_with_output(
         "ENDSTOP_PHASE_CALIBRATE", timeout=30.0, collect_s=3.0,
     )
 
     if output.strip():
-        print(f"\n  Klipper output:\n{output}")
+        logger.info("Klipper output:\n%s", output)
     else:
-        print("\n  (No console output captured -- check Klipper log for"
-              " endstop_phase results)")
+        logger.warning(
+            "No console output captured -- check Klipper log for "
+            "endstop_phase results",
+        )
 
     summary: dict[str, Any] = {
         "homes": n_homes,
         "klipper_output": output,
     }
-    print(format_calibration_summary(summary))
+    logger.info("%s", format_calibration_summary(summary))
     return summary
 
 
@@ -607,29 +623,28 @@ def test_digital_output(
     out_cfg = _get_digital_output(config, output_name)
 
     logger.info("Testing digital output: %s (pin %s)", output_name, out_cfg.pin)
-    print(f"\n{'='*60}")
-    print(f"  DIGITAL OUTPUT TEST: {output_name}")
-    print(f"{'='*60}")
-    print(f"  Pin:         {out_cfg.pin}")
-    print(f"  Description: {out_cfg.description}")
-    print(f"  Cycles:      {cycles}  (ON {on_time_s}s / OFF {off_time_s}s)")
-    print()
+    logger.info("=" * 60)
+    logger.info("DIGITAL OUTPUT TEST: %s", output_name)
+    logger.info("=" * 60)
+    logger.info("Pin:         %s", out_cfg.pin)
+    logger.info("Description: %s", out_cfg.description)
+    logger.info("Cycles:      %d  (ON %ss / OFF %ss)", cycles, on_time_s, off_time_s)
 
     _set_pin(client, output_name, 0)
     t_start = time.monotonic()
 
     for i in range(cycles):
-        print(f"  Cycle {i + 1}/{cycles}: ON  ...", end="", flush=True)
+        logger.info("Cycle %d/%d: ON  ...", i + 1, cycles)
         _set_pin(client, output_name, 1)
         time.sleep(on_time_s)
 
-        print(f"  OFF", flush=True)
+        logger.info("Cycle %d/%d: OFF", i + 1, cycles)
         _set_pin(client, output_name, 0)
         if i < cycles - 1:
             time.sleep(off_time_s)
 
     elapsed = time.monotonic() - t_start
-    print(f"\n  Test complete.  {cycles} cycles in {elapsed:.1f} s")
+    logger.info("Test complete.  %d cycles in %.1f s", cycles, elapsed)
 
     summary: dict[str, Any] = {
         "output_name": output_name,
@@ -637,7 +652,7 @@ def test_digital_output(
         "cycles": cycles,
         "elapsed_s": round(elapsed, 1),
     }
-    print(format_calibration_summary(summary))
+    logger.info("%s", format_calibration_summary(summary))
     return summary
 
 
@@ -782,14 +797,17 @@ def _probe_single_point(
         "back":    (0.0, -_XY_JOG_STEP_MM),
     }
 
-    print(f"\n  --- Point {idx + 1}/{total}  X={current_x:.1f}  Y={current_y:.1f} ---")
-    print(f"  Starting Z: {current_z:.3f} mm")
-    print("  Commands:")
-    print("    <number>       Jog Z by that amount (e.g. +0.1, -0.05)")
-    print("    l / r          Jog X by -5 / +5 mm  (left / right)")
-    print("    f / b          Jog Y by +5 / -5 mm  (forward / back)")
-    print("    circle         Draw a 3 mm test circle at current Z")
-    print("    accept         Record this Z and move to next point")
+    logger.info(
+        "--- Point %d/%d  X=%.1f  Y=%.1f ---",
+        idx + 1, total, current_x, current_y,
+    )
+    logger.info("Starting Z: %.3f mm", current_z)
+    logger.info("Commands:")
+    logger.info("  <number>       Jog Z by that amount (e.g. +0.1, -0.05)")
+    logger.info("  l / r          Jog X by -5 / +5 mm  (left / right)")
+    logger.info("  f / b          Jog Y by +5 / -5 mm  (forward / back)")
+    logger.info("  circle         Draw a 3 mm test circle at current Z")
+    logger.info("  accept         Record this Z and move to next point")
 
     while True:
         raw = input(
@@ -797,12 +815,14 @@ def _probe_single_point(
         ).strip().lower()
 
         if raw == "accept":
-            print(f"  Accepted Z = {current_z:.3f} mm  "
-                  f"at X={current_x:.1f} Y={current_y:.1f}")
+            logger.info(
+                "Accepted Z = %.3f mm  at X=%.1f Y=%.1f",
+                current_z, current_x, current_y,
+            )
             return current_z, current_x, current_y
 
         if raw == "circle":
-            print("  Drawing test circle...")
+            logger.info("Drawing test circle...")
             _draw_test_circle(client, current_x, current_y, current_z, config)
             client.send_gcode(
                 f"G1 Z{current_z:.3f} F{f_plunge:.0f}\nM400", timeout=10.0,
@@ -837,8 +857,10 @@ def _probe_single_point(
         try:
             delta = float(raw)
         except ValueError:
-            print("  Invalid input. Type a number, l/r/f/b, 'circle', "
-                  "or 'accept'.")
+            logger.warning(
+                "Invalid input. Type a number, l/r/f/b, 'circle', "
+                "or 'accept'.",
+            )
             continue
 
         new_z = current_z + delta
@@ -1037,18 +1059,23 @@ def calibrate_bed_mesh(
     first_z_start = z_contact - _FIRST_POINT_SAFE_MARGIN_MM
 
     logger.info("Starting bed-mesh calibration")
-    print(f"\n{'='*60}")
-    print("  BED MESH CALIBRATION (surface leveling)")
-    print(f"{'='*60}")
-    print(f"  Bounds:       {bounds_label}")
-    print(f"  Grid:         {probe_count[0]}x{probe_count[1]}")
-    print(f"  Area:         ({mesh_min[0]:.1f}, {mesh_min[1]:.1f}) -> "
-          f"({mesh_max[0]:.1f}, {mesh_max[1]:.1f}) mm")
-    print(f"  z_contact_mm: {z_contact:.3f}  (from jobs.yaml)")
-    print(f"  First start:  {first_z_start:.3f}  "
-          f"({_FIRST_POINT_SAFE_MARGIN_MM} mm safety margin)")
-    print(f"  Subsequent:   accepted_z - {_SUBSEQUENT_SAFE_MARGIN_MM} mm")
-    print()
+    logger.info("=" * 60)
+    logger.info("BED MESH CALIBRATION (surface leveling)")
+    logger.info("=" * 60)
+    logger.info("Bounds:       %s", bounds_label)
+    logger.info("Grid:         %dx%d", probe_count[0], probe_count[1])
+    logger.info(
+        "Area:         (%.1f, %.1f) -> (%.1f, %.1f) mm",
+        mesh_min[0], mesh_min[1], mesh_max[0], mesh_max[1],
+    )
+    logger.info("z_contact_mm: %.3f  (from jobs.yaml)", z_contact)
+    logger.info(
+        "First start:  %.3f  (%s mm safety margin)",
+        first_z_start, _FIRST_POINT_SAFE_MARGIN_MM,
+    )
+    logger.info(
+        "Subsequent:   accepted_z - %s mm", _SUBSEQUENT_SAFE_MARGIN_MM,
+    )
 
     probe_points = _build_probe_grid(mesh_min, mesh_max, probe_count)
     total = len(probe_points)
@@ -1060,8 +1087,8 @@ def calibrate_bed_mesh(
 
     z_start = first_z_start
 
-    print("  Place paper on the glass surface.")
-    print("  The pen will move to each point; adjust Z until it touches.\n")
+    logger.info("Place paper on the glass surface.")
+    logger.info("The pen will move to each point; adjust Z until it touches.")
     input("  Press ENTER to begin...")
 
     # Ensure no bed mesh compensation is active during calibration.
@@ -1069,10 +1096,10 @@ def calibrate_bed_mesh(
     # values the user sees, contaminating the new offsets.
     try:
         client.send_gcode("BED_MESH_CLEAR", timeout=5.0)
-    except Exception:
-        pass  # OK if no mesh was loaded
+    except (OSError, TimeoutError) as exc:
+        logger.warning("Could not clear bed mesh: %s", exc)
 
-    print("\n  Homing all axes...")
+    logger.info("Homing all axes...")
     client.send_gcode("G28\nM400", timeout=60.0)
 
     contact_zs: list[float] = []
@@ -1123,41 +1150,51 @@ def calibrate_bed_mesh(
     ]
     planarity = check_planarity(points_xyz, tolerance=planarity_tolerance)
 
-    print(f"\n{'='*60}")
-    print("  BED MESH RESULTS")
-    print(f"{'='*60}")
-    print(f"  Mean contact Z:  {mean_z:.3f} mm")
-    print(f"  Offsets range:   [{min(offsets_flat):.3f}, "
-          f"{max(offsets_flat):.3f}] mm")
-    print(f"  Max plane residual: {planarity.max_residual_mm:.4f} mm")
+    logger.info("=" * 60)
+    logger.info("BED MESH RESULTS")
+    logger.info("=" * 60)
+    logger.info("Mean contact Z:  %.3f mm", mean_z)
+    logger.info(
+        "Offsets range:   [%.3f, %.3f] mm",
+        min(offsets_flat), max(offsets_flat),
+    )
+    logger.info(
+        "Max plane residual: %.4f mm", planarity.max_residual_mm,
+    )
 
     if planarity.is_planar:
-        print(f"  Planarity:       PASS (within {planarity_tolerance} mm)")
+        logger.info(
+            "Planarity:       PASS (within %s mm)", planarity_tolerance,
+        )
     else:
-        print(f"  Planarity:       WARNING -- max residual "
-              f"{planarity.max_residual_mm:.4f} mm exceeds "
-              f"{planarity_tolerance} mm tolerance")
-        print("  This may indicate the glass is flexing or "
-              "the surface is not rigid.")
-        print("  Per-point residuals:")
+        logger.warning(
+            "Planarity:       WARNING -- max residual %.4f mm "
+            "exceeds %s mm tolerance",
+            planarity.max_residual_mm, planarity_tolerance,
+        )
+        logger.warning(
+            "This may indicate the glass is flexing or "
+            "the surface is not rigid.",
+        )
+        logger.info("Per-point residuals:")
         for i, ((fx, fy), res) in enumerate(
             zip(final_xys, planarity.residuals)
         ):
             flag = " <<<" if abs(res) > planarity_tolerance else ""
-            print(f"    Point {i+1} ({fx:.0f}, {fy:.0f}): "
-                  f"{res:+.4f} mm{flag}")
-
-    print()
+            logger.info(
+                "  Point %d (%.0f, %.0f): %+.4f mm%s",
+                i + 1, fx, fy, res, flag,
+            )
 
     # ---- Save to config ----
     if get_yes_no("Save mesh to machine.yaml and regenerate printer.cfg?"):
         _save_bed_mesh_to_config(
             config_path, offsets_2d, mean_z, mesh_min, mesh_max,
         )
-        print(f"  Updated machine.yaml (pen_work_mm = {mean_z:.3f})")
+        logger.info("Updated machine.yaml (pen_work_mm = %.3f)", mean_z)
 
         _save_z_contact_to_jobs(mean_z)
-        print(f"  Updated jobs.yaml   (z_contact_mm = {mean_z:.3f})")
+        logger.info("Updated jobs.yaml   (z_contact_mm = %.3f)", mean_z)
 
         # Regenerate printer.cfg
         from robot_control.configs.loader import load_config
@@ -1168,16 +1205,17 @@ def calibrate_bed_mesh(
         if printer_cfg_path.exists():
             backup = printer_cfg_path.with_suffix(".cfg.bak")
             printer_cfg_path.rename(backup)
-            print(f"  Backed up printer.cfg -> {backup}")
+            logger.info("Backed up printer.cfg -> %s", backup)
         printer_cfg_text = generate_printer_cfg(updated_cfg)
         printer_cfg_path.write_text(printer_cfg_text)
-        print(f"  Wrote printer.cfg to {printer_cfg_path}")
-        print()
-        print("  Restart Klipper to load the new mesh profile, then use:")
-        print("    BED_MESH_PROFILE LOAD=default")
-        print("  (Drawing scripts do this automatically.)")
+        logger.info("Wrote printer.cfg to %s", printer_cfg_path)
+        logger.info(
+            "Restart Klipper to load the new mesh profile, then use: "
+            "BED_MESH_PROFILE LOAD=default "
+            "(Drawing scripts do this automatically.)",
+        )
     else:
-        print("  Mesh NOT saved.")
+        logger.info("Mesh NOT saved.")
 
     summary: dict[str, Any] = {
         "mean_contact_z": mean_z,
@@ -1185,5 +1223,5 @@ def calibrate_bed_mesh(
         "planarity": "PASS" if planarity.is_planar else "WARNING",
         "max_residual": planarity.max_residual_mm,
     }
-    print(format_calibration_summary(summary))
+    logger.info("%s", format_calibration_summary(summary))
     return summary

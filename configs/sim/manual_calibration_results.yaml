@@ -2,6 +2,10 @@
 # Purpose: Operator-entered measurements from printed calibration patterns
 # Instructions: Measure in calibrated image editor (linear RGB, mm ruler)
 # Used by: src/data_pipeline/calibrate.py (build_luts_from_manual)
+#
+# NOTE: This is a TEMPLATE file. All placeholder values (0.xx, x.x,
+# "YYYY-MM-DD", "Operator Name") must be replaced with actual measurements
+# before use. Copy this file and fill in real data for your machine.
 
 schema: manual_calibration_results.v1
 
@@ -25,8 +29,8 @@ psf_alpha_measurements:
   P00:
     z_mm: 5.0
     speed_mm_s: 50.0
-    alpha_measured: 0.xx         # Coverage factor vs. paper white
-    width_mm: x.x                # Dot diameter/characteristic size
+    alpha_measured: 0.xx         # TEMPLATE: replace with measured coverage factor vs. paper white
+    width_mm: x.x                # TEMPLATE: replace with measured dot diameter/characteristic size
     shape_description: "circular"
   # ... (operator fills in 25 entries)
 
@@ -54,7 +58,7 @@ ink_mixing_measurements: {}
   #   notes: ""
 
 # Metadata
-calibration_date: "YYYY-MM-DD"
-operator: "Operator Name"
-notes: "Any observations or issues during printing/measurement"
+calibration_date: "YYYY-MM-DD"        # TEMPLATE: replace with actual date
+operator: "Operator Name"              # TEMPLATE: replace with operator name
+notes: "Any observations or issues during printing/measurement"  # TEMPLATE: replace
 

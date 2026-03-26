@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import select
 import socket
@@ -54,6 +55,9 @@ if _PROJECT_ROOT not in sys.path:
 
 from robot_control.configs.loader import load_config
 from robot_control.configs.printer_cfg import generate_printer_cfg
+from src.utils.logging_config import setup_logging
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants -- ALL derived from machine.yaml via load_config()
@@ -65,6 +69,7 @@ _CFG = load_config()
 SOCKET_PATH = "/tmp/klippy_uds"
 PRINTER_CFG_PATH = Path.home() / "printer.cfg"
 ETX = b"\x03"
+_SOCKET_RECV_BUFFER_SIZE = 4096
 
 # Motor parameters (from steppers section)
 ROTATION_DISTANCE = _CFG.steppers.xy_rotation_distance
@@ -174,7 +179,7 @@ def _raw_send(sock: socket.socket, method: str, params: dict, timeout: float = 1
             remaining = max(0.05, deadline - time.monotonic())
             sock.settimeout(remaining)
             try:
-                chunk = sock.recv(4096)
+                chunk = sock.recv(_SOCKET_RECV_BUFFER_SIZE)
                 if not chunk:
                     break
                 buf += chunk
@@ -213,7 +218,7 @@ def _drain_socket(sock: socket.socket, duration: float = 0.2) -> None:
     while time.monotonic() < deadline:
         sock.settimeout(max(0.05, deadline - time.monotonic()))
         try:
-            data = sock.recv(4096)
+            data = sock.recv(_SOCKET_RECV_BUFFER_SIZE)
             if not data:
                 break
         except socket.timeout:
@@ -226,7 +231,7 @@ def _raw_gcode(sock: socket.socket, script: str, timeout: float = 30.0) -> bool:
     if "error" in resp:
         err = resp["error"]
         msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-        print(f"  !! G-code error: {msg[:120]}")
+        logger.error("G-code error: %s", msg[:120])
         return False
     return True
 
@@ -256,11 +261,11 @@ def _wait_for_ready(timeout: float = 30.0) -> socket.socket:
 
             if state in ("error", "shutdown") and not restart_attempted:
                 restart_attempted = True
-                print(f"  Klipper state: {state} -- {state_msg[:80]}")
-                print("  Attempting FIRMWARE_RESTART...")
+                logger.warning("Klipper state: %s -- %s", state, state_msg[:80])
+                logger.info("Attempting FIRMWARE_RESTART...")
                 try:
                     _raw_gcode(sock, "FIRMWARE_RESTART")
-                except Exception:
+                except (OSError, socket.timeout):
                     pass
                 sock.close()
                 time.sleep(5.0)
@@ -316,25 +321,29 @@ def spin_single_stepper(
     degrees = (dist / ROTATION_DISTANCE) * 360.0
 
     for i in range(1, cycles + 1):
-        print(f"    Cycle {i}/{cycles}: forward {degrees:.0f}deg "
-              f"({dist:.0f} mm) ...", end="", flush=True)
+        logger.info(
+            "Cycle %d/%d: forward %.0f deg (%.0f mm) ...",
+            i, cycles, degrees, dist,
+        )
         _raw_gcode(
             sock,
             f"FORCE_MOVE STEPPER={stepper_name} "
             f"DISTANCE={dist} VELOCITY={speed} ACCEL=4000",
         )
-        print(" done")
+        logger.info("done")
 
         _raw_gcode(sock, f"G4 P{DIRECTION_PAUSE_MS}")
 
-        print(f"    Cycle {i}/{cycles}: reverse {degrees:.0f}deg "
-              f"({dist:.0f} mm) ...", end="", flush=True)
+        logger.info(
+            "Cycle %d/%d: reverse %.0f deg (%.0f mm) ...",
+            i, cycles, degrees, dist,
+        )
         _raw_gcode(
             sock,
             f"FORCE_MOVE STEPPER={stepper_name} "
             f"DISTANCE=-{dist} VELOCITY={speed} ACCEL=4000",
         )
-        print(" done")
+        logger.info("done")
 
         if i < cycles:
             _raw_gcode(sock, f"G4 P{DIRECTION_PAUSE_MS}")
@@ -359,16 +368,16 @@ def spin_x_back_and_forth(
         _raw_gcode(sock, "SET_KINEMATIC_POSITION X=0 Y=0")
 
         _drain_socket(sock)
-        print(f"    Cycle {i}/{cycles}: forward 360deg (both) ...", end="", flush=True)
+        logger.info("Cycle %d/%d: forward 360deg (both) ...", i, cycles)
         _raw_gcode(sock, f"G1 X{one_rev:.1f} F{feedrate:.0f}")
-        print(" done")
+        logger.info("done")
 
         _raw_gcode(sock, f"G4 P{DIRECTION_PAUSE_MS}")
         _drain_socket(sock)
 
-        print(f"    Cycle {i}/{cycles}: reverse 360deg (both) ...", end="", flush=True)
+        logger.info("Cycle %d/%d: reverse 360deg (both) ...", i, cycles)
         _raw_gcode(sock, f"G1 X0 F{feedrate:.0f}")
-        print(" done")
+        logger.info("done")
 
         if i < cycles:
             _raw_gcode(sock, f"G4 P{DIRECTION_PAUSE_MS}")
@@ -432,15 +441,17 @@ def query_endstops(sock: socket.socket, debug: bool = False) -> dict[str, str]:
     )
 
     if debug:
-        print(f"\n  [DEBUG] objects/query raw response: {json.dumps(resp, indent=2)}")
+        logger.debug("objects/query raw response: %s", json.dumps(resp, indent=2))
 
     results: dict[str, str] = {}
     status = resp.get("result", {}).get("status", {})
     last_query = status.get("query_endstops", {}).get("last_query", {})
 
     if debug and not last_query:
-        print("  [DEBUG] last_query is empty -- objects/query may have returned "
-              "a stale notification instead of the actual response.")
+        logger.debug(
+            "last_query is empty -- objects/query may have returned "
+            "a stale notification instead of the actual response.",
+        )
 
     # With cartesian kinematics, keys are "x", "y", "z" (not
     # "manual_stepper motor_y").  Normalise to consistent names.
@@ -460,7 +471,7 @@ def _stdin_has_data() -> bool:
     """Check if stdin has data ready (non-blocking)."""
     try:
         return bool(select.select([sys.stdin], [], [], 0.0)[0])
-    except Exception:
+    except (OSError, ValueError):
         return False
 
 
@@ -472,7 +483,7 @@ def diagnose_mcu(sock: socket.socket) -> None:
     was compiled for the correct MCU (STM32H723) and whether GPIO
     pins are accessible.
     """
-    print("  --- MCU Firmware Diagnostic ---")
+    logger.info("--- MCU Firmware Diagnostic ---")
 
     # Query MCU object for version/build info
     _drain_socket(sock)
@@ -491,22 +502,27 @@ def diagnose_mcu(sock: socket.socket) -> None:
         mcu_name = constants.get("MCU", "unknown")
         freq = constants.get("CLOCK_FREQ", 0)
 
-        print(f"    MCU type:      {mcu_name}")
-        print(f"    Clock freq:    {freq:,} Hz" if freq else "    Clock freq:    unknown")
-        print(f"    FW version:    {version}")
-        print(f"    Build:         {str(build)[:80]}")
+        logger.info("MCU type:      %s", mcu_name)
+        if freq:
+            logger.info("Clock freq:    %s Hz", f"{freq:,}")
+        else:
+            logger.info("Clock freq:    unknown")
+        logger.info("FW version:    %s", version)
+        logger.info("Build:         %s", str(build)[:80])
 
         # Check if it's actually H723
         if "stm32h723" in str(mcu_name).lower():
-            print("    [OK] Firmware is built for STM32H723")
+            logger.info("Firmware is built for STM32H723")
         elif "stm32" in str(mcu_name).lower():
-            print(f"    [!!] Firmware is for {mcu_name}, NOT H723!")
-            print("         This could cause wrong pin mappings.")
+            logger.warning(
+                "Firmware is for %s, NOT H723! "
+                "This could cause wrong pin mappings.", mcu_name,
+            )
         else:
-            print(f"    [??] Could not confirm MCU type: {mcu_name}")
+            logger.info("MCU type:      %s", mcu_name)
 
-    except Exception as exc:
-        print(f"    [!!] Failed to query MCU info: {exc}")
+    except (OSError, socket.timeout, json.JSONDecodeError, KeyError) as exc:
+        logger.error("Failed to query MCU info: %s", exc)
 
     # Query configfile to see loaded endstop pins
     _drain_socket(sock)
@@ -519,18 +535,16 @@ def diagnose_mcu(sock: socket.socket) -> None:
         )
         config = resp.get("result", {}).get("status", {}).get("configfile", {}).get("config", {})
 
-        print()
-        print("    Loaded endstop pins from config:")
+        logger.info("Loaded endstop pins from config:")
         for section_name, section_data in config.items():
             if section_name.startswith(("stepper_", "manual_stepper")):
                 ep = section_data.get("endstop_pin", None)
                 if ep:
-                    print(f"      [{section_name}] endstop_pin = {ep}")
+                    logger.info("  [%s] endstop_pin = %s", section_name, ep)
 
-    except Exception as exc:
-        print(f"    [!!] Failed to query config: {exc}")
+    except (OSError, socket.timeout, json.JSONDecodeError, KeyError) as exc:
+        logger.error("Failed to query config: %s", exc)
 
-    print()
 
 
 def run_endstop_test(sock: socket.socket) -> bool:
@@ -542,27 +556,23 @@ def run_endstop_test(sock: socket.socket) -> bool:
 
     Returns True if all endstops passed.
     """
-    print()
-    print("=" * 60)
-    print("  PHASE 4: ENDSTOP VERIFICATION")
-    print("=" * 60)
-    print()
-    print("  Press each endstop when prompted.  The test auto-advances")
-    print("  once it detects the OPEN -> TRIGGERED transition.")
-    print("  Press Enter to skip a stuck endstop.")
-    print()
+    logger.info("=" * 60)
+    logger.info("  PHASE 4: ENDSTOP VERIFICATION")
+    logger.info("=" * 60)
+    logger.info("  Press each endstop when prompted.  The test auto-advances")
+    logger.info("  once it detects the OPEN -> TRIGGERED transition.")
+    logger.info("  Press Enter to skip a stuck endstop.")
 
     # Discover endstop key names from Klipper (varies by kinematics).
     # cartesian: "x", "y", "z"  or  "stepper_x", "stepper_y", "stepper_z"
     # manual_stepper: "manual_stepper motor_y", etc.
     try:
         initial = query_endstops(sock)
-    except Exception as exc:
-        print(f"  !! Could not query endstops: {exc}")
+    except (OSError, socket.timeout, json.JSONDecodeError) as exc:
+        logger.error("Could not query endstops: %s", exc)
         return False
 
-    print(f"  Detected endstop keys: {list(initial.keys())}")
-    print()
+    logger.info("Detected endstop keys: %s", list(initial.keys()))
 
     # Find the key that corresponds to X and Y endstops
     def _find_key(states: dict[str, str], axis: str) -> str | None:
@@ -583,13 +593,13 @@ def run_endstop_test(sock: socket.socket) -> bool:
     z_key = _find_key(initial, "z")
 
     if not x_key:
-        print(f"  !! No X endstop key found in: {list(initial.keys())}")
+        logger.error("No X endstop key found in: %s", list(initial.keys()))
         return False
     if not y_key:
-        print(f"  !! No Y endstop key found in: {list(initial.keys())}")
+        logger.error("No Y endstop key found in: %s", list(initial.keys()))
         return False
     if not z_key:
-        print(f"  !! No Z endstop key found in: {list(initial.keys())}")
+        logger.error("No Z endstop key found in: %s", list(initial.keys()))
         return False
 
     endstops_to_test = [
@@ -601,8 +611,8 @@ def run_endstop_test(sock: socket.socket) -> bool:
     all_pass = True
 
     for endstop_name, description in endstops_to_test:
-        print(f"  >> {description}  [key: {endstop_name}]")
-        print(f"     Release the switch, then press it.")
+        logger.info(">> %s  [key: %s]", description, endstop_name)
+        logger.info("Release the switch, then press it.")
 
         saw_open = False
         saw_triggered = False
@@ -610,8 +620,8 @@ def run_endstop_test(sock: socket.socket) -> bool:
         while True:
             try:
                 states = query_endstops(sock)
-            except Exception as exc:
-                print(f"\r     !! Query error: {exc}                    ")
+            except (OSError, socket.timeout, json.JSONDecodeError) as exc:
+                logger.error("Query error: %s", exc)
                 time.sleep(1.0)
                 continue
 
@@ -631,29 +641,26 @@ def run_endstop_test(sock: socket.socket) -> bool:
 
             # Auto-advance: saw both states (open then triggered)
             if saw_open and saw_triggered:
-                print(f"\n     PASS  {endstop_name}")
+                logger.info("PASS  %s", endstop_name)
                 break
 
             # Allow Enter to skip
             if _stdin_has_data():
                 sys.stdin.readline()
-                print()
                 if saw_open and not saw_triggered:
-                    print(f"     FAIL  {endstop_name}: saw OPEN but never TRIGGERED")
+                    logger.warning("FAIL  %s: saw OPEN but never TRIGGERED", endstop_name)
                 elif saw_triggered and not saw_open:
-                    print(f"     FAIL  {endstop_name}: always TRIGGERED, never OPEN")
+                    logger.warning("FAIL  %s: always TRIGGERED, never OPEN", endstop_name)
                 else:
-                    print(f"     SKIP  {endstop_name}")
+                    logger.info("SKIP  %s", endstop_name)
                 all_pass = False
                 break
 
             time.sleep(0.3)
 
-        print()
 
     tag = "ALL PASSED" if all_pass else "SOME FAILED"
-    print(f"  ENDSTOP RESULT: {tag}")
-    print()
+    logger.info("ENDSTOP RESULT: %s", tag)
     return all_pass
 
 
@@ -676,44 +683,41 @@ def home_all(sock: socket.socket) -> bool:
       Y = 200 (endstop at max,  workspace 0..200)
       Z = 80  (endstop at max,  workspace 0..80)
     """
-    print()
-    print("=" * 60)
-    print("  PHASE 5: HOMING  (G28 X Y, then G28 Z at reduced speed)")
-    print("=" * 60)
-    print()
+    logger.info("=" * 60)
+    logger.info("  PHASE 5: HOMING  (G28 X Y, then G28 Z at reduced speed)")
+    logger.info("=" * 60)
 
     # Home X and Y first (faster, 16 mm/s)
-    print("  Homing X (both motors) and Y ...")
+    logger.info("  Homing X (both motors) and Y ...")
     ok_xy = _raw_gcode(sock, "G28 X Y", timeout=60.0)
     if ok_xy:
-        print(f"    Homed OK  X=0  Y={WORKSPACE_Y_MM}")
+        logger.info("Homed OK  X=0  Y=%s", WORKSPACE_Y_MM)
     else:
-        print("    XY homing FAILED")
-        print()
+        logger.info("    XY homing FAILED")
         return False
 
     # Home Z separately (slower due to delicate limit switch)
-    print(f"  Homing Z (seesaw, {Z_HOMING_SPEED} mm/s) ...")
+    logger.info("Homing Z (seesaw, %s mm/s) ...", Z_HOMING_SPEED)
     ok_z = _raw_gcode(sock, "G28 Z", timeout=60.0)
     if not ok_z:
-        print("    Z homing FAILED")
-        print()
+        logger.info("    Z homing FAILED")
         return False
 
     # Retract Z from the hard stop (position 80) to safe limit.
     # After homing to max, the carriage sits right at the physical end
     # of travel.  Back off immediately to avoid stressing the belt.
-    print(f"    Homed OK  Z={WORKSPACE_Z_MM:.0f}, "
-          f"retracting to {Z_MAX_SAFE:.0f} ...")
+    logger.info("Homed OK  Z=%.0f, retracting to %.0f ...", WORKSPACE_Z_MM, Z_MAX_SAFE)
     move_z(sock, Z_MAX_SAFE, feedrate=600.0)
     _raw_gcode(sock, "M400")  # wait for retract to physically complete
-    print(f"    Workspace: 0..{WORKSPACE_X_MM:.0f} mm (X)  x  "
-          f"0..{WORKSPACE_Y_MM:.0f} mm (Y)  x  "
-          f"0..{WORKSPACE_Z_MM:.0f} mm (Z)")
-    print(f"    Z safe range: {Z_MIN_SAFE:.0f}..{Z_MAX_SAFE:.0f} mm "
-          f"({Z_BUFFER_MM:.0f} mm buffer each side)")
+    logger.info(
+        "Workspace: 0..%.0f mm (X)  x  0..%.0f mm (Y)  x  0..%.0f mm (Z)",
+        WORKSPACE_X_MM, WORKSPACE_Y_MM, WORKSPACE_Z_MM,
+    )
+    logger.info(
+        "Z safe range: %.0f..%.0f mm (%.0f mm buffer each side)",
+        Z_MIN_SAFE, Z_MAX_SAFE, Z_BUFFER_MM,
+    )
 
-    print()
     return True
 
 
@@ -811,8 +815,10 @@ def draw_circle(
     z_hi = min(z_center + z_amplitude, Z_MAX_SAFE) if use_z else 0.0
 
     z_tag = f"  Z: {z_lo:.0f} to {z_hi:.0f} mm" if use_z else ""
-    print(f"  Drawing circle: centre=({center_x},{center_y}) "
-          f"r={radius} mm  {speed_mmps:.0f} mm/s  (G2 arcs){z_tag}")
+    logger.info(
+        "Drawing circle: centre=(%s,%s) r=%s mm  %.0f mm/s  (G2 arcs)%s",
+        center_x, center_y, radius, speed_mmps, z_tag,
+    )
 
     # Move ALL axes to start position in a single G1 so they travel
     # simultaneously (3 o'clock position, Z at low end of oscillation).
@@ -846,7 +852,7 @@ def draw_circle(
         f"I{radius:.2f} J0 F{feedrate:.0f}",
     )
 
-    print(f"    circle done")
+    logger.info("circle done")
 
 
 def run_limit_reach_test(sock: socket.socket) -> None:
@@ -870,18 +876,14 @@ def run_limit_reach_test(sock: socket.socket) -> None:
     cy = WORKSPACE_Y_MM / 2.0
     feedrate = 12000.0  # 200 mm/s
 
-    print()
-    print("=" * 60)
-    print("  PHASE 5b: LIMIT REACH TEST (each axis, both sides)")
-    print("=" * 60)
-    print()
-    print(f"  Margin: {MARGIN:.0f} mm from each limit")
-    print(f"    X: {x_lo:.0f} .. {x_hi:.0f} mm")
-    print(f"    Y: {y_lo:.0f} .. {y_hi:.0f} mm")
-    print(f"    Z: {z_lo:.0f} .. {z_hi:.0f} mm")
-    print()
-    print("  Press Enter at any time to skip remaining moves.")
-    print()
+    logger.info("=" * 60)
+    logger.info("  PHASE 5b: LIMIT REACH TEST (each axis, both sides)")
+    logger.info("=" * 60)
+    logger.info("Margin: %.0f mm from each limit", MARGIN)
+    logger.info("  X: %.0f .. %.0f mm", x_lo, x_hi)
+    logger.info("  Y: %.0f .. %.0f mm", y_lo, y_hi)
+    logger.info("  Z: %.0f .. %.0f mm", z_lo, z_hi)
+    logger.info("  Press Enter at any time to skip remaining moves.")
 
     skipped = False
 
@@ -893,7 +895,7 @@ def run_limit_reach_test(sock: socket.socket) -> None:
         return False
 
     # Start from workspace centre
-    print("  Moving to centre ...")
+    logger.info("  Moving to centre ...")
     move_xyz(sock, cx, cy, Z_CENTER, feedrate)
     _raw_gcode(sock, "M400")
 
@@ -911,19 +913,18 @@ def run_limit_reach_test(sock: socket.socket) -> None:
         if _check_skip():
             skipped = True
             break
-        print(f"  {label} ...")
+        logger.info("%s ...", label)
         move_xyz(sock, mx, my, mz, feedrate)
         _raw_gcode(sock, "M400")
 
     if skipped:
-        print("  [SKIP] Remaining limit moves skipped by operator.")
+        logger.info("  [SKIP] Remaining limit moves skipped by operator.")
 
     # Always return to centre before next phase
-    print("  Returning to centre ...")
+    logger.info("  Returning to centre ...")
     move_xyz(sock, cx, cy, Z_CENTER, feedrate)
     _raw_gcode(sock, "M400")
-    print("    Done.")
-    print()
+    logger.info("    Done.")
 
 
 def run_motion_test(sock: socket.socket) -> None:
@@ -934,11 +935,9 @@ def run_motion_test(sock: socket.socket) -> None:
     its safe range via linear Z interpolation inside the G2 arcs.
     All three axes move simultaneously -- no sequential moves.
     """
-    print()
-    print("=" * 60)
-    print("  PHASE 6: HELICAL CIRCLE TEST (XY + Z)")
-    print("=" * 60)
-    print()
+    logger.info("=" * 60)
+    logger.info("  PHASE 6: HELICAL CIRCLE TEST (XY + Z)")
+    logger.info("=" * 60)
 
     cx = WORKSPACE_X_MM / 2.0
     cy = WORKSPACE_Y_MM / 2.0
@@ -952,45 +951,43 @@ def run_motion_test(sock: socket.socket) -> None:
     z_amp = Z_CENTER - Z_MIN_SAFE  # 35 mm -> range 5..75 mm
 
     # Move all three axes to workspace centre simultaneously
-    print(f"  Moving to workspace centre "
-          f"({cx:.0f}, {cy:.0f}, Z={Z_CENTER:.0f}) ...")
+    logger.info(
+        "Moving to workspace centre (%.0f, %.0f, Z=%.0f) ...",
+        cx, cy, Z_CENTER,
+    )
     move_xyz(sock, cx, cy, Z_CENTER, feedrate=3600.0)
     _raw_gcode(sock, "M400")  # wait for physical move to complete
-    print("    Arrived.")
-    print()
+    logger.info("    Arrived.")
 
-    print(f"  Z back-and-forth: {Z_MIN_SAFE:.0f}..{Z_MAX_SAFE:.0f} mm "
-          f"({Z_MAX_SAFE - Z_MIN_SAFE:.0f} mm per half-circle)")
-    print()
+    logger.info(
+        "Z back-and-forth: %.0f..%.0f mm (%.0f mm per half-circle)",
+        Z_MIN_SAFE, Z_MAX_SAFE, Z_MAX_SAFE - Z_MIN_SAFE,
+    )
 
     # --- Slow verification circle (XYZ) ---
-    print("  --- Slow helical circle (32 mm/s) ---")
+    logger.info("  --- Slow helical circle (32 mm/s) ---")
     draw_circle(
         sock, cx, cy, radius, feedrate=1920.0,
         z_center=Z_CENTER, z_amplitude=z_amp,
     )
-    print()
 
     # --- Speed ramp (XYZ) ---
     ramp_speeds = [100, 200, 320, 440, 500, 560, 620]  # mm/s
-    print(f"  --- Speed ramp: {ramp_speeds} mm/s  (G2 arcs + Z) ---")
-    print(f"  (Ctrl-C to abort if motion becomes rough)")
-    print()
+    logger.info("--- Speed ramp: %s mm/s  (G2 arcs + Z) ---", ramp_speeds)
+    logger.info("(Ctrl-C to abort if motion becomes rough)")
 
     for speed in ramp_speeds:
         feedrate = speed * 60.0
-        print(f"  --- {speed} mm/s ---")
+        logger.info("--- %d mm/s ---", speed)
         draw_circle(
             sock, cx, cy, radius, feedrate=feedrate,
             z_center=Z_CENTER, z_amplitude=z_amp,
         )
-        print()
 
     # Return all axes to centre simultaneously
-    print("  Returning to centre ...")
+    logger.info("  Returning to centre ...")
     move_xyz(sock, cx, cy, Z_CENTER, feedrate=3600.0)
-    print("    Done.")
-    print()
+    logger.info("    Done.")
 
 
 # ---------------------------------------------------------------------------
@@ -1029,31 +1026,33 @@ def main() -> None:
         help="Don't overwrite printer.cfg (assume correct config is loaded)",
     )
     args = parser.parse_args()
+    setup_logging()
 
     rps = args.speed / ROTATION_DISTANCE
 
-    print("=" * 60)
-    print("  HARDWARE BRING-UP TEST")
-    print("=" * 60)
-    print()
-    print("  Motor parameters:")
-    print(f"    rotation_distance:  {ROTATION_DISTANCE} mm/rev")
-    print(f"    microsteps:         {MICROSTEPS}  (must match DM542TE DIP)")
-    print(f"    step_pulse:         {STEP_PULSE_DURATION} s (5 us)")
+    logger.info("=" * 60)
+    logger.info("  HARDWARE BRING-UP TEST")
+    logger.info("=" * 60)
+    logger.info("  Motor parameters:")
+    logger.info("  rotation_distance:  %s mm/rev", ROTATION_DISTANCE)
+    logger.info("  microsteps:         %s  (must match DM542TE DIP)", MICROSTEPS)
+    logger.info("  step_pulse:         %s s (5 us)", STEP_PULSE_DURATION)
     full_steps = _CFG.steppers.full_steps_per_rotation
-    print(f"    pulses/rev:         {full_steps * MICROSTEPS}  "
-          f"({full_steps} full-steps x {MICROSTEPS})")
-    print(f"    test speed:         {args.speed} mm/s ({rps:.2f} RPS)")
-    print(f"    direction pause:    {DIRECTION_PAUSE_MS} ms")
-    print(f"    cycles:             {args.cycles} back-and-forth")
-    print(f"    endstop polarity:   from machine.yaml")
-    print()
-    print("  Workspace (from machine.yaml):")
-    print(f"    X: 0 .. {WORKSPACE_X_MM:.0f} mm")
-    print(f"    Y: 0 .. {WORKSPACE_Y_MM:.0f} mm")
-    print(f"    Z: 0 .. {WORKSPACE_Z_MM:.0f} mm  "
-          f"(safe: {Z_MIN_SAFE:.0f} .. {Z_MAX_SAFE:.0f} mm)")
-    print()
+    logger.info(
+        "  pulses/rev:         %d  (%d full-steps x %d)",
+        full_steps * MICROSTEPS, full_steps, MICROSTEPS,
+    )
+    logger.info("  test speed:         %s mm/s (%.2f RPS)", args.speed, rps)
+    logger.info("  direction pause:    %d ms", DIRECTION_PAUSE_MS)
+    logger.info("  cycles:             %d back-and-forth", args.cycles)
+    logger.info("  endstop polarity:   from machine.yaml")
+    logger.info("  Workspace (from machine.yaml):")
+    logger.info("  X: 0 .. %.0f mm", WORKSPACE_X_MM)
+    logger.info("  Y: 0 .. %.0f mm", WORKSPACE_Y_MM)
+    logger.info(
+        "  Z: 0 .. %.0f mm  (safe: %.0f .. %.0f mm)",
+        WORKSPACE_Z_MM, Z_MIN_SAFE, Z_MAX_SAFE,
+    )
 
     # --- Write test config and restart Klipper ----------------------------
     if not args.no_config_write:
@@ -1061,20 +1060,18 @@ def main() -> None:
         if PRINTER_CFG_PATH.exists():
             backup = PRINTER_CFG_PATH.with_suffix(".cfg.bak")
             PRINTER_CFG_PATH.rename(backup)
-            print(f"  Backed up existing printer.cfg -> {backup}")
+            logger.info("Backed up existing printer.cfg -> %s", backup)
 
         config_text = generate_test_config()
         PRINTER_CFG_PATH.write_text(config_text)
-        print(f"  Wrote test printer.cfg to {PRINTER_CFG_PATH}")
-        print()
+        logger.info("Wrote test printer.cfg to %s", PRINTER_CFG_PATH)
 
-        print("  Restarting Klipper to load test config...")
+        logger.info("  Restarting Klipper to load test config...")
         restart_klipper()
 
-    print("  Waiting for Klipper to become ready...")
+    logger.info("  Waiting for Klipper to become ready...")
     sock = _wait_for_ready(timeout=30.0)
-    print("  [OK] Klipper is ready")
-    print()
+    logger.info("  [OK] Klipper is ready")
 
     # --- MCU diagnostic: verify firmware matches the board -----------------
     diagnose_mcu(sock)
@@ -1083,84 +1080,76 @@ def main() -> None:
         if not args.skip_to_homing:
             # --- Phase 1: Motor 0 (Y) ------------------------------------
             if not args.endstops_only:
-                print("=" * 60)
-                print("  PHASE 1: Motor 0 (Y axis = stepper_y)")
-                print("  Pins: step=PF13  dir=PF12  enable=PF14")
-                print("  Uses FORCE_MOVE for individual stepper test")
-                print("=" * 60)
-                print()
+                logger.info("=" * 60)
+                logger.info("  PHASE 1: Motor 0 (Y axis = stepper_y)")
+                logger.info("  Pins: step=PF13  dir=PF12  enable=PF14")
+                logger.info("  Uses FORCE_MOVE for individual stepper test")
+                logger.info("=" * 60)
 
                 spin_single_stepper(sock, "stepper_y", args.cycles, args.speed)
-                print()
-                print("  Motor 0 test complete.")
-                print()
+                logger.info("  Motor 0 test complete.")
 
                 # --- Phase 2: Motor 1 (Z seesaw = stepper_z) --------------
                 z_quarter_turn = ROTATION_DISTANCE / 4.0  # 8 mm
                 if not args.skip_motor1:
-                    print()
-                    print("=" * 60)
-                    print("  PHASE 2: Motor 1 (DRIVER_1 = stepper_z seesaw)")
-                    print("  Pins: step=PG0  dir=PG1  enable=PF15")
-                    print("  Endstop: PG10 (DIAG2)")
-                    print(f"  Total travel: {WORKSPACE_Z_MM:.0f} mm, "
-                          f"safe range: {Z_MIN_SAFE:.0f} to {Z_MAX_SAFE:.0f} mm")
-                    print(f"  Using quarter-turn ({z_quarter_turn:.0f} mm) "
-                          f"due to limited travel")
-                    print("=" * 60)
-                    print()
-                    print("  WARNING: Centre the Z seesaw manually before running!")
-                    print(f"  FORCE_MOVE will travel +/-{z_quarter_turn} mm "
-                          f"(90deg).")
-                    print()
+                    logger.info("=" * 60)
+                    logger.info("  PHASE 2: Motor 1 (DRIVER_1 = stepper_z seesaw)")
+                    logger.info("  Pins: step=PG0  dir=PG1  enable=PF15")
+                    logger.info("  Endstop: PG10 (DIAG2)")
+                    logger.info(
+                        "Total travel: %.0f mm, safe range: %.0f to %.0f mm",
+                        WORKSPACE_Z_MM, Z_MIN_SAFE, Z_MAX_SAFE,
+                    )
+                    logger.info(
+                        "Using quarter-turn (%.0f mm) due to limited travel",
+                        z_quarter_turn,
+                    )
+                    logger.info("=" * 60)
+                    logger.info("  WARNING: Centre the Z seesaw manually before running!")
+                    logger.warning(
+                        "Centre the Z seesaw manually before running! "
+                        "FORCE_MOVE will travel +/-%.0f mm (90deg).",
+                        z_quarter_turn,
+                    )
 
                     spin_single_stepper(
                         sock, "stepper_z", args.cycles, args.speed,
                         distance=z_quarter_turn,
                     )
-                    print()
-                    print("  Motor 1 (Z seesaw) test complete.")
-                    print("  Verify: both effectors moved in opposite directions.")
-                    print()
+                    logger.info("  Motor 1 (Z seesaw) test complete.")
+                    logger.info("  Verify: both effectors moved in opposite directions.")
                 else:
-                    print()
-                    print("  [SKIP] Motor 1 / Z seesaw (--skip-motor1)")
-                    print()
+                    logger.info("  [SKIP] Motor 1 / Z seesaw (--skip-motor1)")
 
                 # --- Phase 3: Motor 2_1 + 2_2 (X dual, same rail) --------
-                print()
-                print("=" * 60)
-                print("  PHASE 3: Motor 2_1 + 2_2 (X axis, stepper_x + stepper_x1)")
-                print("  stepper_x  (primary):  step=PF11  dir=PG3   enable=PG5")
-                print("  stepper_x1 (secondary): step=PG4   dir=!PC1  enable=PA0")
-                print("  Both on same Klipper rail -- always move together")
-                print("=" * 60)
-                print()
+                logger.info("=" * 60)
+                logger.info("  PHASE 3: Motor 2_1 + 2_2 (X axis, stepper_x + stepper_x1)")
+                logger.info("  stepper_x  (primary):  step=PF11  dir=PG3   enable=PG5")
+                logger.info("  stepper_x1 (secondary): step=PG4   dir=!PC1  enable=PA0")
+                logger.info("  Both on same Klipper rail -- always move together")
+                logger.info("=" * 60)
 
                 _drain_socket(sock)
                 spin_x_back_and_forth(sock, args.cycles, args.speed)
 
                 _drain_socket(sock)
-                print()
-                print("  Motor 2_1 + 2_2 test complete.")
-                print()
+                logger.info("  Motor 2_1 + 2_2 test complete.")
 
             # --- Phase 4: Endstop verification ----------------------------
             endstops_ok = run_endstop_test(sock)
 
             if not endstops_ok:
-                print("  Endstop verification failed -- skipping homing & motion.")
-                print("  Fix endstops and re-run.")
+                logger.info("  Endstop verification failed -- skipping homing & motion.")
+                logger.info("  Fix endstops and re-run.")
                 return
         else:
-            print("  [SKIP] Phases 1-4 (--skip-to-homing)")
-            print()
+            logger.info("  [SKIP] Phases 1-4 (--skip-to-homing)")
 
         # --- Phase 5: Homing (G28 X Y) -----------------------------------
         homed = home_all(sock)
 
         if not homed:
-            print("  Homing failed -- skipping limit reach & circle test.")
+            logger.info("  Homing failed -- skipping limit reach & circle test.")
         else:
             # --- Phase 5b: Limit reach test -------------------------------
             run_limit_reach_test(sock)
@@ -1172,7 +1161,7 @@ def main() -> None:
             _raw_gcode(sock, "M18")  # disable all steppers
 
     except KeyboardInterrupt:
-        print("\n\n  Interrupted -- disabling all motors...")
+        logger.warning("Interrupted -- disabling all motors...")
         try:
             # Fire-and-forget: send M18 without waiting for Klipper's
             # response so Ctrl-C exits immediately instead of blocking
@@ -1186,46 +1175,43 @@ def main() -> None:
             )
             sock.settimeout(1.0)
             sock.sendall(payload)
-        except Exception:
+        except OSError:
             pass
 
     finally:
         sock.close()
 
     # --- Summary ----------------------------------------------------------
-    print("=" * 60)
-    print("  TEST COMPLETE")
-    print("=" * 60)
-    print()
-    print("  Checklist:")
-    print("    [ ] Motor 0 (Y): spun smoothly in both directions?")
+    logger.info("=" * 60)
+    logger.info("  TEST COMPLETE")
+    logger.info("=" * 60)
+    logger.info("  Checklist:")
+    logger.info("    [ ] Motor 0 (Y): spun smoothly in both directions?")
     if not args.skip_motor1:
-        print("    [ ] Motor 1 (Z): spun smoothly? Both effectors moved "
+        logger.info("    [ ] Motor 1 (Z): spun smoothly? Both effectors moved "
               "opposite?")
-    print("    [ ] Motor 2_1+2_2 (X): both spun together, same direction?")
-    print("    [ ] X endstop: open when released, TRIGGERED when pressed?")
-    print("    [ ] Y endstop: open when released, TRIGGERED when pressed?")
-    print("    [ ] Z endstop: open when released, TRIGGERED when pressed?")
-    print("    [ ] G28 X Y: both X motors homed and stopped at endstop?")
-    print("    [ ] G28 Z: Z homed at reduced speed, stopped at endstop?")
-    print("    [ ] Limit reach: all axes reached within 10 mm of both limits?")
-    print("    [ ] Circles: XY smooth at all speeds?")
-    print("    [ ] Helical: Z oscillated smoothly during circles?")
-    print()
+    logger.info("    [ ] Motor 2_1+2_2 (X): both spun together, same direction?")
+    logger.info("    [ ] X endstop: open when released, TRIGGERED when pressed?")
+    logger.info("    [ ] Y endstop: open when released, TRIGGERED when pressed?")
+    logger.info("    [ ] Z endstop: open when released, TRIGGERED when pressed?")
+    logger.info("    [ ] G28 X Y: both X motors homed and stopped at endstop?")
+    logger.info("    [ ] G28 Z: Z homed at reduced speed, stopped at endstop?")
+    logger.info("    [ ] Limit reach: all axes reached within 10 mm of both limits?")
+    logger.info("    [ ] Circles: XY smooth at all speeds?")
+    logger.info("    [ ] Helical: Z oscillated smoothly during circles?")
 
     if not args.no_config_write:
         backup = PRINTER_CFG_PATH.with_suffix(".cfg.bak")
         if backup.exists():
-            print(f"  To restore your production config:")
-            print(f"    mv {backup} {PRINTER_CFG_PATH}")
-            print()
+            logger.info("To restore your production config:")
+            logger.info("  mv %s %s", backup, PRINTER_CFG_PATH)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:
-        print(f"\n  ERROR: {exc}")
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.error("Fatal error: %s", exc)
         # Emergency: fire-and-forget M18 with short timeout
         try:
             _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

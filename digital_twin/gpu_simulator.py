@@ -404,6 +404,35 @@ class GPUStampSimulator:
         )
 
     # -----------------------------------------------------------------
+    # Public accessors for calibration state
+    # -----------------------------------------------------------------
+
+    @property
+    def cal(self) -> validators.CalibrationV1:
+        """The loaded calibration model."""
+        return self._cal
+
+    @property
+    def dpi_x(self) -> float:
+        """Horizontal pixels-per-mm derived from canvas width and work area."""
+        return self._dpi_x
+
+    @property
+    def dpi_y(self) -> float:
+        """Vertical pixels-per-mm derived from canvas height and work area."""
+        return self._dpi_y
+
+    @property
+    def canvas_width(self) -> int:
+        """Canvas width in pixels."""
+        return self._W
+
+    @property
+    def canvas_height(self) -> int:
+        """Canvas height in pixels."""
+        return self._H
+
+    # -----------------------------------------------------------------
     # Color-LUT loader
     # -----------------------------------------------------------------
     def _load_color_lut(self) -> torch.Tensor:
@@ -1370,7 +1399,7 @@ class GPUStampSimulator:
 
         # measure simulated width (pixels where luminance < paper - 0.05)
         pw_lum = _lum_tensor(self._paper_white)
-        col_lum = 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2]
+        col_lum = color_utils._REC709_R * col[0] + color_utils._REC709_G * col[1] + color_utils._REC709_B * col[2]
         dark_mask = col_lum < (pw_lum - 0.05)
         if dark_mask.any():
             dark_indices = dark_mask.nonzero(as_tuple=True)[0]
@@ -1585,9 +1614,9 @@ class GPUStampSimulator:
         px_mid_x = int(wa_x * 0.5 * self._dpi_x)
         col_slice = canvas[0, :, :, px_mid_x].cpu().numpy()
         lum = (
-            0.2126 * col_slice[0]
-            + 0.7152 * col_slice[1]
-            + 0.0722 * col_slice[2]
+            color_utils._REC709_R * col_slice[0]
+            + color_utils._REC709_G * col_slice[1]
+            + color_utils._REC709_B * col_slice[2]
         )
         y_px = np.arange(len(lum))
         y_mm = y_px / self._dpi_y
@@ -1669,13 +1698,13 @@ class GPUStampSimulator:
 
 def _lum(rgb) -> float:
     """Rec.709 luminance from an RGB tuple, list, or tensor."""
-    return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+    return color_utils._REC709_R * rgb[0] + color_utils._REC709_G * rgb[1] + color_utils._REC709_B * rgb[2]
 
 
 def _lum_tensor(rgb: torch.Tensor) -> float:
     """Rec.709 luminance from a (3,) tensor."""
     return float(
-        0.2126 * rgb[0].item()
-        + 0.7152 * rgb[1].item()
-        + 0.0722 * rgb[2].item()
+        color_utils._REC709_R * rgb[0].item()
+        + color_utils._REC709_G * rgb[1].item()
+        + color_utils._REC709_B * rgb[2].item()
     )

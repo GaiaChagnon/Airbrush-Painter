@@ -10,6 +10,7 @@ Speed in **mm/s**.
 
 from __future__ import annotations
 
+import atexit
 import json
 import select
 import socket
@@ -27,6 +28,21 @@ if TYPE_CHECKING:
     )
 
 ETX = b"\x03"
+
+# Size of the socket recv buffer (bytes)
+_SOCKET_RECV_BUFFER_SIZE = 4096
+
+# Default pump acceleration for move commands (mm/s^2)
+_DEFAULT_PUMP_ACCEL_MM_S2 = 100.0
+
+# Pump acceleration during homing and backlash purge (mm/s^2)
+_HOMING_ACCEL_MM_S2 = 50.0
+
+# Extra travel beyond plunger stroke to ensure limit switch is reached (mm)
+_HOMING_OVERSHOOT_MM = 5.0
+
+# Delay after QUERY_ENDSTOPS to allow response propagation (seconds)
+_ENDSTOP_QUERY_DELAY_S = 0.3
 
 _KLIPPY_ENV = Path.home() / "klippy-env" / "bin" / "python"
 _KLIPPY_PY = Path.home() / "klipper" / "klippy" / "klippy.py"
@@ -87,7 +103,7 @@ def raw_send(
             remaining = max(0.05, deadline - time.monotonic())
             sock.settimeout(remaining)
             try:
-                chunk = sock.recv(4096)
+                chunk = sock.recv(_SOCKET_RECV_BUFFER_SIZE)
                 if not chunk:
                     break
                 buf += chunk
@@ -117,7 +133,7 @@ def drain_socket(sock: socket.socket, duration: float = 0.2) -> None:
     while time.monotonic() < deadline:
         sock.settimeout(max(0.05, deadline - time.monotonic()))
         try:
-            data = sock.recv(4096)
+            data = sock.recv(_SOCKET_RECV_BUFFER_SIZE)
             if not data:
                 break
         except socket.timeout:
@@ -147,11 +163,10 @@ def raw_gcode(
 def klipper_is_alive(socket_path: str) -> bool:
     """Return True if a Klipper process owns the UDS socket."""
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(2.0)
-        s.connect(socket_path)
-        s.close()
-        return True
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(2.0)
+            s.connect(socket_path)
+            return True
     except OSError:
         return False
 
@@ -192,6 +207,8 @@ def launch_klipper(socket_path: str) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    proc = _spawned_klipper_proc  # local ref for closure
+    atexit.register(lambda: proc.terminate() if proc.poll() is None else None)
     time.sleep(3.0)
 
 
@@ -232,6 +249,7 @@ def wait_for_ready(
     restart_attempted = False
 
     while time.monotonic() < deadline:
+        sock: socket.socket | None = None
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(5.0)
@@ -242,7 +260,7 @@ def wait_for_ready(
             state_msg = result.get("state_message", "")
 
             if state == "ready":
-                return sock
+                return sock  # NOTE: Caller owns the socket from here.
 
             if state in ("error", "shutdown") and not restart_attempted:
                 restart_attempted = True
@@ -250,15 +268,21 @@ def wait_for_ready(
                 print("  Attempting FIRMWARE_RESTART...")
                 try:
                     raw_gcode(sock, "FIRMWARE_RESTART")
-                except Exception:
+                except (OSError, ValueError):
                     pass
                 sock.close()
+                sock = None
                 time.sleep(5.0)
                 continue
 
             sock.close()
+            sock = None
         except (OSError, json.JSONDecodeError, KeyError):
-            pass
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
         time.sleep(1.0)
 
     raise RuntimeError(f"Klipper did not become ready within {timeout}s")
@@ -267,21 +291,20 @@ def wait_for_ready(
 def emergency_disable(socket_path: str, pump_id: str) -> None:
     """Fire-and-forget motor disable for emergency shutdown."""
     try:
-        _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        _sock.settimeout(2.0)
-        _sock.connect(socket_path)
-        payload = (
-            json.dumps({
-                "id": 9999,
-                "method": "gcode/script",
-                "params": {
-                    "script": f"MANUAL_STEPPER STEPPER={pump_id} ENABLE=0",
-                },
-            }).encode()
-            + ETX
-        )
-        _sock.sendall(payload)
-        _sock.close()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as _sock:
+            _sock.settimeout(2.0)
+            _sock.connect(socket_path)
+            payload = (
+                json.dumps({
+                    "id": 9999,
+                    "method": "gcode/script",
+                    "params": {
+                        "script": f"MANUAL_STEPPER STEPPER={pump_id} ENABLE=0",
+                    },
+                }).encode()
+                + ETX
+            )
+            _sock.sendall(payload)
     except OSError:
         pass
 
@@ -337,7 +360,7 @@ def pump_move(
     pump_id: str,
     position: float,
     speed: float,
-    accel: float = 100.0,
+    accel: float = _DEFAULT_PUMP_ACCEL_MM_S2,
     stop_on_endstop: int = 0,
     sync: bool = True,
     timeout: float = 60.0,
@@ -395,7 +418,7 @@ def pump_home(
     backoff = pump_cfg.home_backoff_mm
     h_dir = pump_cfg.homing_direction
 
-    homing_target = h_dir * (travel + 5.0)
+    homing_target = h_dir * (travel + _HOMING_OVERSHOOT_MM)
     dir_label = "positive" if h_dir > 0 else "negative"
     print(f"    Homing: moving {dir_label} toward limit switch "
           f"at {homing_speed} mm/s ...")
@@ -403,7 +426,7 @@ def pump_home(
         sock, pump_id,
         position=homing_target,
         speed=homing_speed,
-        accel=50.0,
+        accel=_HOMING_ACCEL_MM_S2,
         stop_on_endstop=1,
         timeout=60.0,
     )
@@ -417,7 +440,7 @@ def pump_home(
     if backoff > 0:
         backoff_pos = -h_dir * backoff
         print(f"    Backing off {backoff:.1f} mm ...")
-        pump_move(sock, pump_id, position=backoff_pos, speed=1.0, accel=50.0)
+        pump_move(sock, pump_id, position=backoff_pos, speed=1.0, accel=_HOMING_ACCEL_MM_S2)
         pump_set_position(sock, pump_id, 0.0)
         print("    Position reset to 0.0 mm (after backoff)")
 
@@ -448,7 +471,7 @@ def pump_home_with_backlash(
         dsign = -pump_cfg.homing_direction
         purge_pos = dsign * backlash_mm
         print(f"    Backlash purge: advancing {backlash_mm:.2f} mm ...")
-        pump_move(sock, pump_id, position=purge_pos, speed=1.0, accel=50.0)
+        pump_move(sock, pump_id, position=purge_pos, speed=1.0, accel=_HOMING_ACCEL_MM_S2)
         pump_set_position(sock, pump_id, 0.0)
         print("    Position reset to 0.0 mm (backlash eliminated)")
 
@@ -484,7 +507,7 @@ def query_pump_endstop(
     """
     drain_socket(sock)
     raw_gcode(sock, "QUERY_ENDSTOPS")
-    time.sleep(0.3)
+    time.sleep(_ENDSTOP_QUERY_DELAY_S)
     drain_socket(sock)
 
     resp = raw_send(
@@ -513,5 +536,5 @@ def stdin_has_data() -> bool:
     """Check if stdin has data ready (non-blocking)."""
     try:
         return bool(select.select([sys.stdin], [], [], 0.0)[0])
-    except Exception:
+    except (OSError, ValueError):
         return False

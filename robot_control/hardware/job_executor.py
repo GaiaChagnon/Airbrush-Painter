@@ -122,7 +122,7 @@ class JobExecutor:
         if self._progress_cb is not None:
             try:
                 self._progress_cb(self._progress)
-            except Exception as exc:  # noqa: BLE001
+            except (TypeError, ValueError, KeyError) as exc:
                 logger.error("Progress callback error: %s", exc)
 
     # ------------------------------------------------------------------
@@ -296,5 +296,5 @@ class JobExecutor:
             self._client.send_gcode(
                 f"G0 Z{z_travel:.3f} F{f_val:.1f}\nM400",
             )
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, TimeoutError, ValueError) as exc:
             logger.warning("Could not raise tool after cancel: %s", exc)

@@ -29,6 +29,24 @@ logger = logging.getLogger(__name__)
 # ETX byte terminates each JSON message in the Klipper API protocol
 ETX = b"\x03"
 
+# Size of the socket recv buffer (bytes)
+_SOCKET_RECV_BUFFER_SIZE = 4096
+
+# Timeout for FIRMWARE_RESTART command during reconnect (seconds)
+_FIRMWARE_RESTART_TIMEOUT_S = 10.0
+
+# Maximum time to wait for Klipper to reach 'ready' after reconnect (seconds)
+_READY_POLL_TIMEOUT_S = 30.0
+
+# Socket poll interval for drain/subscription reads (seconds)
+_DRAIN_POLL_INTERVAL_S = 0.5
+
+# Polling interval when waiting for toolhead idle (seconds)
+_IDLE_POLL_INTERVAL_S = 0.1
+
+# Pause after restart command to allow Klipper to reinitialise (seconds)
+_RESTART_SETTLE_S = 2.0
+
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -265,13 +283,13 @@ class KlipperClient:
                     self._send_request(
                         "gcode/script",
                         {"script": "FIRMWARE_RESTART"},
-                        timeout=10.0,
+                        timeout=_FIRMWARE_RESTART_TIMEOUT_S,
                     )
                 except KlipperError:
                     pass  # May error during restart; that's fine
 
                 # Wait for Klipper to become ready
-                if self._wait_for_ready(timeout=30.0):
+                if self._wait_for_ready(timeout=_READY_POLL_TIMEOUT_S):
                     logger.info("Reconnected successfully")
                     self._resubscribe()
                     return
@@ -377,7 +395,7 @@ class KlipperClient:
 
             # Read until a complete message is buffered
             while ETX not in self._recv_buffer:
-                chunk = self._sock.recv(4096)  # type: ignore[union-attr]
+                chunk = self._sock.recv(_SOCKET_RECV_BUFFER_SIZE)  # type: ignore[union-attr]
                 if not chunk:
                     raise ConnectionResetError("Connection closed by server")
                 self._recv_buffer += chunk
@@ -401,14 +419,14 @@ class KlipperClient:
             if "method" in msg and self._sub_callback is not None:
                 try:
                     self._sub_callback(msg.get("params", {}))
-                except Exception as exc:  # noqa: BLE001
+                except (TypeError, ValueError, KeyError) as exc:
                     logger.error("Subscription callback error: %s", exc)
 
     # ------------------------------------------------------------------
     # Readiness polling (used during reconnect)
     # ------------------------------------------------------------------
 
-    def _wait_for_ready(self, timeout: float = 30.0) -> bool:
+    def _wait_for_ready(self, timeout: float = _READY_POLL_TIMEOUT_S) -> bool:
         """Poll ``info`` until Klipper reports *ready* or *timeout*."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -547,17 +565,17 @@ class KlipperClient:
                 if "method" in msg and self._sub_callback is not None:
                     try:
                         self._sub_callback(msg.get("params", {}))
-                    except Exception:  # noqa: BLE001
+                    except (TypeError, ValueError, KeyError):
                         pass
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             self._sock.settimeout(  # type: ignore[union-attr]
-                min(0.5, remaining),
+                min(_DRAIN_POLL_INTERVAL_S, remaining),
             )
             try:
-                chunk = self._sock.recv(4096)  # type: ignore[union-attr]
+                chunk = self._sock.recv(_SOCKET_RECV_BUFFER_SIZE)  # type: ignore[union-attr]
                 if not chunk:
                     break
                 self._recv_buffer += chunk
@@ -586,7 +604,7 @@ class KlipperClient:
             self._send_request("gcode/restart", {})
         except KlipperError:
             pass  # May error during restart transition
-        time.sleep(2.0)
+        time.sleep(_RESTART_SETTLE_S)
 
     # ------------------------------------------------------------------
     # State queries
@@ -661,7 +679,7 @@ class KlipperClient:
                 raise TimeoutError(
                     f"Toolhead not idle after {timeout}s"
                 )
-            time.sleep(0.1)
+            time.sleep(_IDLE_POLL_INTERVAL_S)
 
     # ------------------------------------------------------------------
     # Subscriptions
@@ -710,9 +728,9 @@ class KlipperClient:
             try:
                 if self._sock is None or self._sub_callback is None:
                     break
-                self._sock.settimeout(0.1)
+                self._sock.settimeout(_IDLE_POLL_INTERVAL_S)
                 try:
-                    chunk = self._sock.recv(4096)
+                    chunk = self._sock.recv(_SOCKET_RECV_BUFFER_SIZE)
                     if not chunk:
                         # Server closed -- attempt reconnect
                         if self.auto_reconnect:
@@ -730,13 +748,13 @@ class KlipperClient:
                                 self._sub_callback(
                                     msg.get("params", {}),
                                 )
-                        except (json.JSONDecodeError, Exception) as exc:
+                        except (json.JSONDecodeError, TypeError, KeyError) as exc:
                             logger.warning(
                                 "Subscription parse error: %s", exc,
                             )
                 except socket.timeout:
                     pass
-            except Exception as exc:  # noqa: BLE001
+            except (OSError, json.JSONDecodeError, ConnectionError) as exc:
                 if not self._stop_sub.is_set():
                     logger.error("Subscription loop error: %s", exc)
                 break

@@ -24,7 +24,7 @@ import datetime
 import logging
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import questionary
@@ -34,6 +34,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from src.utils import color as color_utils, validators
+from src.utils.logging_config import setup_logging
 from src.utils.validators import CalibrationV1
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,7 @@ def ask_float(
     prompt: str,
     min_val: float = -1e30,
     max_val: float = 1e30,
-    default: Optional[float] = None,
+    default: float | None = None,
 ) -> float:
     """Prompt for a float with range validation and re-prompt on error."""
     default_str = f" [{default}]" if default is not None else ""
@@ -77,7 +78,7 @@ def ask_float(
         return val
 
 
-def ask_rgb(prompt: str) -> Tuple[float, float, float]:
+def ask_rgb(prompt: str) -> tuple[float, float, float]:
     """Prompt for an RGB triplet (space or comma separated), each in [0,1]."""
     while True:
         raw = questionary.text(f"{prompt} (R G B in [0,1]):").ask()
@@ -100,7 +101,7 @@ def ask_rgb(prompt: str) -> Tuple[float, float, float]:
         return vals  # type: ignore[return-value]
 
 
-def ask_cmy(prompt: str) -> Tuple[float, float, float]:
+def ask_cmy(prompt: str) -> tuple[float, float, float]:
     """Prompt for a CMY triplet, same parsing as ``ask_rgb``."""
     while True:
         raw = questionary.text(f"{prompt} (C M Y in [0,1]):").ask()
@@ -142,7 +143,7 @@ def _format_value(v: Any) -> str:
 def confirm_values(
     console: Console,
     label: str,
-    data: Dict[str, Any],
+    data: dict[str, Any],
 ) -> bool:
     """Show a Rich table of entered values and ask for confirmation."""
     table = Table(title=label)
@@ -293,7 +294,7 @@ def block_dot_sheet(session: CalibrationSession) -> None:
 
 def _fit_dots(
     session: CalibrationSession,
-    dots: Dict[str, Any],
+    dots: dict[str, Any],
     cal_dict: Dict,
 ) -> None:
     """Fit radius_lut_mm from measured dot diameters."""
@@ -333,7 +334,7 @@ def _fit_dots(
 
 def _fit_profile_from_dots(
     session: CalibrationSession,
-    dots: Dict[str, Any],
+    dots: dict[str, Any],
     cal_dict: Dict,
 ) -> None:
     """Estimate profile shape from centre/mid/edge darkness ratios.
@@ -359,7 +360,7 @@ def _fit_profile_from_dots(
     target_center, target_mid, target_edge = avg
 
     best_err = float("inf")
-    best_params: Dict[str, float] = {}
+    best_params: dict[str, float] = {}
 
     for cf in np.linspace(0.15, 0.60, 10):
         for sf in np.linspace(0.10, 0.60, 10):
@@ -421,7 +422,7 @@ def _fit_profile_from_dots(
 
 def _lum(rgb) -> float:
     """Rec.709 luminance from an RGB tuple or list."""
-    return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+    return color_utils._REC709_R * rgb[0] + color_utils._REC709_G * rgb[1] + color_utils._REC709_B * rgb[2]
 
 
 # ============================================================================
@@ -497,7 +498,7 @@ def block_line_sheet(session: CalibrationSession) -> None:
 
 def _fit_lines(
     session: CalibrationSession,
-    lines: Dict[str, Any],
+    lines: dict[str, Any],
     cal_dict: Dict,
 ) -> None:
     """Fit mass_lut from measured line centre darkness.
@@ -521,9 +522,9 @@ def _fit_lines(
     max_step = cal_dict["sampling"]["max_step_mm"]
     margin = cal_dict["profile"].get("margin_factor", 1.5)
 
-    z_pts: List[float] = []
-    v_pts: List[float] = []
-    mass_pts: List[float] = []
+    z_pts: list[float] = []
+    v_pts: list[float] = []
+    mass_pts: list[float] = []
 
     for line in lines.values():
         bg_lum = _lum(line["background_rgb"])
@@ -536,9 +537,9 @@ def _fit_lines(
         # actual paint luminance from subtractive model
         cmy = line["color_recipe_cmy"]
         paint_lum = (
-            0.2126 * (1.0 - cmy[0])
-            + 0.7152 * (1.0 - cmy[1])
-            + 0.0722 * (1.0 - cmy[2])
+            color_utils._REC709_R * (1.0 - cmy[0])
+            + color_utils._REC709_G * (1.0 - cmy[1])
+            + color_utils._REC709_B * (1.0 - cmy[2])
         )
 
         # adaptive ds matching the renderer's rule
@@ -693,7 +694,7 @@ def block_color_swatches(session: CalibrationSession) -> None:
 
 def _fit_swatches(
     session: CalibrationSession,
-    swatches: Dict[str, Any],
+    swatches: dict[str, Any],
     cal_dict: Dict,
 ) -> None:
     """Build a color LUT from measured swatches.
@@ -721,7 +722,7 @@ def _fit_swatches(
     pw = np.array(cal_dict["paper_white_rgb"])
     alpha_eff, n_passes = _estimate_fill_alpha(cal_dict)
 
-    measured_points: List[Tuple[List[float], np.ndarray]] = []
+    measured_points: list[tuple[list[float], np.ndarray]] = []
     for sw in swatches.values():
         cmy = sw["cmy_command"]
         interior = np.array(sw["interior_rgb"])
@@ -799,7 +800,7 @@ def _fit_swatches(
     )
 
 
-def _estimate_fill_alpha(cal_dict: Dict) -> Tuple[float, int]:
+def _estimate_fill_alpha(cal_dict: Dict) -> tuple[float, int]:
     """Estimate per-stamp centre alpha and pass count for a dense fill.
 
     Uses the preview defaults (z, speed) and the mass_lut to compute
@@ -965,7 +966,7 @@ def block_layering(session: CalibrationSession) -> None:
 
 def _validate_layering(
     session: CalibrationSession,
-    overlaps: Dict[str, Any],
+    overlaps: dict[str, Any],
     cal_dict: Dict,
 ) -> None:
     """Compare simulated overlap RGB to measured for each pattern.
@@ -975,7 +976,7 @@ def _validate_layering(
     The combined overlap is compared to each entered overlap_rgb.
     """
     sim = session.simulator
-    delta_es: List[float] = []
+    delta_es: list[float] = []
 
     table = Table(title="Layering Validation")
     table.add_column("Pattern")
@@ -1068,11 +1069,11 @@ def _render_fill_band(
     sim, canvas: torch.Tensor, cmy: list, band_half: float = 10.0,
 ) -> torch.Tensor:
     """Render a dense horizontal fill band centred on the canvas."""
-    ps = sim._cal.preview_settings
+    ps = sim.cal.preview_settings
     fill_z = ps.default_z_mm
     fill_speed = ps.default_speed_mm_s
-    cx = sim._cal.render.work_area_mm[0] / 2
-    cy = sim._cal.render.work_area_mm[1] / 2
+    cx = sim.cal.render.work_area_mm[0] / 2
+    cy = sim.cal.render.work_area_mm[1] / 2
     line_len = 30.0
     line_spacing = 0.5
 
@@ -1098,17 +1099,17 @@ def _render_fill_band(
 
 def _sample_centre(sim, canvas: torch.Tensor) -> torch.Tensor:
     """Sample a small patch at the canvas centre and return mean RGB."""
-    cx = sim._cal.render.work_area_mm[0] / 2
-    cy = sim._cal.render.work_area_mm[1] / 2
-    px_x = int(cx * sim._dpi_x)
-    px_y = int(cy * sim._dpi_y)
-    px_x = min(max(px_x, 0), sim._W - 1)
-    px_y = min(max(px_y, 0), sim._H - 1)
+    cx = sim.cal.render.work_area_mm[0] / 2
+    cy = sim.cal.render.work_area_mm[1] / 2
+    px_x = int(cx * sim.dpi_x)
+    px_y = int(cy * sim.dpi_y)
+    px_x = min(max(px_x, 0), sim.canvas_width - 1)
+    px_y = min(max(px_y, 0), sim.canvas_height - 1)
     r = 2
     y0 = max(px_y - r, 0)
-    y1 = min(px_y + r + 1, sim._H)
+    y1 = min(px_y + r + 1, sim.canvas_height)
     x0 = max(px_x - r, 0)
-    x1 = min(px_x + r + 1, sim._W)
+    x1 = min(px_x + r + 1, sim.canvas_width)
     return canvas[0, :, y0:y1, x0:x1].mean(dim=(1, 2))
 
 
@@ -1138,7 +1139,7 @@ def block_preview_validate(session: CalibrationSession) -> None:
     table = sim.summary_table()
     session.console.print(table)
 
-    all_de: List[float] = []
+    all_de: list[float] = []
     for block_data in results.values():
         for entry in block_data.values():
             all_de.append(entry["delta_e"])
@@ -1211,12 +1212,12 @@ def _save_canvas_png(canvas: torch.Tensor, path: Path) -> None:
 # ============================================================================
 
 def dot_matrix_pattern(
-    z_values: List[float],
-    color_cmy: Tuple[float, float, float] = (0.8, 0.2, 0.1),
+    z_values: list[float],
+    color_cmy: tuple[float, float, float] = (0.8, 0.2, 0.1),
     spacing_mm: float = 20.0,
     n_repeats: int = 3,
     speed: float = 60.0,
-) -> List[Dict]:
+) -> list[Dict]:
     """Generate stroke descriptors for a dot matrix calibration sheet.
 
     Returns list of stroke dicts (tiny-length strokes -> isolated dots).
@@ -1241,12 +1242,12 @@ def dot_matrix_pattern(
 
 
 def line_matrix_pattern(
-    z_values: List[float],
-    speed_values: List[float],
-    color_cmy: Tuple[float, float, float] = (0.8, 0.2, 0.1),
+    z_values: list[float],
+    speed_values: list[float],
+    color_cmy: tuple[float, float, float] = (0.8, 0.2, 0.1),
     length_mm: float = 40.0,
     spacing_mm: float = 20.0,
-) -> List[Dict]:
+) -> list[Dict]:
     """Generate stroke descriptors for a line matrix calibration sheet."""
     strokes = []
     c, m, y = color_cmy
@@ -1271,12 +1272,12 @@ def line_matrix_pattern(
 
 
 def color_swatch_pattern(
-    cmy_recipes: List[Tuple[float, float, float]],
+    cmy_recipes: list[tuple[float, float, float]],
     swatch_size_mm: float = 15.0,
     fill_speed: float = 30.0,
     fill_z: float = 6.0,
     line_spacing_mm: float = 0.5,
-) -> List[Dict]:
+) -> list[Dict]:
     """Generate dense-fill strokes for color swatches."""
     strokes = []
     margin = 10.0
@@ -1304,13 +1305,13 @@ def color_swatch_pattern(
 
 
 def layering_staircase_pattern(
-    colors: List[Tuple[float, float, float]],
+    colors: list[tuple[float, float, float]],
     rect_size_mm: float = 30.0,
     overlap_mm: float = 15.0,
     fill_speed: float = 30.0,
     fill_z: float = 6.0,
     line_spacing_mm: float = 0.5,
-) -> List[Dict]:
+) -> list[Dict]:
     """Generate nested-rectangle strokes for layering validation."""
     strokes = []
     margin = 10.0
@@ -1338,8 +1339,9 @@ def layering_staircase_pattern(
 # Main menu
 # ============================================================================
 
-def main(cal_path: Optional[str] = None) -> None:
+def main(cal_path: str | None = None) -> None:
     """Launch the calibration wizard."""
+    setup_logging()
     console = Console()
     console.clear()
     console.print(Panel(

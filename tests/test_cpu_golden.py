@@ -383,7 +383,7 @@ def compute_metrics(
     painted_mask = alpha_test > 0.01
     if painted_mask.any():
         L_white = 1.0  # white canvas luminance
-        L_test = 0.2126 * canvas_test[..., 0] + 0.7152 * canvas_test[..., 1] + 0.0722 * canvas_test[..., 2]
+        L_test = color_utils._REC709_R * canvas_test[..., 0] + color_utils._REC709_G * canvas_test[..., 1] + color_utils._REC709_B * canvas_test[..., 2]
         L_painted = L_test[painted_mask].mean()
         center_drop = float(L_white - L_painted)
     else:
@@ -575,7 +575,7 @@ def test_visibility_sanity(renderer, blank_canvas):
     painted_mask = alpha > 0.1
     assert painted_mask.any(), "No pixels with alpha > 0.1"
     
-    L = 0.2126 * canvas[..., 0] + 0.7152 * canvas[..., 1] + 0.0722 * canvas[..., 2]
+    L = color_utils._REC709_R * canvas[..., 0] + color_utils._REC709_G * canvas[..., 1] + color_utils._REC709_B * canvas[..., 2]
     L_painted = L[painted_mask].mean()
     drop = 1.0 - L_painted
     

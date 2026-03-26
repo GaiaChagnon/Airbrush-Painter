@@ -9,6 +9,7 @@ All distance values are in **millimetres**.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -224,7 +225,7 @@ def calculate_tool_offset(
 
 
 def binary_search_z(
-    prompt_fn: callable,
+    prompt_fn: Callable[[float], bool],
     z_min: float,
     z_max: float,
     tolerance: float = 0.05,
@@ -233,7 +234,7 @@ def binary_search_z(
 
     Parameters
     ----------
-    prompt_fn : callable
+    prompt_fn : Callable[[float], bool]
         ``prompt_fn(z) -> bool`` -- move to Z and ask user "is the tool
         touching?" Returns ``True`` if touching.
     z_min, z_max : float
