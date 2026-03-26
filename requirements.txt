@@ -25,8 +25,8 @@ pyclipper>=1.3.0,<2.0.0
 # Vectorization & line-art tracing
 pypotrace>=0.3.0,<1.0.0
 vpype>=1.14.0,<2.0.0
-hatched @ git+https://github.com/plottertools/hatched.git@267a082
-vpype-flow-imager[all] @ git+https://github.com/serycjon/vpype-flow-imager.git@e580530
+hatched @ git+https://github.com/plottertools/hatched.git@f31db1f713ddec820641e677646fc3c568446997
+vpype-flow-imager[all] @ git+https://github.com/serycjon/vpype-flow-imager.git@ae0a3144d171289e61e800208682b451b8e1bf6a
 
 # Testing
 pytest>=8.0.0,<9.0.0
