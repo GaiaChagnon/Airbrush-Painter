@@ -23,6 +23,14 @@ line_tracing:
   simplify_tol_mm: 0.05              # Douglas-Peucker tolerance (mm)
   min_path_mm: 0.5                   # Drop paths shorter than this (mm)
   threshold: null                    # Binary threshold 0-255; null = default 128
+  adaptive_threshold: false          # Use Gaussian adaptive threshold instead of
+                                     # global.  Better for anti-aliased text/lines
+                                     # and images with uneven brightness.
+  adaptive_block_size: 15            # Neighbourhood size (px, odd, >= 3).  Larger
+                                     # values handle slow brightness gradients;
+                                     # smaller values preserve thin features.
+  adaptive_c: 4                      # Constant subtracted from local mean.
+                                     # Higher = more conservative (fewer black px).
 
 # --- Hatched mode (hatched library + vpype) ----------------------------------
 # Best for: photos, portraits, illustrations, grayscale art.

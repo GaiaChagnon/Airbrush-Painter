@@ -46,6 +46,12 @@ _RAW_CONNECT_TIMEOUT_S = 45.0
 # Maximum time to wait for Klipper recovery from shutdown (seconds)
 _SHUTDOWN_RECOVERY_TIMEOUT_S = 30.0
 
+# Maximum time to wait for Klipper to become ready after a restart (seconds)
+_POST_RESTART_READY_TIMEOUT_S = 60.0
+
+# Settling time after FIRMWARE_RESTART before polling again (seconds)
+_FIRMWARE_RESTART_SETTLE_S = 5.0
+
 
 class KlipperConnectionManager:
     """Manages Klipper connectivity for all CLI modes.
@@ -114,7 +120,18 @@ class KlipperConnectionManager:
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
-        """Connect the high-level KlipperClient."""
+        """Connect the high-level ``KlipperClient``.
+
+        If the initial connection attempt fails (e.g. Klipper is still
+        settling after a restart), falls back to the robust
+        ``_wait_for_klipper_ready`` loop -- which includes
+        ``FIRMWARE_RESTART`` recovery -- before retrying.
+
+        Raises
+        ------
+        KlipperConnectionError
+            If Klipper is unreachable after all retries and fallback.
+        """
         cfg = self._cfg
         self._client = KlipperClient(
             socket_path=cfg.connection.socket_path,
@@ -126,8 +143,23 @@ class KlipperConnectionManager:
         try:
             self._client.connect()
         except KlipperShutdown:
-            self._console.print("[yellow]Klipper is in shutdown -- attempting recovery...[/]")
+            self._console.print(
+                "[yellow]Klipper is in shutdown"
+                " -- attempting recovery...[/]"
+            )
             self._recover_from_shutdown()
+        except KlipperConnectionError:
+            # KlipperClient exhausted its short retry window; use the
+            # robust wait (with FIRMWARE_RESTART fallback) then retry.
+            self._console.print(
+                "[yellow]  Connection failed -- waiting for"
+                " Klipper with extended timeout...[/]"
+            )
+            if not self._wait_for_klipper_ready(
+                timeout=_POST_RESTART_READY_TIMEOUT_S,
+            ):
+                raise
+            self._client.connect()
 
         with self._lock:
             self._connected = True
@@ -302,35 +334,84 @@ class KlipperConnectionManager:
         raise RuntimeError(f"Could not recover Klipper from shutdown within {_SHUTDOWN_RECOVERY_TIMEOUT_S} s")
 
     def _restart_klipper(self) -> None:
-        """Send RESTART and wait for ready."""
-        self._console.print("  Restarting Klipper...")
-        sp = self._cfg.connection.socket_path
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(5.0)
-                sock.connect(sp)
-                payload = json.dumps({
-                    "id": 1, "method": "gcode/script",
-                    "params": {"script": "RESTART"},
-                }).encode() + ETX
-                sock.sendall(payload)
-        except OSError:
-            pass
-        time.sleep(3.0)
-        self._wait_for_klipper_ready(timeout=60.0)
-        self._console.print("  [green]Klipper ready.[/]")
+        """Restart Klipper, launching fresh if the process is dead.
 
-    def _wait_for_klipper_ready(self, timeout: float = 60.0) -> None:
-        """Poll Klipper until state is 'ready' or timeout."""
+        Uses ``pump_control.klipper_is_alive`` to detect whether
+        Klipper is reachable.  If not, spawns it via
+        ``pump_control.launch_klipper`` instead of sending a no-op
+        RESTART to a nonexistent socket.
+
+        Raises
+        ------
+        KlipperConnectionError
+            If Klipper does not become ready within the timeout.
+        """
+        from robot_control.hardware.pump_control import (
+            klipper_is_alive,
+            launch_klipper,
+        )
+
+        sp = self._cfg.connection.socket_path
+
+        if klipper_is_alive(sp):
+            self._console.print("  Restarting Klipper...")
+            try:
+                with socket.socket(
+                    socket.AF_UNIX, socket.SOCK_STREAM
+                ) as sock:
+                    sock.settimeout(5.0)
+                    sock.connect(sp)
+                    payload = json.dumps({
+                        "id": 1,
+                        "method": "gcode/script",
+                        "params": {"script": "RESTART"},
+                    }).encode() + ETX
+                    sock.sendall(payload)
+            except OSError:
+                pass
+            time.sleep(3.0)
+        else:
+            self._console.print(
+                "  Klipper is not running -- launching fresh..."
+            )
+            launch_klipper(sp)
+
+        ready = self._wait_for_klipper_ready(
+            timeout=_POST_RESTART_READY_TIMEOUT_S,
+        )
+        if ready:
+            self._console.print("  [green]Klipper ready.[/]")
+        else:
+            raise KlipperConnectionError(
+                f"Klipper did not become ready within"
+                f" {_POST_RESTART_READY_TIMEOUT_S}s after restart."
+                f" Check ~/printer_data/logs/klippy.log"
+            )
+
+    def _wait_for_klipper_ready(self, timeout: float = 60.0) -> bool:
+        """Poll Klipper until state is ``'ready'`` or *timeout*.
+
+        Attempts ``FIRMWARE_RESTART`` once if Klipper reports ``error``
+        or ``shutdown``, mirroring the recovery logic in
+        ``pump_control.wait_for_ready``.
+
+        Returns
+        -------
+        bool
+            ``True`` if Klipper reached ``ready``, ``False`` on timeout.
+        """
         sp = self._cfg.connection.socket_path
         deadline = time.monotonic() + timeout
+        firmware_restart_attempted = False
 
         while time.monotonic() < deadline:
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                     sock.settimeout(5.0)
                     sock.connect(sp)
-                    payload = json.dumps({"id": 1, "method": "info", "params": {}}).encode() + ETX
+                    payload = json.dumps(
+                        {"id": 1, "method": "info", "params": {}}
+                    ).encode() + ETX
                     sock.sendall(payload)
                     buf = b""
                     while ETX not in buf:
@@ -341,13 +422,52 @@ class KlipperConnectionManager:
                     if ETX in buf:
                         frame = buf[:buf.index(ETX)]
                         msg = json.loads(frame.decode())
-                        state = msg.get("result", {}).get("state", "unknown")
+                        result = msg.get("result", {})
+                        state = result.get("state", "unknown")
+
                         if state == "ready":
-                            return
+                            return True
+
+                        if (
+                            state in ("error", "shutdown")
+                            and not firmware_restart_attempted
+                        ):
+                            firmware_restart_attempted = True
+                            state_msg = result.get(
+                                "state_message", ""
+                            )[:80]
+                            self._console.print(
+                                f"  Klipper state: {state}"
+                                f" -- {state_msg}"
+                            )
+                            self._console.print(
+                                "  Attempting FIRMWARE_RESTART..."
+                            )
+                            self._send_firmware_restart(sp)
+                            time.sleep(_FIRMWARE_RESTART_SETTLE_S)
+                            continue
             except OSError:
                 pass
             time.sleep(1.0)
 
         self._console.print(
-            f"[yellow]  WARNING: Klipper did not become ready within {timeout}s[/]"
+            f"[yellow]  WARNING: Klipper did not become ready"
+            f" within {timeout}s[/]"
         )
+        return False    @staticmethod
+    def _send_firmware_restart(socket_path: str) -> None:
+        """Send ``FIRMWARE_RESTART`` via a throwaway UDS socket."""
+        try:
+            with socket.socket(
+                socket.AF_UNIX, socket.SOCK_STREAM
+            ) as sock:
+                sock.settimeout(5.0)
+                sock.connect(socket_path)
+                payload = json.dumps({
+                    "id": 1,
+                    "method": "gcode/script",
+                    "params": {"script": "FIRMWARE_RESTART"},
+                }).encode() + ETX
+                sock.sendall(payload)
+        except OSError:
+            pass

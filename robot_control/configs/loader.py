@@ -377,6 +377,9 @@ class PumpsConfig:
     manifold_purge_volume_ml: float = 0.5
     refill_valve_output: str = ""
     refill_valve_delay_s: float = 1.0
+    needle_output: str = ""
+    air_valve_output: str = ""
+    needle_servo_delay_s: float = 0.5
     enforce_travel_limits: bool = True
 
 
@@ -699,6 +702,9 @@ def _parse_pumps(data: dict[str, Any]) -> PumpsConfig | None:
         ),
         refill_valve_output=str(data.get("refill_valve_output", "")),
         refill_valve_delay_s=float(data.get("refill_valve_delay_s", 1.0)),
+        needle_output=str(data.get("needle_output", "")),
+        air_valve_output=str(data.get("air_valve_output", "")),
+        needle_servo_delay_s=float(data.get("needle_servo_delay_s", 0.5)),
         enforce_travel_limits=bool(data.get("enforce_travel_limits", True)),
     )
 

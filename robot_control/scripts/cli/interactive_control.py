@@ -130,6 +130,56 @@ class _InteractiveJogController:
     def jog_increment(self) -> float:
         return self._increments[self._inc_idx]
 
+    # ------------------------------------------------------------------
+    # Needle safety interlock
+    # ------------------------------------------------------------------
+
+    def _resolve_needle_output(self) -> str:
+        """Return the Klipper output_pin name for the airbrush needle."""
+        if self._cfg.pumps and self._cfg.pumps.needle_output:
+            return self._cfg.pumps.needle_output
+        if self._cfg.digital_outputs:
+            for name in self._cfg.digital_outputs:
+                if "needle" in name.lower():
+                    return name
+        return ""
+
+    def _ensure_needle_for_dispense(self) -> None:
+        """Hard safety interlock: needle must be open before any fluid output.
+
+        Sends SET_PIN to retract the needle and waits for the servo
+        transit delay.  Idempotent -- skips if already retracted.
+        """
+        name = self._resolve_needle_output()
+        if not name:
+            return
+        if self._output_states.get(name, False):
+            return
+        if self._safe_gcode(f"SET_PIN PIN={name} VALUE=1", timeout=5.0):
+            self._output_states[name] = True
+            delay = (
+                self._cfg.pumps.needle_servo_delay_s
+                if self._cfg.pumps else 0.5
+            )
+            time.sleep(delay)
+            self._log.log_action("interactive", "needle_open", "auto")
+
+    def _ensure_needle_for_fill(self) -> None:
+        """Safety interlock: needle must be closed during syringe fill."""
+        name = self._resolve_needle_output()
+        if not name:
+            return
+        if not self._output_states.get(name, False):
+            return
+        if self._safe_gcode(f"SET_PIN PIN={name} VALUE=0", timeout=5.0):
+            self._output_states[name] = False
+            delay = (
+                self._cfg.pumps.needle_servo_delay_s
+                if self._cfg.pumps else 0.5
+            )
+            time.sleep(delay)
+            self._log.log_action("interactive", "needle_close", "auto")
+
     def run(self) -> None:
         """Main loop: Rich Live display + readchar input."""
         if not os.isatty(sys.stdin.fileno()):
@@ -212,7 +262,10 @@ class _InteractiveJogController:
                     }
             valve_open = self._output_states.get("servo_pump_refill", False)
             needle_ret = self._output_states.get("servo_airbrush_needle", False)
-            parts.append(pump_diagram(pump_states, valve_open, needle_ret))
+            air_open = self._output_states.get("air_valve", False)
+            parts.append(
+                pump_diagram(pump_states, valve_open, needle_ret, air_open)
+            )
         parts.extend([status_p, keys_p, status_bar])
         return Group(*parts)
 
@@ -417,6 +470,7 @@ class _InteractiveJogController:
         motor = self._cfg.pumps.motors.get(self._active_pump)
         if not motor:
             return
+        self._ensure_needle_for_dispense()
         sign = -motor.homing_direction
         self._pump_move(sign * self.jog_increment)
 
@@ -427,6 +481,7 @@ class _InteractiveJogController:
         motor = self._cfg.pumps.motors.get(self._active_pump)
         if not motor:
             return
+        self._ensure_needle_for_fill()
         sign = motor.homing_direction
         self._pump_move(sign * self.jog_increment)
 
@@ -442,7 +497,10 @@ class _InteractiveJogController:
         h_dir = motor.homing_direction
         backlash = self._cfg.pumps.backlash_purge_mm if self._cfg.pumps else 0.3
         travel = motor.syringe.plunger_travel_mm
+        backoff = motor.home_backoff_mm
+        dsign = -h_dir
 
+        self._ensure_needle_for_fill()
         self._status = f"Homing {pid}..."
         home_cmd = (
             f"MANUAL_STEPPER STEPPER={pid} ENABLE=1\n"
@@ -454,22 +512,30 @@ class _InteractiveJogController:
         if not self._safe_gcode(home_cmd, timeout=60.0):
             return
 
-        backoff = motor.home_backoff_mm
-        dsign = -h_dir
-        purge_cmd = (
+        backoff_cmd = (
             f"MANUAL_STEPPER STEPPER={pid}"
             f" MOVE={-h_dir * backoff:.4f} SPEED=1.0 ACCEL=100.0\n"
-            f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0\n"
+            f"M400\n"
+            f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0"
+        )
+        if not self._safe_gcode(backoff_cmd, timeout=30.0):
+            return
+
+        self._ensure_needle_for_dispense()
+        purge_cmd = (
             f"MANUAL_STEPPER STEPPER={pid}"
-            f" MOVE={dsign * backlash:.4f} SPEED=1.0 ACCEL=100.0\n"
+            f" MOVE={dsign * backlash:.4f} SPEED=1.0 ACCEL=50.0\n"
+            f"M400\n"
             f"MANUAL_STEPPER STEPPER={pid} SET_POSITION=0\n"
             f"MANUAL_STEPPER STEPPER={pid} ENABLE=0"
         )
-        if self._safe_gcode(purge_cmd, timeout=60.0):
+        if self._safe_gcode(purge_cmd, timeout=30.0):
             self._pump_positions[pid] = 0.0
             self._pump_homed[pid] = True
             self._status = f"{pid} homed"
             self._log.log_action("interactive", "pump_home", pid)
+
+        self._ensure_needle_for_fill()
 
     def _goto_position(self, live: Live) -> None:
         """Pause readchar, prompt with questionary, then resume."""

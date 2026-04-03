@@ -16,7 +16,9 @@ import datetime
 import io
 import socket
 import sys
+import termios
 import time
+import tty
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -65,6 +67,13 @@ _MANUAL_CAL_PATH = (
 )
 
 _MAX_LOG_PANEL_LINES = 8
+
+# Stepper acceleration used for backlash purge moves (mm/s^2).
+# Matches the value in pump_control._HOMING_ACCEL_MM_S2.
+_BACKLASH_ACCEL_MM_S2 = 50.0
+
+# Default airbrush flow rate for calibration (µl/s).
+_DEFAULT_FLOW_RATE_UL_S = 22.0
 
 # Isopropyl alcohol density at 20 C, used to convert mass (g) -> volume (ml)
 # in the volume calibration routine.  Source: CRC Handbook of Chemistry and
@@ -133,6 +142,7 @@ class _PumpSession:
         self.homed: dict[str, bool] = {pid: False for pid in self.pumps_cfg.motors}
         self.valve_open_flag: bool = False
         self.needle_retracted: bool = False
+        self.air_valve_open: bool = False
         self.pump_positions: dict[str, float] = {
             pid: 0.0 for pid in self.pumps_cfg.motors
         }
@@ -224,7 +234,10 @@ class _PumpSession:
                 "homed": self.homed[pid],
                 "speed_mm_s": self.current_speeds.get(pid, 0.0),
             }
-        return pump_diagram(states, self.valve_open_flag, self.needle_retracted)
+        return pump_diagram(
+            states, self.valve_open_flag, self.needle_retracted,
+            self.air_valve_open,
+        )
 
     def _build_log_panel(self) -> Panel:
         """Build the activity-log panel with a fixed height.
@@ -316,6 +329,116 @@ class _PumpSession:
         self.log("  Refill valve [red]CLOSED[/]")
         self.app.session_log.log_action("pump", "valve_close")
 
+    # ------------------------------------------------------------------
+    # Needle & air valve safety interlock
+    # ------------------------------------------------------------------
+
+    def _resolve_needle_output(self) -> str | None:
+        """Resolve the Klipper output_pin name for the airbrush needle."""
+        name = self.pumps_cfg.needle_output
+        if name:
+            return name
+        outputs = self.cfg.digital_outputs or {}
+        for oname in outputs:
+            if "needle" in oname.lower():
+                return oname
+        return None
+
+    def _resolve_air_valve_output(self) -> str | None:
+        """Resolve the Klipper output_pin name for the air supply valve."""
+        name = self.pumps_cfg.air_valve_output
+        if name:
+            return name
+        outputs = self.cfg.digital_outputs or {}
+        for oname in outputs:
+            if "air_valve" in oname.lower():
+                return oname
+        return None
+
+    def open_needle(self) -> None:
+        """Retract the airbrush needle, opening the nozzle for fluid flow.
+
+        Waits ``needle_servo_delay_s`` for the servo to reach position.
+        Idempotent -- no-op if already retracted.
+        """
+        if self.needle_retracted:
+            return
+        name = self._resolve_needle_output()
+        if not name:
+            self.log("  [red]No needle output configured[/]")
+            return
+        sock = self.ensure_connected()
+        set_pin(sock, name, 1)
+        delay = self.pumps_cfg.needle_servo_delay_s
+        if delay > 0:
+            time.sleep(delay)
+        self.needle_retracted = True
+        self.log("  Needle [green]OPEN[/] (retracted)")
+        self.app.session_log.log_action("pump", "needle_open")
+
+    def close_needle(self) -> None:
+        """Extend the airbrush needle, closing the nozzle.
+
+        Waits ``needle_servo_delay_s`` for the servo to reach position.
+        Idempotent -- no-op if already extended.
+        """
+        if not self.needle_retracted:
+            return
+        name = self._resolve_needle_output()
+        if not name:
+            return
+        sock = self.ensure_connected()
+        set_pin(sock, name, 0)
+        delay = self.pumps_cfg.needle_servo_delay_s
+        if delay > 0:
+            time.sleep(delay)
+        self.needle_retracted = False
+        self.log("  Needle [red]CLOSED[/] (extended)")
+        self.app.session_log.log_action("pump", "needle_close")
+
+    def open_air_valve(self) -> None:
+        """Open the compressed air supply valve.  Idempotent."""
+        if self.air_valve_open:
+            return
+        name = self._resolve_air_valve_output()
+        if not name:
+            self.log("  [yellow]No air valve output configured[/]")
+            return
+        sock = self.ensure_connected()
+        set_pin(sock, name, 1)
+        self.air_valve_open = True
+        self.log("  Air valve [green]OPEN[/]")
+        self.app.session_log.log_action("pump", "air_valve_open")
+
+    def close_air_valve(self) -> None:
+        """Close the compressed air supply valve.  Idempotent."""
+        if not self.air_valve_open:
+            return
+        name = self._resolve_air_valve_output()
+        if not name:
+            return
+        sock = self.ensure_connected()
+        set_pin(sock, name, 0)
+        self.air_valve_open = False
+        self.log("  Air valve [red]CLOSED[/]")
+        self.app.session_log.log_action("pump", "air_valve_close")
+
+    def ensure_needle_for_dispense(self) -> None:
+        """Hard safety interlock: needle MUST be open before any fluid output.
+
+        Opens the needle (retract) if not already open and waits for the
+        servo transit delay.  This is the enforcement point -- every code
+        path that pushes fluid through the pumps must call this first.
+        """
+        self.open_needle()
+
+    def ensure_needle_for_fill(self) -> None:
+        """Safety interlock: needle must be closed during syringe fill.
+
+        Prevents air ingress through the nozzle while the syringe retracts.
+        """
+        self.close_needle()
+
     def check_travel_limit(self, pid: str, target_position: float) -> bool:
         if not self.pumps_cfg.enforce_travel_limits:
             return True
@@ -395,15 +518,23 @@ def _ask_confirm(prompt: str, default: bool = True) -> bool:
 def _select_pumps(
     s: _PumpSession, prompt: str = "Select pumps", allow_all: bool = True
 ) -> list[str]:
-    choices = [f"{s.pump_label(pid)}" for pid in s.pump_ids]
+    choices = [s.pump_label(pid) for pid in s.pump_ids]
     if allow_all:
-        choices.insert(0, "All pumps")
-    selected = questionary.checkbox(prompt, choices=choices).ask()
-    if selected is None:
-        raise KeyboardInterrupt
-    if "All pumps" in selected or not selected:
-        return list(s.pump_ids)
-    return [pid for pid in s.pump_ids if s.pump_label(pid) in selected]
+        choices.append("All pumps")
+    while True:
+        selected = questionary.checkbox(prompt, choices=choices).ask()
+        if selected is None:
+            raise KeyboardInterrupt
+        if "All pumps" in selected:
+            return list(s.pump_ids)
+        if not selected:
+            s.log(
+                "  [yellow]No pumps selected. "
+                "Use Space to toggle, Enter to confirm.[/]"
+            )
+            s.render_screen()
+            continue
+        return [pid for pid in s.pump_ids if s.pump_label(pid) in selected]
 
 
 def _select_single_pump(s: _PumpSession, prompt: str = "Select pump") -> str:
@@ -504,9 +635,20 @@ def _run_animated_moves(
 
 
 def _do_homing(s: _PumpSession, pump_ids: list[str]) -> bool:
+    """Home pumps with needle-safe backlash purge.
+
+    Sequence per pump:
+    1. Needle closed (fill direction toward limit switch).
+    2. Valve open, home to limit switch, back off.
+    3. Needle open (backlash purge pushes fluid).
+    4. Advance by backlash_purge_mm, reset position to 0.
+    5. Needle closed, valve closed.
+    """
     sock = s.ensure_connected()
     backlash = s.pumps_cfg.backlash_purge_mm
     all_ok = True
+
+    s.ensure_needle_for_fill()
     s.open_valve()
     try:
         s.console.clear()
@@ -518,15 +660,36 @@ def _do_homing(s: _PumpSession, pump_ids: list[str]) -> bool:
                 s.log(f"  Homing [bold]{s.pump_label(pid)}[/]...")
                 live.update(s.build_live_renderable())
                 pump_enable(sock, pid)
+
                 with s.capture_prints():
-                    ok = pump_home_with_backlash(sock, pid, m, sy, backlash)
-                if ok:
-                    s.homed[pid] = True
-                    s.pump_positions[pid] = 0.0
-                    s.log(f"  [green]{pid} homed successfully.[/]")
-                else:
+                    ok = pump_home(sock, pid, m, sy)
+                if not ok:
                     s.log(f"  [red]{pid} homing FAILED[/]")
                     all_ok = False
+                    pump_disable(sock, pid)
+                    live.update(s.build_live_renderable())
+                    continue
+
+                s.homed[pid] = True
+                s.pump_positions[pid] = 0.0
+                live.update(s.build_live_renderable())
+
+                if backlash > 0:
+                    s.ensure_needle_for_dispense()
+                    dsign = -m.homing_direction
+                    purge_pos = dsign * backlash
+                    s.log(
+                        f"  Backlash purge: {backlash:.2f} mm..."
+                    )
+                    pump_move(
+                        sock, pid, purge_pos, 1.0,
+                        accel=_BACKLASH_ACCEL_MM_S2,
+                    )
+                    pump_set_position(sock, pid, 0.0)
+                    s.pump_positions[pid] = 0.0
+                    s.ensure_needle_for_fill()
+
+                s.log(f"  [green]{pid} homed successfully.[/]")
                 pump_disable(sock, pid)
                 live.update(s.build_live_renderable())
     finally:
@@ -550,6 +713,7 @@ def _check_homing(s: _PumpSession, pump_ids: list[str]) -> bool:
 
 def _do_dispense(s: _PumpSession, pid: str, volume_ml: float, speed: float) -> None:
     """Dispense a volume with animated progress and prompt before retract."""
+    s.ensure_needle_for_dispense()
     sock = s.ensure_connected()
     m, sy = s.motor(pid), s.syringe(pid)
     travel_mm = volume_to_mm(volume_ml, sy)
@@ -599,6 +763,7 @@ def _do_dispense_no_retract(
     speed: float,
     disable_after: bool = True,
 ) -> float:
+    s.ensure_needle_for_dispense()
     sock = s.ensure_connected()
     m, sy = s.motor(pid), s.syringe(pid)
     travel_mm = volume_to_mm(volume_ml, sy)
@@ -634,6 +799,7 @@ def _do_simultaneous_dispense(
     speed: float,
     retract: bool = True,
 ) -> None:
+    s.ensure_needle_for_dispense()
     sock = s.ensure_connected()
     travels: dict[str, float] = {}
     for pid in pump_ids:
@@ -710,6 +876,7 @@ def _test_pump_juggle(s: _PumpSession) -> None:
     reps = _ask_int(s.app, "Repetitions", 10)
     if not _check_homing(s, selected):
         return
+    s.ensure_needle_for_dispense()
     sock = s.ensure_connected()
 
     s.console.clear()
@@ -817,6 +984,7 @@ def _test_speed_ramp(s: _PumpSession) -> None:
     selected = _select_pumps(s, "Pumps to test")
     if not _check_homing(s, selected):
         return
+    s.ensure_needle_for_dispense()
     sock = s.ensure_connected()
     dose_ml = 0.5
 
@@ -875,6 +1043,7 @@ def _test_repeatability(s: _PumpSession) -> None:
     speed = _ask_float(s.app, "Dispense speed (mm/s)", 0.5)
     if not _check_homing(s, selected):
         return
+    s.ensure_needle_for_dispense()
     sock = s.ensure_connected()
 
     s.console.clear()
@@ -935,6 +1104,7 @@ def _test_full_travel(s: _PumpSession) -> None:
     if not s.app.confirm_dangerous("Full plunger travel on selected pumps"):
         return
 
+    s.ensure_needle_for_dispense()
     sock = s.ensure_connected()
     s.console.clear()
     with Live(
@@ -1075,23 +1245,18 @@ def _control_toggle_valve(s: _PumpSession) -> None:
 
 def _control_toggle_needle(s: _PumpSession) -> None:
     """Toggle the airbrush needle servo retracted/extended."""
-    name = s.pumps_cfg.needle_output if hasattr(s.pumps_cfg, "needle_output") else None
-    if not name:
-        outputs = s.cfg.digital_outputs or {}
-        for oname in outputs:
-            if "needle" in oname.lower():
-                name = oname
-                break
-    if not name:
-        s.log("  [red]No needle output configured.[/]")
-        return
-    sock = s.ensure_connected()
-    new_state = not s.needle_retracted
-    set_pin(sock, name, 1 if new_state else 0)
-    s.needle_retracted = new_state
-    label = "RETRACTED" if new_state else "EXTENDED"
-    s.log(f"  Needle [bold]{label}[/]")
-    s.app.session_log.log_action("pump", "needle", label)
+    if s.needle_retracted:
+        s.close_needle()
+    else:
+        s.open_needle()
+
+
+def _control_toggle_air_valve(s: _PumpSession) -> None:
+    """Toggle the compressed air supply valve."""
+    if s.air_valve_open:
+        s.close_air_valve()
+    else:
+        s.open_air_valve()
 
 
 def _control_fill(s: _PumpSession) -> None:
@@ -1102,6 +1267,7 @@ def _control_fill(s: _PumpSession) -> None:
     if not _check_homing(s, selected):
         return
     sock = s.ensure_connected()
+    s.ensure_needle_for_fill()
     s.open_valve()
     try:
         for pid in selected:
@@ -1125,64 +1291,99 @@ def _control_fill(s: _PumpSession) -> None:
 
 
 def _control_valve_cycle(s: _PumpSession) -> None:
+    """Automated fill + purge cycles (full syringe volume each time).
+
+    Each cycle:
+      1. Needle closed, valve open  -> retract to 0 (fill 1 ml).
+      2. Valve closed, needle open  -> dispense full travel (purge 1 ml).
+    Repeats for the requested number of cycles.  Ctrl+C stops cleanly
+    after the current phase completes.
+    """
     s.log("[bold cyan]── Control: Valve Cycle ──[/]")
     if not s.pumps_cfg.refill_valve_output:
         s.log("  [red]No refill_valve_output configured.[/]")
         return
     s.render_screen()
     selected = _select_pumps(s, "Pumps to cycle")
+    n_cycles = _ask_int(s.app, "Number of cycles", 5)
     speed = _ask_float(s.app, "Speed (mm/s)", 2.0)
     if not _check_homing(s, selected):
         return
     sock = s.ensure_connected()
 
-    # Fill all simultaneously
-    s.open_valve()
+    completed = 0
     try:
-        for pid in selected:
-            s.log(f"  Filling [bold]{s.pump_label(pid)}[/]...")
-            pump_enable(sock, pid)
+        for cycle in range(1, n_cycles + 1):
+            s.log(
+                f"[bold cyan]── Cycle {cycle}/{n_cycles} ──[/]"
+            )
 
-        fill_moves: list[tuple[str, float, float]] = [
-            (pid, 0.0, speed) for pid in selected
-        ]
-        s.console.clear()
-        with Live(
-            s.build_live_renderable(), console=s.console, refresh_per_second=10
-        ) as live:
-            _run_animated_moves(s, sock, fill_moves, live)
+            # -- Fill phase: needle closed, valve open, retract to 0 --
+            s.ensure_needle_for_fill()
+            s.open_valve()
+            try:
+                for pid in selected:
+                    pump_enable(sock, pid)
+                fill_moves: list[tuple[str, float, float]] = [
+                    (pid, 0.0, speed) for pid in selected
+                ]
+                s.console.clear()
+                with Live(
+                    s.build_live_renderable(),
+                    console=s.console,
+                    refresh_per_second=10,
+                ) as live:
+                    _run_animated_moves(s, sock, fill_moves, live)
+                for pid in selected:
+                    pump_disable(sock, pid)
+            finally:
+                s.close_valve()
+            _dwell(s)
 
+            # -- Purge phase: needle open, dispense full travel --
+            s.ensure_needle_for_dispense()
+            empty_moves: list[tuple[str, float, float]] = []
+            for pid in selected:
+                m, sy = s.motor(pid), s.syringe(pid)
+                dsign = _dispense_sign(m)
+                dispense_pos = dsign * sy.plunger_travel_mm
+                if not s.check_travel_limit(pid, dispense_pos):
+                    continue
+                pump_enable(sock, pid)
+                empty_moves.append((pid, dispense_pos, speed))
+
+            if empty_moves:
+                s.console.clear()
+                with Live(
+                    s.build_live_renderable(),
+                    console=s.console,
+                    refresh_per_second=10,
+                ) as live:
+                    _run_animated_moves(s, sock, empty_moves, live)
+                for pid, _, _ in empty_moves:
+                    pump_disable(sock, pid)
+
+            completed = cycle
+            s.log(
+                f"  Cycle {cycle}/{n_cycles} "
+                f"[green]done[/]"
+            )
+
+    except KeyboardInterrupt:
+        s.log(f"\n[yellow]Interrupted after {completed} cycles.[/]")
         for pid in selected:
-            s.log(f"  {pid} fill [green]done[/]")
-            pump_disable(sock, pid)
+            try:
+                pump_disable(sock, pid)
+            except Exception:
+                pass
     finally:
+        s.ensure_needle_for_fill()
         s.close_valve()
-    _dwell(s)
 
-    # Empty all simultaneously
-    empty_moves: list[tuple[str, float, float]] = []
-    for pid in selected:
-        m, sy = s.motor(pid), s.syringe(pid)
-        dsign = _dispense_sign(m)
-        dispense_pos = dsign * sy.plunger_travel_mm
-        if not s.check_travel_limit(pid, dispense_pos):
-            continue
-        s.log(f"  Emptying [bold]{s.pump_label(pid)}[/]...")
-        pump_enable(sock, pid)
-        empty_moves.append((pid, dispense_pos, speed))
-
-    if empty_moves:
-        s.console.clear()
-        with Live(
-            s.build_live_renderable(), console=s.console, refresh_per_second=10
-        ) as live:
-            _run_animated_moves(s, sock, empty_moves, live)
-
-        for pid, _, _ in empty_moves:
-            s.log(f"  {pid} empty [green]done[/]")
-            pump_disable(sock, pid)
-
-    s.log("[green]Valve cycle complete.[/]")
+    s.log(
+        f"[green]Valve cycling finished: "
+        f"{completed}/{n_cycles} cycles completed.[/]"
+    )
 
 
 # ======================================================================
@@ -1266,6 +1467,7 @@ def _calibrate_volume(s: _PumpSession) -> None:
                 f"target = {target:.3f} ml ({travel_mm:.4f} mm) ──[/]"
             )
 
+            s.ensure_needle_for_fill()
             s.open_valve()
             try:
                 pump_enable(sock, pid)
@@ -1289,6 +1491,7 @@ def _calibrate_volume(s: _PumpSession) -> None:
                 "Ready to dispense. Press any key..."
             ).ask()
 
+            s.ensure_needle_for_dispense()
             pump_set_position(sock, pid, 0.0)
             s.pump_positions[pid] = 0.0
             s.log(f"  Dispensing {target:.3f} ml...")
@@ -1614,6 +1817,341 @@ def _save_mixing_result(
 
 
 # ======================================================================
+# Airbrush flow calibration
+# ======================================================================
+
+
+def _calibrate_airbrush_flow(s: _PumpSession) -> None:
+    """Calibrate airbrush priming volume and stabilisation time.
+
+    Dispenses IPA at a user-specified flow rate while the operator
+    observes the nozzle.  Two space-bar taps mark (1) first liquid
+    visible and (2) consistent flow.  From these timestamps the prime
+    volume and stabilisation delay are computed and saved to CSV.
+
+    Requires: needle output, air valve output, purge (IPA) pump.
+    """
+    s.log("[bold cyan]── Calibration: Airbrush Flow ──[/]")
+    s.render_screen()
+
+    # -- Select pump (prefer purge/IPA) ------------------------------------
+    purge_pid = s.purge_pump_id
+    if purge_pid:
+        pid = purge_pid
+        s.log(f"  Using purge pump: {s.pump_label(pid)}")
+    else:
+        s.log("  [yellow]No purge pump found, select manually.[/]")
+        s.render_screen()
+        pid = _select_single_pump(s, "Select pump (IPA)")
+
+    sy = s.syringe(pid)
+    m = s.motor(pid)
+
+    # -- Flow rate ---------------------------------------------------------
+    flow_rate_ul_s = _ask_float(
+        s.app, "Flow rate (ul/s)", _DEFAULT_FLOW_RATE_UL_S,
+        key="airbrush_flow_rate",
+    )
+    flow_rate_ml_s = flow_rate_ul_s / 1000.0
+    speed_mm_s = flow_rate_ml_s * sy.mm_per_ml
+
+    if speed_mm_s > m.max_dispense_speed_mm_s:
+        s.log(
+            f"  [red]Plunger speed {speed_mm_s:.3f} mm/s exceeds "
+            f"max {m.max_dispense_speed_mm_s} mm/s. Clamping.[/]"
+        )
+        speed_mm_s = m.max_dispense_speed_mm_s
+        flow_rate_ml_s = speed_mm_s / sy.mm_per_ml
+        flow_rate_ul_s = flow_rate_ml_s * 1000.0
+
+    max_duration_s = sy.volume_ml / flow_rate_ml_s if flow_rate_ml_s > 0 else 999
+    s.set_summary(
+        info_panel(
+            {
+                "Pump": s.pump_label(pid),
+                "Flow rate": f"{flow_rate_ul_s:.1f} ul/s",
+                "Plunger speed": f"{speed_mm_s:.4f} mm/s",
+                "Syringe": f"{sy.volume_ml:.2f} ml / {sy.plunger_travel_mm:.1f} mm",
+                "Max duration": f"{max_duration_s:.1f} s",
+            },
+            title="Airbrush Flow Cal",
+        )
+    )
+    s.render_screen()
+
+    # -- Home + fill -------------------------------------------------------
+    if not _check_homing(s, [pid]):
+        return
+
+    s.ensure_needle_for_fill()
+    s.open_valve()
+    try:
+        sock = s.ensure_connected()
+        pump_enable(sock, pid)
+        s.log("  Filling syringe...")
+        s.console.clear()
+        with Live(
+            s.build_live_renderable(), console=s.console, refresh_per_second=10,
+        ) as live:
+            _run_animated_moves(
+                s, sock, [(pid, 0.0, m.max_retract_speed_mm_s)], live,
+            )
+    finally:
+        s.close_valve()
+
+    s.log("  [green]Syringe filled.[/]")
+    s.log("  Point airbrush into a waste container.")
+    s.render_screen()
+    if not _ask_confirm("Ready to start flow calibration?"):
+        pump_disable(sock, pid)
+        return
+
+    # -- Dispensing with space-bar timing ----------------------------------
+    s.ensure_needle_for_dispense()
+    s.open_air_valve()
+
+    dsign = _dispense_sign(m)
+    target_pos = dsign * sy.plunger_travel_mm
+    pump_set_position(sock, pid, 0.0)
+    s.pump_positions[pid] = 0.0
+
+    s.log("  [bold]Dispensing started.[/]")
+    s.log("  [yellow]Press SPACE when liquid first appears.[/]")
+
+    pump_move(sock, pid, target_pos, speed_mm_s, accel=50.0, sync=False)
+    t_start = time.monotonic()
+    t_first: float | None = None
+    t_consistent: float | None = None
+
+    old_settings = termios.tcgetattr(sys.stdin)
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+
+        s.console.clear()
+        with Live(
+            s.build_live_renderable(), console=s.console, refresh_per_second=10,
+        ) as live:
+            while True:
+                elapsed = time.monotonic() - t_start
+                frac = min(1.0, elapsed / max_duration_s)
+                s.pump_positions[pid] = frac * sy.plunger_travel_mm
+                vol_ul = frac * sy.volume_ml * 1000.0
+
+                if t_first is None:
+                    s.set_progress(
+                        f"  [bold yellow]SPACE[/] = first liquid  |  "
+                        f"Elapsed: {elapsed:.1f}s  |  "
+                        f"Volume: {vol_ul:.1f} ul"
+                    )
+                elif t_consistent is None:
+                    s.set_progress(
+                        f"  [bold yellow]SPACE[/] = consistent flow  |  "
+                        f"Elapsed: {elapsed:.1f}s  |  "
+                        f"First at: {t_first - t_start:.2f}s"
+                    )
+                live.update(s.build_live_renderable())
+
+                if stdin_has_data():
+                    ch = sys.stdin.read(1)
+                    if ch == " ":
+                        if t_first is None:
+                            t_first = time.monotonic()
+                            first_elapsed = t_first - t_start
+                            s.log(
+                                f"  [green]First liquid at "
+                                f"{first_elapsed:.2f}s[/]"
+                            )
+                            s.log(
+                                "  [yellow]Press SPACE when flow "
+                                "is consistent.[/]"
+                            )
+                        elif t_consistent is None:
+                            t_consistent = time.monotonic()
+                            s.log(
+                                f"  [green]Consistent flow at "
+                                f"{t_consistent - t_start:.2f}s[/]"
+                            )
+                            break
+                    elif ch in ("\x1b", "q"):
+                        s.log("  [yellow]Calibration aborted.[/]")
+                        break
+
+                if elapsed >= max_duration_s:
+                    s.log(
+                        "  [red]Syringe empty before consistent "
+                        "flow reached.[/]"
+                    )
+                    break
+
+                time.sleep(0.05)
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+    # -- Stop pump and close outputs ---------------------------------------
+    raw_gcode(sock, "M400")
+    pump_disable(sock, pid)
+    s.close_air_valve()
+    s.close_needle()
+    s.set_progress("")
+
+    # -- Compute results ---------------------------------------------------
+    if t_first is None:
+        s.log("  [red]No timing data collected.[/]")
+        return
+
+    time_to_first_s = t_first - t_start
+    prime_volume_ul = flow_rate_ul_s * time_to_first_s
+
+    results: dict[str, float] = {
+        "flow_rate_ul_s": flow_rate_ul_s,
+        "speed_mm_s": speed_mm_s,
+        "time_to_first_output_s": round(time_to_first_s, 3),
+        "prime_volume_ul": round(prime_volume_ul, 2),
+    }
+
+    if t_consistent is not None:
+        time_to_consistent_s = t_consistent - t_start
+        stabilization_s = t_consistent - t_first
+        stabilization_ul = flow_rate_ul_s * stabilization_s
+        total_lead_ul = flow_rate_ul_s * time_to_consistent_s
+        results.update({
+            "time_to_consistent_s": round(time_to_consistent_s, 3),
+            "stabilization_time_s": round(stabilization_s, 3),
+            "stabilization_volume_ul": round(stabilization_ul, 2),
+            "total_lead_volume_ul": round(total_lead_ul, 2),
+        })
+
+    # -- Save CSV ----------------------------------------------------------
+    data_dir = Path(__file__).resolve().parents[2] / "data"
+    data_dir.mkdir(exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = data_dir / f"airbrush_flow_cal_{timestamp}.csv"
+    header = ",".join(results.keys())
+    values = ",".join(f"{v:.4f}" for v in results.values())
+    csv_path.write_text(f"{header}\n{values}\n")
+
+    s.log(f"  Results saved to [bold]{csv_path}[/]")
+    s.app.session_log.log_action(
+        "pump", "airbrush_flow_cal", str(csv_path),
+    )
+
+    # -- Display results ---------------------------------------------------
+    _show_flow_cal_results(s, results, csv_path)
+    s.render_screen()
+    questionary.press_any_key_to_continue(
+        "Press any key to view charts..."
+    ).ask()
+
+    s.console.clear()
+    _show_flow_cal_charts(s, results)
+    questionary.press_any_key_to_continue(
+        "Press any key to continue..."
+    ).ask()
+
+
+def _show_flow_cal_results(
+    s: _PumpSession,
+    results: dict[str, float],
+    csv_path: Path,
+) -> None:
+    """Display airbrush flow calibration results as a summary panel."""
+    display: dict[str, str] = {
+        "Flow rate": f"{results['flow_rate_ul_s']:.1f} ul/s",
+        "Plunger speed": f"{results['speed_mm_s']:.4f} mm/s",
+        "Time to first output": (
+            f"{results['time_to_first_output_s']:.2f} s"
+        ),
+        "Prime volume": f"{results['prime_volume_ul']:.1f} ul",
+    }
+    if "time_to_consistent_s" in results:
+        display.update({
+            "Time to consistent flow": (
+                f"{results['time_to_consistent_s']:.2f} s"
+            ),
+            "Stabilisation delay": (
+                f"{results['stabilization_time_s']:.2f} s"
+            ),
+            "Stabilisation volume": (
+                f"{results['stabilization_volume_ul']:.1f} ul"
+            ),
+            "Total lead volume": (
+                f"{results['total_lead_volume_ul']:.1f} ul"
+            ),
+        })
+    display["CSV"] = str(csv_path)
+
+    s.set_summary(
+        Panel(
+            info_panel(display, title="Results", border_style="green"),
+            title="[bold]Airbrush Flow Calibration[/]",
+            border_style="cyan",
+        )
+    )
+
+
+def _show_flow_cal_charts(
+    s: _PumpSession,
+    results: dict[str, float],
+) -> None:
+    """Render airbrush flow calibration timeline using plotext."""
+    flow = results["flow_rate_ul_s"]
+    t_first = results["time_to_first_output_s"]
+    t_consistent = results.get("time_to_consistent_s")
+
+    t_end = t_consistent if t_consistent else t_first * 1.5
+    n_points = 60
+    dt = t_end / n_points if t_end > 0 else 0.1
+    times = [i * dt for i in range(n_points + 1)]
+    cumulative_ul = [flow * t for t in times]
+
+    # Effective output: 0 before t_first, ramps to full after t_consistent
+    effective: list[float] = []
+    for t in times:
+        if t < t_first:
+            effective.append(0.0)
+        elif t_consistent and t < t_consistent:
+            frac = (t - t_first) / (t_consistent - t_first)
+            effective.append(flow * frac)
+        else:
+            effective.append(flow)
+
+    plt.clear_figure()
+    plt.theme("dark")
+    plt.plot_size(65, 18)
+    plt.plot(times, cumulative_ul, label="Cumulative (ul)")
+    plt.vline(t_first, color="yellow")
+    plt.title("Airbrush Flow Calibration")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Volume (ul)")
+    plt.show()
+    s.console.print()
+
+    plt.clear_figure()
+    plt.theme("dark")
+    plt.plot_size(65, 15)
+    plt.plot(times, effective, label="Effective output (ul/s)")
+    plt.hline(flow, color="green")
+    plt.vline(t_first, color="yellow")
+    if t_consistent:
+        plt.vline(t_consistent, color="green")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Flow rate (ul/s)")
+    plt.title("Effective Output Rate")
+    plt.show()
+    s.console.print()
+
+    s.console.print(
+        f"  [yellow]|[/] T_first = {t_first:.2f}s  "
+        f"(prime = {results['prime_volume_ul']:.1f} ul)"
+    )
+    if t_consistent:
+        s.console.print(
+            f"  [green]|[/] T_consistent = {t_consistent:.2f}s  "
+            f"(total lead = {results.get('total_lead_volume_ul', 0):.1f} ul)"
+        )
+
+
+# ======================================================================
 # Menu system
 # ======================================================================
 
@@ -1637,11 +2175,13 @@ _CONTROLS_MENU = [
     ("Valve cycle (fill + empty)", _control_valve_cycle),
     ("Toggle refill valve", _control_toggle_valve),
     ("Toggle needle servo", _control_toggle_needle),
+    ("Toggle air valve", _control_toggle_air_valve),
 ]
 
 _CALIBRATIONS_MENU = [
     ("Volume accuracy", _calibrate_volume),
     ("Mixing test", _calibrate_mixing),
+    ("Airbrush flow", _calibrate_airbrush_flow),
 ]
 
 
@@ -1801,9 +2341,11 @@ def run(app: RobotApp) -> None:
         s.log("[yellow]Interrupted.[/]")
     finally:
         if s.sock is not None:
-            if s.valve_open_flag:
+            for cleanup_fn in (
+                s.close_needle, s.close_air_valve, s.close_valve,
+            ):
                 try:
-                    s.close_valve()
+                    cleanup_fn()
                 except Exception:
                     pass
             for pid in s.pump_ids:

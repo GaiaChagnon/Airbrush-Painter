@@ -227,6 +227,13 @@ def run(app: RobotApp) -> None:
         "min_path_mm": lt_cfg.get("min_path_mm", 0.5),
     }
 
+    if mode == "line_tracing":
+        params.update({
+            "adaptive_threshold": lt_cfg.get("adaptive_threshold", False),
+            "adaptive_block_size": lt_cfg.get("adaptive_block_size", 15),
+            "adaptive_c": lt_cfg.get("adaptive_c", 4),
+        })
+
     if mode == "hatched":
         params.update({
             "levels": hatch_cfg.get("levels", [64, 128, 192]),
@@ -440,6 +447,11 @@ def run(app: RobotApp) -> None:
                     hatching_include_outlines=params.get("hatching_outlines", True),
                     hatching_outline_turdsize=htng_cfg.get("outline_turdsize", 10),
                     hatching_connect_gap_px=params.get("connect_gap", 5.0),
+                    adaptive_threshold=params.get(
+                        "adaptive_threshold", False),
+                    adaptive_block_size=params.get(
+                        "adaptive_block_size", 15),
+                    adaptive_c=params.get("adaptive_c", 4),
                 )
         except Exception as exc:
             progress.stop()

@@ -21,7 +21,7 @@ canvas:
   height_mm: 300.0
 z_states:
   travel_mm: 40.0
-  pen_work_mm: 80.194
+  pen_work_mm: 80.244
   airbrush_work_mm: 0.0
 tools:
   pen:
@@ -129,9 +129,12 @@ pumps:
     step_pulse_duration_s: 5.0e-06
     enable_pin_inverted: false
     direction_reversal_pause_s: 0.3
+  needle_output: servo_airbrush_needle
+  air_valve_output: air_valve
+  needle_servo_delay_s: 0.5
   syringe:
     volume_ml: 1.0
-    plunger_travel_mm: 16.5
+    plunger_travel_mm: 17.0
   motors:
     pump_0:
       fluid: cyan
@@ -148,9 +151,6 @@ pumps:
       home_backoff_mm: 0.5
       max_dispense_speed_mm_s: 4.0
       max_retract_speed_mm_s: 2.0
-      syringe:
-        plunger_travel_mm: 16.5
-        volume_ml: 0.8341
     pump_1:
       fluid: magenta
       octopus_slot: Motor 4
@@ -214,11 +214,11 @@ bed_mesh:
   algorithm: lagrange
   calibrated_points:
   - - -0.094444
-    - -0.094444
-    - -0.094444
-  - - 0.005556
+    - -0.144444
+    - -0.144444
+  - - 0.055556
     - 0.005556
-    - -0.044444
+    - 0.005556
   - - 0.105556
     - 0.105556
     - 0.105556

@@ -15,10 +15,10 @@ void setup() {
 
 void loop() {
   Serial.println("upper");
-  Servo1.writeMicroseconds(2500);
+  Servo2.writeMicroseconds(2100);
   delay(5000);
 
   Serial.println("lower");
-  Servo1.writeMicroseconds(2100);
+  Servo2.writeMicroseconds(2200);
   delay(5000);
 }

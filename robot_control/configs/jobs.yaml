@@ -13,6 +13,6 @@ pen_tracer:
   z_retract_speed_mm_s: 300.0
   accel_mm_s2: 2000.0
   square_corner_velocity_mm_s: 10.0
-  z_contact_mm: 80.194
+  z_contact_mm: 80.244
   z_retract_mm: 2.25
   corner_circle_radius_mm: 3.0

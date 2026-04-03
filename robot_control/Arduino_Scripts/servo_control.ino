@@ -22,8 +22,8 @@
 // --------------- pin assignments ---------------
 const int SERVO_PIN_1 = 11;   // airbrush needle servo
 const int SERVO_PIN_2 = 10;   // pump refill servo
-const int INPUT_PIN_1 = A0;   // PB6 -> airbrush needle
-const int INPUT_PIN_2 = A1;   // PB7 -> pump refill
+const int INPUT_PIN_1 = A1;   // PB6 -> airbrush needle
+const int INPUT_PIN_2 = A0;   // PB7 -> pump refill
 
 // --------------- servo pulse range (must match servo_setup.ino) ---------------
 const int SERVO_MIN_US = 500;
@@ -31,8 +31,8 @@ const int SERVO_MAX_US = 2500;
 
 // --------------- calibrated positions (microseconds) ---------------
 // Servo 1 -- airbrush needle
-const int SERVO1_OFF_US = 2500;  // needle forward, spray OFF
-const int SERVO1_ON_US  = 2100;  // needle retracted, spray ON
+const int SERVO1_OFF_US = 1100;  // needle forward, spray OFF
+const int SERVO1_ON_US  = 1200;  // needle retracted, spray ON
 
 // Servo 2 -- pump refill valve  (adjust after calibration)
 const int SERVO2_OFF_US = 2300;  // valve closed

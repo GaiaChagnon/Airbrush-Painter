@@ -365,9 +365,13 @@ def restart_klipper() -> None:
 # ===========================================================================
 
 
+_CLOSED_CONTOUR_TOL = 1e-3  # mm -- max start/end gap to treat as closed
+
+
 def simplify_paths(
     paths: list[np.ndarray],
     tolerance_px: float,
+    preserve_closed: bool = False,
 ) -> list[np.ndarray]:
     """Apply Douglas-Peucker simplification to each polyline.
 
@@ -377,6 +381,12 @@ def simplify_paths(
         Polylines as ``(N, 2)`` arrays (pixel or mm coords).
     tolerance_px : float
         Maximum deviation (same units as *paths*).
+    preserve_closed : bool
+        When True, detect contours whose first and last points coincide
+        (within ``_CLOSED_CONTOUR_TOL``) and simplify them with
+        ``closed=True`` so the closure segment is preserved.  Only
+        relevant for ``line_tracing`` mode where Potrace produces
+        closed boundary contours.
 
     Returns
     -------
@@ -388,12 +398,21 @@ def simplify_paths(
         if len(pts) < 3:
             out.append(pts)
             continue
+        is_closed = (
+            preserve_closed
+            and np.linalg.norm(pts[0] - pts[-1]) < _CLOSED_CONTOUR_TOL
+        )
         approx = cv2.approxPolyDP(
             pts.astype(np.float32).reshape(-1, 1, 2),
             epsilon=tolerance_px,
-            closed=False,
+            closed=is_closed,
         )
         simplified = approx.reshape(-1, 2).astype(np.float64)
+        if is_closed and len(simplified) >= 3:
+            # Re-close: approxPolyDP(closed=True) drops the duplicate
+            # endpoint; re-append start so downstream draws the full loop.
+            if np.linalg.norm(simplified[0] - simplified[-1]) > _CLOSED_CONTOUR_TOL:
+                simplified = np.vstack([simplified, simplified[:1]])
         if len(simplified) >= 2:
             out.append(simplified)
     return out
@@ -1503,6 +1522,9 @@ def process_image(
     hatching_include_outlines: bool = True,
     hatching_outline_turdsize: int = 10,
     hatching_connect_gap_px: float = 5.0,
+    adaptive_threshold: bool = False,
+    adaptive_block_size: int = 15,
+    adaptive_c: int = 4,
 ) -> tuple[list[np.ndarray], list[np.ndarray], float, float, float, int, int]:
     """Run the full vectorisation pipeline on an image.
 
@@ -1594,6 +1616,9 @@ def process_image(
         image_path, paper_w, paper_h, margin, thr,
         merge_tolerance_px, simplify_tol_mm, min_path_mm,
         turdsize, t0,
+        adaptive_threshold=adaptive_threshold,
+        adaptive_block_size=adaptive_block_size,
+        adaptive_c=adaptive_c,
     )
 
 
@@ -1635,6 +1660,9 @@ def _process_vpype(
     min_path_mm: float,
     turdsize: int,
     t0: float,
+    adaptive_threshold: bool = False,
+    adaptive_block_size: int = 15,
+    adaptive_c: int = 4,
 ) -> tuple[list[np.ndarray], list[np.ndarray], float, float, float, int, int]:
     """Potrace + vpype pipeline: trace -> flatten -> merge -> sort.
 
@@ -1651,18 +1679,44 @@ def _process_vpype(
     ----------
     threshold : int
         Grayscale threshold (0-255).  Pixels darker than this become
-        black (traced).  Default 128.
+        black (traced).  Default 128.  Ignored when *adaptive_threshold*
+        is True.
     merge_tolerance_px : float
         Max pixel distance for vpype endpoint merging.
     turdsize : int
         Potrace speckle filter: discard contours with area below this
         many pixels^2.  Default 10.
+    adaptive_threshold : bool
+        When True, use Gaussian adaptive thresholding instead of a
+        global threshold.  Better for anti-aliased text/lines and
+        images with varying brightness.
+    adaptive_block_size : int
+        Pixel neighbourhood size for adaptive threshold (must be odd,
+        >= 3).  Larger values handle slow brightness gradients; smaller
+        values preserve thin features.  Default 15.
+    adaptive_c : int
+        Constant subtracted from the Gaussian-weighted local mean.
+        Higher values make the binarization more conservative (fewer
+        black pixels).  Default 4.
     """
     print("  [1/4] Tracing outlines (potrace)...")
     image = Image.open(str(image_path)).convert("L")
     W, H = image.size
 
-    binary = (np.array(image) < threshold).astype(np.uint8)
+    gray = np.array(image)
+    if adaptive_threshold:
+        block = adaptive_block_size | 1  # force odd
+        block = max(block, 3)
+        binary_uint8 = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            block, adaptive_c,
+        )
+        binary = (binary_uint8 > 0).astype(np.uint8)
+        print(f"        Adaptive threshold: block={block}, C={adaptive_c}")
+    else:
+        binary = (gray < threshold).astype(np.uint8)
     bmp = potrace.Bitmap(binary)
     traced = bmp.trace(
         turdsize=turdsize,
@@ -1738,7 +1792,9 @@ def _process_vpype(
                      >= min_path_mm]
 
     if simplify_tol_mm > 0:
-        paths_mm = simplify_paths(paths_mm, simplify_tol_mm)
+        paths_mm = simplify_paths(
+            paths_mm, simplify_tol_mm, preserve_closed=True,
+        )
 
     paths_px = [p / mm_per_px for p in paths_mm]
 
@@ -2586,6 +2642,25 @@ def main() -> None:
         default=_LINEART_LT.get("min_path_mm", 0.5),
         help="Drop paths shorter than this, mm (default: 0.5)",
     )
+    proc_group.add_argument(
+        "--adaptive-threshold", action="store_true",
+        default=_LINEART_LT.get("adaptive_threshold", False),
+        help="Use Gaussian adaptive threshold (line_tracing only). "
+             "Better for anti-aliased text/lines and uneven brightness.",
+    )
+    proc_group.add_argument(
+        "--adaptive-block-size", type=int,
+        default=_LINEART_LT.get("adaptive_block_size", 15),
+        help="Neighbourhood size for adaptive threshold, px (odd, >= 3). "
+             "Larger = handles slow gradients; smaller = preserves thin "
+             "features (default: 15)",
+    )
+    proc_group.add_argument(
+        "--adaptive-c", type=int,
+        default=_LINEART_LT.get("adaptive_c", 4),
+        help="Constant subtracted from local mean in adaptive threshold. "
+             "Higher = more conservative / fewer black pixels (default: 4)",
+    )
 
     # ---- Z-axis ----
     z_group = parser.add_argument_group("Z-axis parameters")
@@ -2824,6 +2899,9 @@ def main() -> None:
         hatching_include_outlines=not args.hatching_no_outlines,
         hatching_outline_turdsize=_LINEART_HTNG.get("outline_turdsize", 10),
         hatching_connect_gap_px=args.connect_gap,
+        adaptive_threshold=args.adaptive_threshold,
+        adaptive_block_size=args.adaptive_block_size,
+        adaptive_c=args.adaptive_c,
     )
 
     if not paths_mm:
@@ -2956,11 +3034,21 @@ def main() -> None:
         thr_default = _LINEART_LT.get("threshold", None)
         thr_default_val = thr_default if thr_default is not None else 128
         _show.extend([
-            ("threshold", str(thr_val),
-             thr_val != thr_default_val),
+            ("threshold",
+             "adaptive" if args.adaptive_threshold else str(thr_val),
+             args.adaptive_threshold
+             or thr_val != thr_default_val),
             ("turdsize", str(args.turdsize),
              args.turdsize != _LINEART_LT.get("turdsize", 10)),
         ])
+        if args.adaptive_threshold:
+            _show.extend([
+                ("adaptive_block_size", str(args.adaptive_block_size),
+                 args.adaptive_block_size
+                 != _LINEART_LT.get("adaptive_block_size", 15)),
+                ("adaptive_c", str(args.adaptive_c),
+                 args.adaptive_c != _LINEART_LT.get("adaptive_c", 4)),
+            ])
 
     # Collect CLI overrides for the preview annotation
     _cli_overrides: list[str] = []

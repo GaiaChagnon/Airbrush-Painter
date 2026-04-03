@@ -164,8 +164,9 @@ def pump_diagram(
     pump_states: dict[str, dict[str, Any]],
     valve_open: bool = False,
     needle_retracted: bool = False,
+    air_valve_open: bool = False,
 ) -> Panel:
-    """Visual diagram of syringe pumps, valve, and needle.
+    """Visual diagram of syringe pumps, valve, needle, and air supply.
 
     Parameters
     ----------
@@ -177,11 +178,12 @@ def pump_diagram(
     valve_open : bool
         Refill valve state.
     needle_retracted : bool
-        Airbrush needle state.
+        Airbrush needle state (retracted = nozzle open).
+    air_valve_open : bool
+        Compressed air supply valve state.
     """
     lines: list[Text] = []
 
-    # Valve and needle status line
     valve_indicator = (
         Text.from_markup("[green]■ OPEN[/]") if valve_open
         else Text.from_markup("[red]■ CLOSED[/]")
@@ -190,10 +192,16 @@ def pump_diagram(
         Text.from_markup("[green]■ RETRACTED[/]") if needle_retracted
         else Text.from_markup("[red]■ EXTENDED[/]")
     )
+    air_indicator = (
+        Text.from_markup("[green]■ OPEN[/]") if air_valve_open
+        else Text.from_markup("[red]■ CLOSED[/]")
+    )
     header = Text("  Refill Valve: ")
     header.append_text(valve_indicator)
     header.append("    Needle: ")
     header.append_text(needle_indicator)
+    header.append("    Air: ")
+    header.append_text(air_indicator)
     lines.append(header)
     lines.append(Text(""))
 
